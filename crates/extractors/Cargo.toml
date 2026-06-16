@@ -1,13 +1,14 @@
 [package]
-name = "ferrous-frog-storage"
+name = "ferrous-frog-extractors"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
 [dependencies]
-rusqlite.workspace = true
+regex.workspace = true
+scraper.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+sxd-document.workspace = true
+sxd-xpath.workspace = true
 thiserror.workspace = true
-url.workspace = true

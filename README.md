@@ -12,9 +12,34 @@ This repository now contains the first implementation slice of the Phase 1 MVP:
 - Tauri 2 desktop shell.
 - React, TypeScript, and Vite frontend.
 - In-memory crawl result store.
-- Async spider crawl loop with bounded concurrency, robots.txt support, manual redirect recording, and live progress events.
-- HTML parsing for title, meta description, H1, canonical, indexability, and links.
-- Basic issue views and CSV export.
+- SQLite-backed database mode with resumable current-crawl storage.
+- SQLite-backed named crawl sessions with per-session database files and reopen/delete controls.
+- SQLite-backed named configuration profiles with save/load/delete controls.
+- Async spider crawl loop with bounded concurrency, per-host rate limiting, robots.txt support, manual redirect recording, and live progress events.
+- robots.txt `Crawl-delay` parsing with measured integration coverage.
+- Include and exclude URL regex scope controls in crawler config and Settings UI.
+- Resource-type crawl toggles for HTML, images, CSS, JavaScript, external URLs, and other files.
+- Query-string controls for parameter sorting, full query stripping, regex-based parameter stripping, and maximum retained parameter count.
+- Basic Spider/List mode selection with pasted URL lists.
+- Custom robots.txt override support in crawler config and Settings UI.
+- robots.txt tester command and Settings UI check for overridden robots rules.
+- robots.txt download action to populate override text from the current root URL.
+- Default same-origin `/sitemap.xml` ingestion for root crawls.
+- Sitemap orphan reporting with `in_sitemap` storage, issue view filtering, Overview drill-down, and grid visibility.
+- HTML parsing for titles, meta descriptions, H1/H2, canonicals, directives, images, mobile viewport, AMP, pagination, hreflang, JSON-LD, Open Graph, Twitter Cards, links, and image/stylesheet/script resources.
+- HTTP security-header capture for HSTS, CSP, X-Frame-Options, and X-Content-Type-Options.
+- Per-request network timing capture for DNS lookup, header wait/TTFB, body download, total network time, transfer rate, resolved IP count, and redirect-hop timing.
+- Content fingerprinting with BLAKE3 response hashes, word counts, text-to-code ratio, and SimHash near-duplicate clusters.
+- Crawl graph storage with queryable URL nodes and source-to-target link edges, including source position.
+- Interactive crawl graph visualization with Sigma, Graphology, theme-aware styling, live updates during active crawls, filters, layout controls, selected-node details, and filtered JSON export.
+- Dedicated link reports for all links, internal links, external links, broken or unresolved links, nofollow links, selected URL in-links/out-links, anchor-text aggregation, and redirect chains.
+- Resizable Overview panel with clickable drill-down filters for status, URL distribution, metadata, headings, canonicals, images, technical checks, and issue signals.
+- Overview crawl-speed history with a compact live trend chart.
+- Issue views for response families, titles, meta descriptions, H1/H2, canonicals, directives, images, mobile, hreflang, structured data, security, near-duplicates, and broken links.
+- CSV, XLSX, XML sitemap, graph JSON, HTML report, link edge CSV, and redirect-chain CSV export.
+- Mock-site integration coverage for redirects, broken links, duplicate metadata, graph edges, robots blocking, invalid hreflang, invalid JSON-LD, and redirect loops.
+- Custom extraction through CSS text, CSS attributes, XPath, and regex, wired into crawl config, stored URL details, exports, and dynamic grid columns.
+- Explicit light/dark theme toggle using Etiya design tokens.
 
 See `ROADMAP.md` for the phased implementation plan.
 
@@ -56,15 +81,25 @@ Phase 1 focuses on a shippable crawler:
 
 - Spider mode from a seed URL.
 - Bounded concurrency and rate limiting.
+- Configurable per-host requests-per-second limit.
 - robots.txt support.
 - Configurable User-Agent.
 - Manual redirect recording.
 - Broken-link detection.
 - In-memory storage.
+- SQLite database storage mode.
+- Resume option for the current database crawl.
 - Live UI updates.
 - Virtualized results grid.
+- Light and dark themes.
 - Basic audit views.
 - CSV export.
+- XLSX export.
+- XML sitemap export.
+- Graph JSON export.
+- HTML report export.
+- Link edge and redirect-chain CSV exports.
+- Link report modal and crawl graph modal.
 
 Captured per URL:
 
@@ -72,13 +107,25 @@ Captured per URL:
 - Status code and status text.
 - Content type.
 - Response time.
+- Network timings: DNS lookup, TTFB/header wait, download time, total network time, transfer rate, and resolved IP count.
+- Response hash.
+- Word count.
+- Text-to-code ratio.
+- SimHash near-duplicate cluster.
 - Crawl depth.
 - Title.
 - Meta description.
 - H1.
+- H2.
 - Canonical.
 - Indexability and reason.
+- Meta robots and X-Robots-Tag.
+- Image counts, missing alt counts, and long alt counts.
+- Mixed-content references and insecure forms.
+- Security-header presence.
+- Mobile viewport, AMP, pagination, hreflang, JSON-LD, and social metadata counts.
 - In-link and out-link counts.
+- Source-to-target link edges for crawl graph snapshots.
 
 ## Target Stack
 
@@ -92,6 +139,8 @@ Rust engine:
 - `tracing`
 - `thiserror` and `anyhow`
 - `governor` or equivalent rate limiting
+- `blake3` for response hashes
+- `simhash` for near-duplicate detection
 - SQLite through `rusqlite` or `sqlx` in later phases
 
 Desktop and frontend:
@@ -103,6 +152,7 @@ Desktop and frontend:
 - Zustand or equivalent state management
 - AG Grid Community or TanStack Table with TanStack Virtual
 - Recharts or equivalent charting library
+- Sigma and Graphology for WebGL crawl graph visualization
 
 Dependency versions should be verified against current stable releases before they are pinned.
 

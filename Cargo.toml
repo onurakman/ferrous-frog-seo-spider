@@ -3,6 +3,7 @@ members = [
     "crates/analysis",
     "crates/crawler-core",
     "crates/export",
+    "crates/extractors",
     "crates/parser",
     "crates/storage",
     "src-tauri",
@@ -19,15 +20,25 @@ authors = ["Ferrous Frog Contributors"]
 ferrous-frog-analysis = { path = "crates/analysis" }
 ferrous-frog-crawler-core = { path = "crates/crawler-core" }
 ferrous-frog-export = { path = "crates/export" }
+ferrous-frog-extractors = { path = "crates/extractors" }
 ferrous-frog-parser = { path = "crates/parser" }
 ferrous-frog-storage = { path = "crates/storage" }
 
 anyhow = "1.0.102"
+blake3 = "1.8.5"
 csv = "1.4.0"
+governor = "0.10.4"
+minijinja = "2.20.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["brotli", "charset", "cookies", "deflate", "gzip", "http2", "json", "rustls"] }
+regex = "1.12.4"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+rust_xlsxwriter = "0.95.0"
 scraper = "0.27.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+simhash = "0.3.0"
+sxd-document = "0.3.2"
+sxd-xpath = "0.4.2"
 tauri = "2.11.2"
 tauri-build = "2.6.2"
 texting_robots = "0.2.2"

@@ -12,7 +12,7 @@ Primary stack:
 - Tauri 2 desktop shell.
 - React, TypeScript, and Vite frontend.
 - Virtualized grid UI with server-side paging, sorting, and filtering.
-- In-memory storage for Phase 1, SQLite-backed storage for large/resumable crawls later.
+- In-memory storage for quick crawls and SQLite-backed storage for larger/resumable current crawls.
 
 ## Non-Negotiables
 
@@ -71,6 +71,7 @@ Phase 1 must ship end to end:
 - Capture status, content type, title, meta description, H1, canonical, indexability, response time, depth, in-link count, and out-link count.
 - Basic audit views for response codes, title issues, meta description issues, and broken links.
 - CSV export.
+- SQLite mode, XLSX export, XML sitemap export, custom extraction, near-duplicate clustering, and expanded audit views are already partially implemented. Preserve those paths when changing crawler, storage, export, or UI code.
 
 ## Engineering Rules
 

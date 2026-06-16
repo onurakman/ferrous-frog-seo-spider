@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ferrous Frog SEO Report</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --surface-muted: #f1f5f9;
+      --border: #e2e8f0;
+      --text: #1e293b;
+      --muted: #64748b;
+      --highlight: #0f172a;
+      --primary: #4a4a82;
+      --primary-soft: #ececf6;
+      --danger: #dc2626;
+      --danger-soft: #fee2e2;
+      --warning: #b45309;
+      --warning-soft: #fef3c7;
+      --success: #15803d;
+      --success-soft: #dcfce7;
+      --shadow: 0 18px 50px rgba(15, 23, 42, 0.08);
+    }
+
+    html[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: #171125;
+      --surface: #201733;
+      --surface-muted: #2b2142;
+      --border: #3c3158;
+      --text: #ddd6fe;
+      --muted: #a99fc2;
+      --highlight: #faf5ff;
+      --primary: #f58220;
+      --primary-soft: rgba(245, 130, 32, 0.16);
+      --danger: #fb7185;
+      --danger-soft: rgba(251, 113, 133, 0.16);
+      --warning: #fbbf24;
+      --warning-soft: rgba(251, 191, 36, 0.16);
+      --success: #4ade80;
+      --success-soft: rgba(74, 222, 128, 0.16);
+      --shadow: 0 18px 50px rgba(0, 0, 0, 0.3);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+
+    a {
+      color: inherit;
+    }
+
+    .report {
+      width: min(1240px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 42px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 24px;
+      align-items: start;
+      padding: 28px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--primary);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin-top: 0;
+    }
+
+    h1 {
+      margin-bottom: 10px;
+      color: var(--highlight);
+      font-size: clamp(32px, 5vw, 58px);
+      line-height: 0.98;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      color: var(--highlight);
+      font-size: 18px;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      color: var(--highlight);
+      font-size: 15px;
+      letter-spacing: 0;
+    }
+
+    .lede {
+      max-width: 760px;
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .theme-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 36px;
+      padding: 0 14px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface-muted);
+      color: var(--highlight);
+      font: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      margin-top: 12px;
+      padding: 0 12px;
+      border-radius: 999px;
+      background: var(--primary-soft);
+      color: var(--primary);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    .kpi,
+    .panel,
+    .section-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .kpi {
+      min-width: 0;
+      padding: 16px;
+    }
+
+    .kpi span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .kpi strong {
+      display: block;
+      margin-top: 4px;
+      color: var(--highlight);
+      font-size: 30px;
+      line-height: 1;
+    }
+
+    .kpi p {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .kpi-danger strong {
+      color: var(--danger);
+    }
+
+    .kpi-warning strong {
+      color: var(--warning);
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: minmax(280px, 0.85fr) minmax(0, 1.15fr);
+      gap: 16px;
+      margin-top: 16px;
+    }
+
+    .panel {
+      padding: 20px;
+    }
+
+    .facts {
+      display: grid;
+      gap: 9px;
+      margin: 0;
+    }
+
+    .facts div {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      padding-bottom: 9px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .facts div:last-child {
+      padding-bottom: 0;
+      border-bottom: 0;
+    }
+
+    .facts dt {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .facts dd {
+      margin: 0;
+      color: var(--highlight);
+      font-size: 14px;
+      font-weight: 800;
+    }
+
+    .routing {
+      display: grid;
+      gap: 10px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .routing li {
+      padding: 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface-muted);
+      color: var(--text);
+      font-size: 13px;
+    }
+
+    .routing strong {
+      color: var(--highlight);
+    }
+
+    .sections {
+      display: grid;
+      gap: 16px;
+      margin-top: 16px;
+    }
+
+    .section-card {
+      overflow: hidden;
+    }
+
+    .section-header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: start;
+      padding: 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .section-header p {
+      margin-bottom: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .badge {
+      display: inline-flex;
+      min-height: 26px;
+      align-items: center;
+      padding: 0 10px;
+      border-radius: 999px;
+      background: var(--surface-muted);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .badge-high {
+      background: var(--danger-soft);
+      color: var(--danger);
+    }
+
+    .badge-medium {
+      background: var(--warning-soft);
+      color: var(--warning);
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+
+    th,
+    td {
+      min-width: 160px;
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+      vertical-align: top;
+      font-size: 12px;
+    }
+
+    th {
+      background: var(--surface-muted);
+      color: var(--muted);
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    td {
+      color: var(--text);
+      overflow-wrap: anywhere;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .empty {
+      margin: 0;
+      padding: 18px 20px;
+      color: var(--success);
+      background: var(--success-soft);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .section-note,
+    .footer {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .section-note {
+      padding: 12px 20px 18px;
+      border-top: 1px solid var(--border);
+      background: var(--surface-muted);
+    }
+
+    .footer {
+      margin-top: 18px;
+      padding: 18px 4px 0;
+    }
+
+    @media (max-width: 980px) {
+      .hero,
+      .summary-grid {
+        grid-template-columns: minmax(0, 1fr);
+      }
+
+      .kpis {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .badges {
+        justify-content: flex-start;
+      }
+    }
+
+    @media (max-width: 640px) {
+      .report {
+        width: min(100% - 20px, 1240px);
+        padding-top: 10px;
+      }
+
+      .hero,
+      .panel,
+      .section-header {
+        padding: 16px;
+      }
+
+      .kpis {
+        grid-template-columns: minmax(0, 1fr);
+      }
+    }
+
+    @media print {
+      body {
+        background: #ffffff;
+      }
+
+      .theme-toggle {
+        display: none;
+      }
+
+      .report {
+        width: 100%;
+        padding: 0;
+      }
+
+      .hero,
+      .kpi,
+      .panel,
+      .section-card {
+        box-shadow: none;
+      }
+    }
+  </style>
+  <script>
+    function toggleTheme() {
+      const root = document.documentElement;
+      const next = root.dataset.theme === "dark" ? "light" : "dark";
+      root.dataset.theme = next;
+      try { localStorage.setItem("ferrous-frog-report-theme", next); } catch (_) {}
+    }
+
+    (function initTheme() {
+      try {
+        const saved = localStorage.getItem("ferrous-frog-report-theme");
+        if (saved === "dark" || saved === "light") {
+          document.documentElement.dataset.theme = saved;
+          return;
+        }
+      } catch (_) {}
+      if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+        document.documentElement.dataset.theme = "dark";
+      }
+    })();
+  </script>
+</head>
+<body>
+  <main class="report">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">Ferrous Frog SEO Spider</p>
+        <h1>{{ report.title|e }}</h1>
+        <p class="lede">{{ report.subtitle|e }}</p>
+        <span class="hero-badge">Clean-room crawl report</span>
+      </div>
+      <button class="theme-toggle" type="button" onclick="toggleTheme()">Toggle theme</button>
+    </header>
+
+    <section class="kpis" aria-label="Report summary">
+      {% for kpi in report.kpis %}
+      <article class="kpi kpi-{{ kpi.tone|e }}">
+        <span>{{ kpi.label|e }}</span>
+        <strong>{{ kpi.value|e }}</strong>
+        <p>{{ kpi.description|e }}</p>
+      </article>
+      {% endfor %}
+    </section>
+
+    <section class="summary-grid">
+      <article class="panel">
+        <h2>Status Breakdown</h2>
+        <dl class="facts">
+          {% for fact in report.facts %}
+          <div>
+            <dt>{{ fact.label|e }}</dt>
+            <dd>{{ fact.value|e }}</dd>
+          </div>
+          {% endfor %}
+        </dl>
+      </article>
+      <article class="panel">
+        <h2>Recommended Routing</h2>
+        <ul class="routing">
+          {% for route in report.routing %}
+          <li><strong>{{ route.team|e }}:</strong> {{ route.text|e }}</li>
+          {% endfor %}
+        </ul>
+      </article>
+    </section>
+
+    <section class="sections" aria-label="Issue sections">
+      {% for section in report.sections %}
+      <article class="section-card">
+        <div class="section-header">
+          <div>
+            <h2>{{ section.title|e }}</h2>
+            <p>{{ section.summary|e }}</p>
+          </div>
+          <div class="badges">
+            <span class="badge badge-{{ section.severity|lower|e }}">{{ section.severity|e }}</span>
+            <span class="badge">{{ section.team|e }}</span>
+            <span class="badge">{{ section.count }} {{ section.countLabel|e }}</span>
+          </div>
+        </div>
+
+        {% if section.hasRows %}
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                {% for column in section.columns %}
+                <th>{{ column|e }}</th>
+                {% endfor %}
+              </tr>
+            </thead>
+            <tbody>
+              {% for row in section.rows %}
+              <tr>
+                {% for cell in row.cells %}
+                <td>{{ cell|e }}</td>
+                {% endfor %}
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div class="section-note">
+          Showing up to {{ report.rowLimit }} representative rows for this section. Use CSV, XLSX, or Graph JSON exports for complete data.
+        </div>
+        {% else %}
+        <p class="empty">{{ section.emptyMessage|e }}</p>
+        {% endif %}
+      </article>
+      {% endfor %}
+    </section>
+
+    <footer class="footer">
+      <p>Generated by Ferrous Frog SEO Spider. This report is designed for sharing triaged findings with implementation teams.</p>
+    </footer>
+  </main>
+</body>
+</html>
