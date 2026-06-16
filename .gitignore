@@ -1,0 +1,27 @@
+# Rust
+/target/
+
+# Node/Vite
+/node_modules/
+/dist/
+
+# Tauri bundles
+/src-tauri/target/
+/src-tauri/gen/
+
+# Crawl data and exports
+*.sqlite
+*.sqlite3
+*.db
+*.csv
+*.xlsx
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp

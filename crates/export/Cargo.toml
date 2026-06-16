@@ -1,0 +1,10 @@
+[package]
+name = "ferrous-frog-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+csv.workspace = true
+ferrous-frog-storage.workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "ferrous-frog-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+ferrous-frog-analysis.workspace = true
+ferrous-frog-crawler-core.workspace = true
+ferrous-frog-export.workspace = true
+ferrous-frog-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { workspace = true, features = [] }
+tokio.workspace = true
+
+[[bin]]
+name = "ferrous-frog"
+path = "src/main.rs"

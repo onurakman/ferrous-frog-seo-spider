@@ -1,0 +1,11 @@
+[package]
+name = "ferrous-frog-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+scraper.workspace = true
+serde.workspace = true
+url.workspace = true
