@@ -29,9 +29,28 @@ pub struct CustomExtractor {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct CustomSearch {
+    pub name: String,
+    pub pattern: String,
+    pub regex: bool,
+    pub case_sensitive: bool,
+    pub max_snippets: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ExtractionResult {
     pub name: String,
     pub values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResult {
+    pub name: String,
+    pub matched: bool,
+    pub match_count: usize,
+    pub snippets: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -44,6 +63,8 @@ pub enum ExtractionError {
     XPath { name: String, message: String },
     #[error("invalid XML/HTML document for XPath extractor '{name}': {message}")]
     XPathDocument { name: String, message: String },
+    #[error("invalid regex for search '{name}': {source}")]
+    SearchRegex { name: String, source: regex::Error },
 }
 
 pub fn run_extractors(
@@ -67,6 +88,32 @@ pub fn run_extractors(
     }
 
     Ok(results)
+}
+
+pub fn run_searches(
+    html: &str,
+    searches: &[CustomSearch],
+) -> Result<Vec<SearchResult>, ExtractionError> {
+    searches
+        .iter()
+        .map(|search| run_search(html, search))
+        .collect()
+}
+
+fn run_search(html: &str, search: &CustomSearch) -> Result<SearchResult, ExtractionError> {
+    let max_snippets = search.max_snippets.min(20);
+    let snippets_and_count = if search.regex {
+        regex_search_values(html, search, max_snippets)?
+    } else {
+        text_search_values(html, search, max_snippets)?
+    };
+
+    Ok(SearchResult {
+        name: search.name.clone(),
+        matched: snippets_and_count.0 > 0,
+        match_count: snippets_and_count.0,
+        snippets: snippets_and_count.1,
+    })
 }
 
 fn css_text_values(
@@ -107,6 +154,89 @@ fn regex_values(html: &str, extractor: &CustomExtractor) -> Result<Vec<String>, 
             .map(|match_value| match_value.as_str().to_string())
     });
     Ok(limit_matches(values, extractor.all_matches))
+}
+
+fn regex_search_values(
+    html: &str,
+    search: &CustomSearch,
+    max_snippets: usize,
+) -> Result<(usize, Vec<String>), ExtractionError> {
+    let pattern = if search.case_sensitive {
+        search.pattern.clone()
+    } else {
+        format!("(?i:{})", search.pattern)
+    };
+    let regex = Regex::new(&pattern).map_err(|source| ExtractionError::SearchRegex {
+        name: search.name.clone(),
+        source,
+    })?;
+    let mut count = 0usize;
+    let mut snippets = Vec::new();
+    for match_value in regex.find_iter(html) {
+        count = count.saturating_add(1);
+        if snippets.len() < max_snippets {
+            snippets.push(snippet(html, match_value.start(), match_value.end()));
+        }
+    }
+    Ok((count, snippets))
+}
+
+fn text_search_values(
+    html: &str,
+    search: &CustomSearch,
+    max_snippets: usize,
+) -> Result<(usize, Vec<String>), ExtractionError> {
+    if search.pattern.is_empty() {
+        return Ok((0, Vec::new()));
+    }
+
+    let escaped = regex::escape(&search.pattern);
+    let pattern = if search.case_sensitive {
+        escaped
+    } else {
+        format!("(?i:{escaped})")
+    };
+    let regex = Regex::new(&pattern).map_err(|source| ExtractionError::SearchRegex {
+        name: search.name.clone(),
+        source,
+    })?;
+    let mut count = 0usize;
+    let mut snippets = Vec::new();
+    for match_value in regex.find_iter(html) {
+        count = count.saturating_add(1);
+        if snippets.len() < max_snippets {
+            snippets.push(snippet(html, match_value.start(), match_value.end()));
+        }
+    }
+
+    Ok((count, snippets))
+}
+
+fn snippet(html: &str, start: usize, end: usize) -> String {
+    let context = 48usize;
+    let safe_start = html
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= start)
+        .last()
+        .unwrap_or(0);
+    let safe_end = html
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= end)
+        .unwrap_or(html.len());
+    let prefix_start = html[..safe_start]
+        .char_indices()
+        .rev()
+        .nth(context)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    let suffix_end = html[safe_end..]
+        .char_indices()
+        .nth(context)
+        .map(|(index, _)| safe_end + index)
+        .unwrap_or(html.len());
+    normalize_whitespace(&html[prefix_start..suffix_end])
 }
 
 fn xpath_values(html: &str, extractor: &CustomExtractor) -> Result<Vec<String>, ExtractionError> {
@@ -242,5 +372,40 @@ mod tests {
         let results = run_extractors(html, &extractors).unwrap();
 
         assert_eq!(results[0].values, ["XPath Heading"]);
+    }
+
+    #[test]
+    fn searches_text_in_raw_html() {
+        let html = r#"<script>window.analyticsId = "abc";</script><p>Analytics ready</p>"#;
+        let searches = [CustomSearch {
+            name: "analytics".to_string(),
+            pattern: "analytics".to_string(),
+            regex: false,
+            case_sensitive: false,
+            max_snippets: 2,
+        }];
+
+        let results = run_searches(html, &searches).unwrap();
+
+        assert!(results[0].matched);
+        assert_eq!(results[0].match_count, 2);
+        assert_eq!(results[0].snippets.len(), 2);
+    }
+
+    #[test]
+    fn searches_regex_in_raw_html() {
+        let html = r#"<script>window.analyticsId = "abc-123";</script>"#;
+        let searches = [CustomSearch {
+            name: "analytics_id".to_string(),
+            pattern: r#"analyticsId\s*="#.to_string(),
+            regex: true,
+            case_sensitive: true,
+            max_snippets: 1,
+        }];
+
+        let results = run_searches(html, &searches).unwrap();
+
+        assert_eq!(results[0].match_count, 1);
+        assert!(results[0].snippets[0].contains("analyticsId"));
     }
 }

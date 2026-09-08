@@ -1,31 +1,46 @@
 use anyhow::{Context, Result};
-use ferrous_frog_extractors::{CustomExtractor, run_extractors};
-use ferrous_frog_parser::{PageResourceType, parse_html, same_host};
+use ferrous_frog_extractors::{CustomExtractor, CustomSearch, run_extractors, run_searches};
+use ferrous_frog_parser::{
+    PageResourceType, PageSignals, contains_robots_directive, parse_html, same_host,
+};
 use ferrous_frog_storage::{
-    CrawlRecord, CrawlStore, CrawlSummary, CustomExtractionValue, LinkEdge, LinkType, RedirectHop,
-    UrlClassification, summarize,
+    CrawlFrontierItem, CrawlFrontierState, CrawlRecord, CrawlStore, CrawlSummary,
+    CustomExtractionValue, CustomSearchSource, CustomSearchValue, HreflangLink, ImageAsset,
+    LinkEdge, LinkType, RedirectHop, StructuredDataIssue, UrlClassification, summarize,
 };
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
 use quick_xml::Reader;
+use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use regex::Regex;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, LOCATION};
 use reqwest::{Client, StatusCode, redirect::Policy};
+use rustls::ClientConfig;
+use rustls_pki_types::ServerName;
+use rustls_platform_verifier::ConfigVerifierExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use texting_robots::{Robot, get_robots_url};
-use tokio::net::lookup_host;
+use tokio::net::{TcpStream, lookup_host};
+use tokio::sync::{Mutex, OnceCell};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
+use tokio_rustls::TlsConnector;
 use url::Url;
 
+mod rendering;
+
+pub use rendering::{JsRenderingBackend, JsRenderingConfig};
+
 const DEFAULT_USER_AGENT: &str = "FerrousFrogSeoSpider/0.1 (+https://example.invalid/ferrous-frog)";
+const CRAWL_CANCELLED_MESSAGE: &str = "crawl cancelled";
 const MIN_NEAR_DUPLICATE_WORDS: usize = 20;
 type HostRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;
 
@@ -37,6 +52,8 @@ pub struct CrawlConfig {
     pub start_url: String,
     #[serde(default)]
     pub list_urls: Vec<String>,
+    #[serde(default)]
+    pub list_sitemap_urls: Vec<String>,
     pub max_urls: usize,
     pub max_depth: usize,
     pub concurrency: usize,
@@ -50,17 +67,33 @@ pub struct CrawlConfig {
     pub user_agent: String,
     pub timeout_secs: u64,
     pub max_redirects: usize,
+    #[serde(default = "default_retry_attempts")]
+    pub retry_attempts: u32,
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
     pub near_duplicate_threshold: u32,
     #[serde(default)]
     pub include_url_patterns: Vec<String>,
     #[serde(default)]
     pub exclude_url_patterns: Vec<String>,
     #[serde(default)]
+    pub subdomain_scope: SubdomainScope,
+    #[serde(default)]
+    pub folder_scope: FolderScope,
+    #[serde(default = "default_true")]
+    pub follow_nofollow: bool,
+    #[serde(default)]
     pub resource_types: CrawlResourceTypes,
     #[serde(default)]
     pub query_settings: QuerySettings,
     #[serde(default)]
     pub custom_extractors: Vec<CustomExtractor>,
+    #[serde(default)]
+    pub custom_searches: Vec<CustomSearch>,
+    #[serde(default)]
+    pub rendering: JsRenderingConfig,
+    #[serde(default)]
+    pub resume_from_state: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +102,23 @@ pub enum CrawlMode {
     #[default]
     Spider,
     List,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SubdomainScope {
+    #[default]
+    IncludeSubdomains,
+    ExactHost,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FolderScope {
+    #[default]
+    Anywhere,
+    StartFolder,
+    ExactFolder,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,7 +170,8 @@ impl Default for CrawlConfig {
             mode: CrawlMode::Spider,
             start_url: "https://example.com/".to_string(),
             list_urls: Vec::new(),
-            max_urls: 250,
+            list_sitemap_urls: Vec::new(),
+            max_urls: 5_000,
             max_depth: 3,
             concurrency: 4,
             requests_per_second: 2,
@@ -131,18 +182,34 @@ impl Default for CrawlConfig {
             user_agent: DEFAULT_USER_AGENT.to_string(),
             timeout_secs: 20,
             max_redirects: 10,
+            retry_attempts: default_retry_attempts(),
+            retry_backoff_ms: default_retry_backoff_ms(),
             near_duplicate_threshold: 6,
             include_url_patterns: Vec::new(),
             exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
             resource_types: CrawlResourceTypes::default(),
             query_settings: QuerySettings::default(),
             custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_retry_attempts() -> u32 {
+    1
+}
+
+fn default_retry_backoff_ms() -> u64 {
+    250
 }
 
 #[derive(Clone, Default)]
@@ -207,6 +274,32 @@ pub struct RobotsTxtTestRequest {
 pub struct RobotsTxtTestResult {
     pub allowed: bool,
     pub crawl_delay_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RobotsTxtBatchTestRequest {
+    pub user_agent: String,
+    pub robots_txt: String,
+    pub urls: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RobotsTxtBatchTestRow {
+    pub url: String,
+    pub allowed: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RobotsTxtBatchTestResult {
+    pub crawl_delay_ms: Option<u64>,
+    pub allowed: usize,
+    pub blocked: usize,
+    pub invalid: usize,
+    pub rows: Vec<RobotsTxtBatchTestRow>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -280,10 +373,64 @@ pub fn test_robots_txt(request: RobotsTxtTestRequest) -> Result<RobotsTxtTestRes
         request.user_agent.trim()
     };
     let bytes = request.robots_txt.as_bytes();
-    let robot = Robot::new(user_agent, bytes).context("invalid robots.txt content")?;
+    let robot = parse_robots(user_agent, bytes)?;
     Ok(RobotsTxtTestResult {
         allowed: robot.allowed(url.as_str()),
-        crawl_delay_ms: parse_robots_crawl_delay(bytes),
+        crawl_delay_ms: robots_crawl_delay_ms(&robot),
+    })
+}
+
+pub fn test_robots_txt_batch(
+    request: RobotsTxtBatchTestRequest,
+) -> Result<RobotsTxtBatchTestResult> {
+    let user_agent = if request.user_agent.trim().is_empty() {
+        DEFAULT_USER_AGENT
+    } else {
+        request.user_agent.trim()
+    };
+    let bytes = request.robots_txt.as_bytes();
+    let robot = parse_robots(user_agent, bytes)?;
+    let mut rows = Vec::new();
+    let mut allowed = 0usize;
+    let mut blocked = 0usize;
+    let mut invalid = 0usize;
+
+    for raw_url in request.urls {
+        let trimmed = raw_url.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match Url::parse(trimmed) {
+            Ok(url) => {
+                let is_allowed = robot.allowed(url.as_str());
+                if is_allowed {
+                    allowed = allowed.saturating_add(1);
+                } else {
+                    blocked = blocked.saturating_add(1);
+                }
+                rows.push(RobotsTxtBatchTestRow {
+                    url: url.to_string(),
+                    allowed: is_allowed,
+                    error: None,
+                });
+            }
+            Err(error) => {
+                invalid = invalid.saturating_add(1);
+                rows.push(RobotsTxtBatchTestRow {
+                    url: trimmed.to_string(),
+                    allowed: false,
+                    error: Some(error.to_string()),
+                });
+            }
+        }
+    }
+
+    Ok(RobotsTxtBatchTestResult {
+        crawl_delay_ms: robots_crawl_delay_ms(&robot),
+        allowed,
+        blocked,
+        invalid,
+        rows,
     })
 }
 
@@ -330,6 +477,17 @@ struct QueueItem {
     url: Url,
     depth: usize,
     from_sitemap: bool,
+    storage_key: String,
+    list_position: Option<u32>,
+    list_duplicate_index: u32,
+}
+
+#[derive(Clone, Debug)]
+struct QueueIdentity {
+    storage_key: String,
+    list_position: Option<u32>,
+    list_duplicate_index: u32,
+    from_sitemap: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,18 +503,27 @@ enum DiscoveredResourceType {
 struct DiscoveredUrl {
     url: String,
     resource_type: DiscoveredResourceType,
+    rel_nofollow: bool,
 }
 
 struct FetchOutput {
     record: CrawlRecord,
     links: Vec<DiscoveredUrl>,
     edges: Vec<LinkEdge>,
+    images: Vec<ImageAsset>,
     from_sitemap: bool,
 }
 
-struct RobotsPolicy {
-    robot: Robot,
-    crawl_delay_ms: Option<u64>,
+#[derive(Default)]
+struct OriginPolicy {
+    // ponytail: cache for one crawl; add expiry before supporting crawls over 24 hours.
+    robots: OnceCell<std::result::Result<Option<Robot>, String>>,
+    last_request: Mutex<Option<Instant>>,
+}
+
+struct RequestPolicy {
+    origins: Mutex<HashMap<String, Arc<OriginPolicy>>>,
+    rate_limiter: Option<HostRateLimiter>,
 }
 
 #[derive(Clone)]
@@ -373,6 +540,8 @@ struct QueryRules {
 #[derive(Clone, Copy, Debug, Default)]
 struct NetworkTimings {
     dns_lookup_time_ms: Option<u64>,
+    tcp_connect_time_ms: Option<u64>,
+    tls_handshake_time_ms: Option<u64>,
     ttfb_ms: Option<u64>,
     download_time_ms: Option<u64>,
     total_network_time_ms: Option<u64>,
@@ -397,7 +566,7 @@ where
     F: Fn(CrawlerEvent) + Send + Sync + 'static,
 {
     let on_event = Arc::new(on_event);
-    let mut config = normalize_config(config);
+    let config = normalize_config(config);
     let scope_rules = compile_scope_rules(&config)?;
     let query_rules = compile_query_rules(&config)?;
     let root_url = root_url_from_config(&config, &query_rules)?;
@@ -407,45 +576,53 @@ where
         .timeout(Duration::from_secs(config.timeout_secs))
         .build()
         .context("failed to build HTTP client")?;
-    let robots = fetch_robots(&client, &root_url, &config).await;
-    if let Some(crawl_delay_ms) = robots.as_ref().and_then(|policy| policy.crawl_delay_ms) {
-        config.request_delay_ms = config.request_delay_ms.max(crawl_delay_ms);
-    }
+    let request_policy = Arc::new(RequestPolicy {
+        origins: Mutex::new(HashMap::new()),
+        rate_limiter: host_rate_limiter(config.requests_per_second),
+    });
     let sitemap_urls =
         if config.mode == CrawlMode::Spider && should_fetch_default_sitemap(&root_url) {
-            fetch_sitemap_urls(&client, &root_url).await
+            fetch_default_sitemap_urls(&client, &root_url, &config, &request_policy, &control).await
         } else {
             Vec::new()
         };
-    let rate_limiter = host_rate_limiter(config.requests_per_second);
+    let list_sitemap_seed_urls = if config.mode == CrawlMode::List {
+        fetch_list_sitemap_seed_urls(&client, &config, &root_url, &request_policy, &control).await?
+    } else {
+        Vec::new()
+    };
     let started_at = Instant::now();
-    let mut queue = VecDeque::new();
-    let mut seen = HashSet::new();
-    for item in seed_queue_items(&config, &root_url, &query_rules)? {
-        let normalized = item.url.to_string();
-        if seen.insert(normalized) {
-            queue.push_back(item);
-        }
-    }
-    for mut sitemap_url in sitemap_urls {
-        if seen.len() >= config.max_urls {
-            break;
-        }
-        normalize_url_query(&mut sitemap_url, &config.query_settings, &query_rules);
-        if same_host(&sitemap_url, &root_url) && scope_allows(&sitemap_url, &scope_rules) {
-            let normalized = sitemap_url.to_string();
-            if seen.insert(normalized) {
-                queue.push_back(QueueItem {
-                    url: sitemap_url,
-                    depth: 0,
-                    from_sitemap: true,
-                });
+    let (mut queue, mut seen, mut crawled) = if config.resume_from_state {
+        match restore_frontier_state(&store)? {
+            Some(state) => state,
+            None => {
+                let (queue, seen) = seed_frontier(
+                    &config,
+                    &root_url,
+                    &query_rules,
+                    list_sitemap_seed_urls,
+                    sitemap_urls,
+                    &scope_rules,
+                )?;
+                (queue, seen, 0)
             }
         }
-    }
+    } else {
+        let (queue, seen) = seed_frontier(
+            &config,
+            &root_url,
+            &query_rules,
+            list_sitemap_seed_urls,
+            sitemap_urls,
+            &scope_rules,
+        )?;
+        store.clear_frontier_state();
+        (queue, seen, 0)
+    };
     let mut active = JoinSet::new();
-    let mut crawled = 0usize;
+    let mut active_items = HashMap::<String, QueueItem>::new();
     let mut content_fingerprints = Vec::new();
+    save_frontier_state(&store, &queue, &active_items, &seen, crawled);
 
     on_event(CrawlerEvent::started(progress(
         "running",
@@ -472,40 +649,27 @@ where
             }
 
             let item = queue.pop_front().expect("queue checked as non-empty");
-            if !robots_allowed(robots.as_ref(), &item.url, config.respect_robots) {
-                let mut record = blocked_record(&item.url, item.depth, &root_url);
-                record.in_sitemap = item.from_sitemap;
-                let record = store.upsert(record);
-                crawled += 1;
-                on_event(CrawlerEvent::record(
-                    record,
-                    progress(
-                        "running",
-                        crawled,
-                        queue.len(),
-                        seen.len(),
-                        started_at,
-                        &store,
-                    ),
-                ));
-                continue;
-            }
-
+            let item_key = item.storage_key.clone();
             let task_client = client.clone();
             let task_config = config.clone();
             let task_root = root_url.clone();
-            let task_rate_limiter = rate_limiter.clone();
+            let task_request_policy = request_policy.clone();
             let task_query_rules = query_rules.clone();
+            let task_control = control.clone();
+            active_items.insert(item_key.clone(), item.clone());
+            save_frontier_state(&store, &queue, &active_items, &seen, crawled);
             active.spawn(async move {
-                fetch_one(
+                let result = fetch_one(
                     task_client,
                     task_config,
                     task_root,
-                    task_rate_limiter,
+                    task_request_policy,
                     task_query_rules,
+                    task_control,
                     item,
                 )
-                .await
+                .await;
+                (item_key, result)
             });
         }
 
@@ -513,18 +677,28 @@ where
             break;
         }
 
-        if let Some(joined) = active.join_next().await {
-            let output = match joined {
+        let joined = tokio::select! {
+            joined = active.join_next() => joined,
+            _ = wait_until_cancelled(&control) => break,
+        };
+
+        if let Some(joined) = joined {
+            let (item_key, output) = match joined {
                 Ok(output) => output,
                 Err(error) => {
                     on_event(CrawlerEvent::error(format!("crawl worker failed: {error}")));
                     continue;
                 }
             };
+            active_items.remove(&item_key);
 
             let output = match output {
                 Ok(output) => output,
                 Err(error) => {
+                    save_frontier_state(&store, &queue, &active_items, &seen, crawled);
+                    if control.is_cancelled() && error.to_string() == CRAWL_CANCELLED_MESSAGE {
+                        continue;
+                    }
                     on_event(CrawlerEvent::error(error.to_string()));
                     continue;
                 }
@@ -543,6 +717,9 @@ where
 
             if config.mode == CrawlMode::Spider && next_depth <= config.max_depth {
                 for link in &output.links {
+                    if link.rel_nofollow && !config.follow_nofollow {
+                        continue;
+                    }
                     if seen.len() >= config.max_urls {
                         break;
                     }
@@ -550,12 +727,13 @@ where
                         continue;
                     };
                     normalize_url_query(&mut link_url, &config.query_settings, &query_rules);
-                    if !scope_allows(&link_url, &scope_rules)
+                    if !scope_allows(&link_url, &root_url, &scope_rules, &config)
                         || !should_crawl_discovered(
                             &link_url,
                             &root_url,
                             link.resource_type,
                             &config.resource_types,
+                            config.subdomain_scope,
                         )
                     {
                         continue;
@@ -566,6 +744,9 @@ where
                             url: link_url,
                             depth: next_depth,
                             from_sitemap: false,
+                            storage_key: normalized,
+                            list_position: None,
+                            list_duplicate_index: 0,
                         });
                     }
                 }
@@ -573,6 +754,7 @@ where
 
             let mut record = output.record;
             record.in_sitemap = output.from_sitemap;
+            store.add_image_assets(&record.final_url, output.images);
             assign_near_duplicate_cluster(
                 &mut record,
                 &mut content_fingerprints,
@@ -580,6 +762,7 @@ where
             );
             let record = store.upsert(record);
             crawled += 1;
+            save_frontier_state(&store, &queue, &active_items, &seen, crawled);
             on_event(CrawlerEvent::record(
                 record,
                 progress(
@@ -599,6 +782,11 @@ where
     } else {
         "finished"
     };
+    if status == "finished" && queue.is_empty() && active_items.is_empty() {
+        store.clear_frontier_state();
+    } else {
+        save_frontier_state(&store, &queue, &active_items, &seen, crawled);
+    }
     let final_progress = progress(status, crawled, queue.len(), seen.len(), started_at, &store);
     on_event(CrawlerEvent::finished(final_progress.clone()));
     Ok(final_progress)
@@ -617,6 +805,8 @@ fn normalize_config(mut config: CrawlConfig) -> CrawlConfig {
     if config.max_redirects == 0 {
         config.max_redirects = 10;
     }
+    config.retry_attempts = config.retry_attempts.min(5);
+    config.retry_backoff_ms = config.retry_backoff_ms.min(30_000);
     config.near_duplicate_threshold = config.near_duplicate_threshold.min(64);
     if config.user_agent.trim().is_empty() {
         config.user_agent = DEFAULT_USER_AGENT.to_string();
@@ -631,6 +821,13 @@ fn root_url_from_config(config: &CrawlConfig, query_rules: &QueryRules) -> Resul
             .iter()
             .map(|url| url.trim())
             .find(|url| !url.is_empty())
+            .or_else(|| {
+                config
+                    .list_sitemap_urls
+                    .iter()
+                    .map(|url| url.trim())
+                    .find(|url| !url.is_empty())
+            })
             .unwrap_or(config.start_url.trim())
     } else {
         config.start_url.trim()
@@ -640,20 +837,126 @@ fn root_url_from_config(config: &CrawlConfig, query_rules: &QueryRules) -> Resul
     Ok(root_url)
 }
 
+fn seed_frontier(
+    config: &CrawlConfig,
+    root_url: &Url,
+    query_rules: &QueryRules,
+    list_sitemap_seed_urls: Vec<Url>,
+    sitemap_urls: Vec<Url>,
+    scope_rules: &ScopeRules,
+) -> Result<(VecDeque<QueueItem>, HashSet<String>)> {
+    let mut queue = VecDeque::new();
+    let mut seen = HashSet::new();
+    for item in seed_queue_items(config, root_url, query_rules, &list_sitemap_seed_urls)? {
+        let normalized = item.storage_key.clone();
+        if seen.insert(normalized) {
+            queue.push_back(item);
+        }
+    }
+    for mut sitemap_url in sitemap_urls {
+        if seen.len() >= config.max_urls {
+            break;
+        }
+        normalize_url_query(&mut sitemap_url, &config.query_settings, query_rules);
+        if same_host(&sitemap_url, root_url)
+            && scope_allows(&sitemap_url, root_url, scope_rules, config)
+        {
+            let normalized = sitemap_url.to_string();
+            if seen.insert(normalized.clone()) {
+                queue.push_back(QueueItem {
+                    url: sitemap_url,
+                    depth: 0,
+                    from_sitemap: true,
+                    storage_key: normalized,
+                    list_position: None,
+                    list_duplicate_index: 0,
+                });
+            }
+        }
+    }
+
+    Ok((queue, seen))
+}
+
+fn restore_frontier_state<S: CrawlStore>(
+    store: &S,
+) -> Result<Option<(VecDeque<QueueItem>, HashSet<String>, usize)>> {
+    let Some(state) = store.load_frontier_state() else {
+        return Ok(None);
+    };
+    if state.queued.is_empty() && state.seen.is_empty() {
+        return Ok(None);
+    }
+
+    let mut queue = VecDeque::new();
+    for item in state.queued {
+        queue.push_back(queue_item_from_frontier(item)?);
+    }
+    let seen = state.seen.into_iter().collect::<HashSet<_>>();
+    Ok(Some((queue, seen, state.crawled)))
+}
+
+fn save_frontier_state<S: CrawlStore>(
+    store: &S,
+    queue: &VecDeque<QueueItem>,
+    active_items: &HashMap<String, QueueItem>,
+    seen: &HashSet<String>,
+    crawled: usize,
+) {
+    let mut queued = active_items
+        .values()
+        .map(frontier_item_from_queue)
+        .collect::<Vec<_>>();
+    queued.extend(queue.iter().map(frontier_item_from_queue));
+    let mut seen = seen.iter().cloned().collect::<Vec<_>>();
+    seen.sort();
+    store.save_frontier_state(CrawlFrontierState {
+        queued,
+        seen,
+        crawled,
+    });
+}
+
+fn frontier_item_from_queue(item: &QueueItem) -> CrawlFrontierItem {
+    CrawlFrontierItem {
+        url: item.url.to_string(),
+        depth: item.depth,
+        from_sitemap: item.from_sitemap,
+        storage_key: item.storage_key.clone(),
+        list_position: item.list_position,
+        list_duplicate_index: item.list_duplicate_index,
+    }
+}
+
+fn queue_item_from_frontier(item: CrawlFrontierItem) -> Result<QueueItem> {
+    Ok(QueueItem {
+        url: Url::parse(&item.url).with_context(|| format!("invalid queued URL: {}", item.url))?,
+        depth: item.depth,
+        from_sitemap: item.from_sitemap,
+        storage_key: item.storage_key,
+        list_position: item.list_position,
+        list_duplicate_index: item.list_duplicate_index,
+    })
+}
+
 fn seed_queue_items(
     config: &CrawlConfig,
     root_url: &Url,
     query_rules: &QueryRules,
+    list_sitemap_seed_urls: &[Url],
 ) -> Result<Vec<QueueItem>> {
     if config.mode == CrawlMode::Spider {
         return Ok(vec![QueueItem {
             url: root_url.clone(),
             depth: 0,
             from_sitemap: false,
+            storage_key: root_url.to_string(),
+            list_position: None,
+            list_duplicate_index: 0,
         }]);
     }
 
-    let seeds = if config.list_urls.is_empty() {
+    let manual_seeds = if config.list_urls.is_empty() && list_sitemap_seed_urls.is_empty() {
         vec![config.start_url.trim()]
     } else {
         config
@@ -665,20 +968,43 @@ fn seed_queue_items(
     };
 
     let mut items = Vec::new();
-    for seed in seeds {
+    let mut duplicate_counts = HashMap::<String, u32>::new();
+    for seed in manual_seeds {
         let mut url = Url::parse(seed).with_context(|| format!("invalid list URL: {seed}"))?;
         normalize_url_query(&mut url, &config.query_settings, query_rules);
-        items.push(QueueItem {
-            url,
-            depth: 0,
-            from_sitemap: false,
-        });
+        push_list_queue_item(&mut items, &mut duplicate_counts, url, false);
+    }
+
+    for sitemap_seed_url in list_sitemap_seed_urls {
+        let mut url = sitemap_seed_url.clone();
+        normalize_url_query(&mut url, &config.query_settings, query_rules);
+        push_list_queue_item(&mut items, &mut duplicate_counts, url, true);
     }
 
     if items.is_empty() {
         anyhow::bail!("list mode requires at least one URL");
     }
     Ok(items)
+}
+
+fn push_list_queue_item(
+    items: &mut Vec<QueueItem>,
+    duplicate_counts: &mut HashMap<String, u32>,
+    url: Url,
+    from_sitemap: bool,
+) {
+    let normalized = url.to_string();
+    let duplicate_index = duplicate_counts.entry(normalized.clone()).or_insert(0);
+    *duplicate_index = duplicate_index.saturating_add(1);
+    let list_position = items.len().saturating_add(1).min(u32::MAX as usize) as u32;
+    items.push(QueueItem {
+        url,
+        depth: 0,
+        from_sitemap,
+        storage_key: format!("list:{list_position}:{normalized}"),
+        list_position: Some(list_position),
+        list_duplicate_index: *duplicate_index,
+    });
 }
 
 fn compile_scope_rules(config: &CrawlConfig) -> Result<ScopeRules> {
@@ -708,12 +1034,62 @@ fn compile_regex_list(patterns: &[String], label: &str) -> Result<Vec<Regex>> {
         .collect()
 }
 
-fn scope_allows(url: &Url, rules: &ScopeRules) -> bool {
+fn scope_allows(url: &Url, root_url: &Url, rules: &ScopeRules, config: &CrawlConfig) -> bool {
     let value = url.as_str();
     if !rules.include.is_empty() && !rules.include.iter().any(|pattern| pattern.is_match(value)) {
         return false;
     }
-    !rules.exclude.iter().any(|pattern| pattern.is_match(value))
+    if rules.exclude.iter().any(|pattern| pattern.is_match(value)) {
+        return false;
+    }
+
+    scope_modes_allow(url, root_url, config)
+}
+
+fn scope_modes_allow(url: &Url, root_url: &Url, config: &CrawlConfig) -> bool {
+    scope_host_allows(url, root_url, config.subdomain_scope)
+        && folder_scope_allows(url, root_url, config.folder_scope)
+}
+
+fn scope_host_allows(url: &Url, root_url: &Url, scope: SubdomainScope) -> bool {
+    let Some(host) = url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+    let Some(root_host) = root_url.host_str().map(str::to_ascii_lowercase) else {
+        return false;
+    };
+
+    match scope {
+        SubdomainScope::ExactHost => host == root_host,
+        SubdomainScope::IncludeSubdomains => {
+            let base_host = root_host.strip_prefix("www.").unwrap_or(&root_host);
+            host == root_host || host == base_host || host.ends_with(&format!(".{base_host}"))
+        }
+    }
+}
+
+fn folder_scope_allows(url: &Url, root_url: &Url, scope: FolderScope) -> bool {
+    match scope {
+        FolderScope::Anywhere => true,
+        FolderScope::StartFolder => url.path().starts_with(&folder_path(root_url)),
+        FolderScope::ExactFolder => folder_path(url) == folder_path(root_url),
+    }
+}
+
+fn folder_path(url: &Url) -> String {
+    let path = url.path();
+    if path.ends_with('/') {
+        return path.to_string();
+    }
+    path.rsplit_once('/')
+        .map(|(folder, _)| {
+            if folder.is_empty() {
+                "/".to_string()
+            } else {
+                format!("{folder}/")
+            }
+        })
+        .unwrap_or_else(|| "/".to_string())
 }
 
 fn normalize_url_query(url: &mut Url, settings: &QuerySettings, rules: &QueryRules) {
@@ -760,8 +1136,9 @@ fn should_crawl_discovered(
     root_url: &Url,
     resource_type: DiscoveredResourceType,
     resource_types: &CrawlResourceTypes,
+    subdomain_scope: SubdomainScope,
 ) -> bool {
-    let is_internal = same_host(url, root_url);
+    let is_internal = scope_host_allows(url, root_url, subdomain_scope);
     if !is_internal && !resource_types.external {
         return false;
     }
@@ -810,99 +1187,236 @@ async fn wait_if_paused(control: &CrawlControl) {
     }
 }
 
+async fn wait_until_cancelled(control: &CrawlControl) {
+    while !control.is_cancelled() {
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn ensure_not_cancelled(control: &CrawlControl) -> Result<()> {
+    if control.is_cancelled() {
+        anyhow::bail!(CRAWL_CANCELLED_MESSAGE);
+    }
+    Ok(())
+}
+
 async fn fetch_robots(
+    client: &Client,
+    url: &Url,
+    config: &CrawlConfig,
+    request_policy: &RequestPolicy,
+    control: &CrawlControl,
+) -> Result<Option<Robot>> {
+    if config.use_robots_txt_override && !config.robots_txt_override.trim().is_empty() {
+        return parse_robots(&config.user_agent, config.robots_txt_override.as_bytes()).map(Some);
+    }
+
+    let mut robots_url = Url::parse(&get_robots_url(url.as_str())?)?;
+    // RFC 9309 permits robots.txt redirects across origins; the resulting policy
+    // still belongs to the origin that requested it.
+    for redirect_count in 0..=5 {
+        request_policy
+            .wait(&robots_url, config.request_delay_ms, control)
+            .await?;
+        let response = client
+            .get(robots_url.clone())
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch robots.txt: {robots_url}"))?;
+        if response.status().is_redirection() {
+            if redirect_count == 5 {
+                anyhow::bail!("robots.txt exceeded five redirects: {robots_url}");
+            }
+            let location = redirect_location(response.headers())
+                .context("robots.txt redirect missing Location header")?;
+            robots_url = robots_url
+                .join(&location)
+                .context("invalid robots.txt redirect")?;
+            continue;
+        }
+        if response.status().is_client_error() {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "robots.txt returned HTTP {}: {robots_url}",
+                response.status().as_u16()
+            );
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .with_context(|| format!("failed to read robots.txt: {robots_url}"))?;
+        return parse_robots(&config.user_agent, &bytes).map(Some);
+    }
+    unreachable!("robots redirect loop always returns");
+}
+
+fn parse_robots(user_agent: &str, bytes: &[u8]) -> Result<Robot> {
+    let product_token = user_agent
+        .trim()
+        .split(['/', ' ', '\t'])
+        .next()
+        .unwrap_or(user_agent);
+    Robot::new(product_token, bytes).context("invalid robots.txt content")
+}
+
+fn robots_crawl_delay_ms(robot: &Robot) -> Option<u64> {
+    robot
+        .delay
+        .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+        .map(|seconds| (f64::from(seconds) * 1_000.0).round() as u64)
+}
+
+#[derive(Clone, Debug, Default)]
+struct ParsedSitemap {
+    urls: Vec<Url>,
+    sitemaps: Vec<Url>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SitemapEntryKind {
+    Url,
+    Sitemap,
+}
+
+async fn fetch_default_sitemap_urls(
     client: &Client,
     root_url: &Url,
     config: &CrawlConfig,
-) -> Option<RobotsPolicy> {
-    if !config.respect_robots {
-        return None;
-    }
-
-    if config.use_robots_txt_override && !config.robots_txt_override.trim().is_empty() {
-        let bytes = config.robots_txt_override.as_bytes();
-        let crawl_delay_ms = parse_robots_crawl_delay(bytes);
-        let robot = Robot::new(&config.user_agent, bytes).ok()?;
-        return Some(RobotsPolicy {
-            robot,
-            crawl_delay_ms,
-        });
-    }
-
-    let robots_url = get_robots_url(root_url.as_str()).ok()?;
-    let response = client.get(robots_url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let bytes = response.bytes().await.ok()?;
-    let crawl_delay_ms = parse_robots_crawl_delay(&bytes);
-    let robot = Robot::new(&config.user_agent, &bytes).ok()?;
-    Some(RobotsPolicy {
-        robot,
-        crawl_delay_ms,
-    })
-}
-
-fn parse_robots_crawl_delay(bytes: &[u8]) -> Option<u64> {
-    let text = std::str::from_utf8(bytes).ok()?;
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("crawl-delay") {
-            let seconds = value.trim().parse::<f64>().ok()?;
-            if seconds.is_finite() && seconds >= 0.0 {
-                return Some((seconds * 1_000.0).round() as u64);
-            }
-        }
-    }
-    None
-}
-
-async fn fetch_sitemap_urls(client: &Client, root_url: &Url) -> Vec<Url> {
+    request_policy: &RequestPolicy,
+    control: &CrawlControl,
+) -> Vec<Url> {
     let Ok(sitemap_url) = root_url.join("/sitemap.xml") else {
         return Vec::new();
     };
-    let Ok(response) = client.get(sitemap_url).send().await else {
-        return Vec::new();
-    };
-    if !response.status().is_success() {
-        return Vec::new();
-    }
-    let Ok(bytes) = response.bytes().await else {
-        return Vec::new();
-    };
-    let Ok(xml) = std::str::from_utf8(&bytes) else {
-        return Vec::new();
-    };
-    parse_sitemap_urls(xml, root_url)
+    fetch_sitemap_locations(client, &sitemap_url, config, request_policy, control)
+        .await
+        .unwrap_or_default()
 }
 
 fn should_fetch_default_sitemap(root_url: &Url) -> bool {
     root_url.path() == "/" && root_url.query().is_none()
 }
 
-fn parse_sitemap_urls(xml: &str, root_url: &Url) -> Vec<Url> {
+async fn fetch_list_sitemap_seed_urls(
+    client: &Client,
+    config: &CrawlConfig,
+    root_url: &Url,
+    request_policy: &RequestPolicy,
+    control: &CrawlControl,
+) -> Result<Vec<Url>> {
+    let mut urls = Vec::new();
+    for seed in config
+        .list_sitemap_urls
+        .iter()
+        .map(|url| url.trim())
+        .filter(|url| !url.is_empty())
+    {
+        let sitemap_url = Url::parse(seed)
+            .or_else(|_| root_url.join(seed))
+            .with_context(|| format!("invalid list sitemap URL: {seed}"))?;
+        urls.extend(
+            fetch_sitemap_locations(client, &sitemap_url, config, request_policy, control).await?,
+        );
+    }
+    Ok(urls)
+}
+
+async fn fetch_sitemap_locations(
+    client: &Client,
+    sitemap_url: &Url,
+    config: &CrawlConfig,
+    request_policy: &RequestPolicy,
+    control: &CrawlControl,
+) -> Result<Vec<Url>> {
+    const MAX_SITEMAP_DOCUMENTS: usize = 128;
+    const MAX_SITEMAP_DEPTH: usize = 4;
+
+    let mut pending = VecDeque::from([(sitemap_url.clone(), 0usize)]);
+    let mut seen_sitemaps = HashSet::new();
+    let mut urls = Vec::new();
+
+    while let Some((current_url, depth)) = pending.pop_front() {
+        if seen_sitemaps.len() >= MAX_SITEMAP_DOCUMENTS {
+            break;
+        }
+        if !seen_sitemaps.insert(current_url.to_string()) {
+            continue;
+        }
+
+        let delay = request_policy
+            .robots_delay(client, config, &current_url, control)
+            .await
+            .with_context(|| format!("cannot crawl sitemap: {current_url}"))?;
+        request_policy.wait(&current_url, delay, control).await?;
+        let response = client
+            .get(current_url.clone())
+            .send()
+            .await
+            .with_context(|| format!("failed to fetch sitemap: {current_url}"))?;
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "sitemap returned status {}: {}",
+                response.status().as_u16(),
+                current_url
+            );
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .with_context(|| format!("failed to read sitemap body: {current_url}"))?;
+        let xml = std::str::from_utf8(&bytes)
+            .with_context(|| format!("sitemap is not valid UTF-8: {current_url}"))?;
+        let parsed = parse_sitemap_document(xml, &current_url);
+        urls.extend(parsed.urls);
+
+        if depth < MAX_SITEMAP_DEPTH {
+            for child_sitemap_url in parsed.sitemaps {
+                if !seen_sitemaps.contains(child_sitemap_url.as_str()) {
+                    pending.push_back((child_sitemap_url, depth + 1));
+                }
+            }
+        }
+    }
+
+    Ok(urls)
+}
+
+fn parse_sitemap_document(xml: &str, root_url: &Url) -> ParsedSitemap {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-    let mut urls = Vec::new();
-    let mut in_loc = false;
+    let mut parsed = ParsedSitemap::default();
+    let mut current_entry = None;
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(element)) if element.name().as_ref() == b"loc" => {
-                in_loc = true;
+            Ok(Event::Start(element)) if xml_name_matches(element.name().as_ref(), b"url") => {
+                current_entry = Some(SitemapEntryKind::Url);
             }
-            Ok(Event::End(element)) if element.name().as_ref() == b"loc" => {
-                in_loc = false;
+            Ok(Event::Start(element)) if xml_name_matches(element.name().as_ref(), b"sitemap") => {
+                current_entry = Some(SitemapEntryKind::Sitemap);
             }
-            Ok(Event::Text(text)) if in_loc => {
-                if let Ok(value) = text.decode() {
-                    if let Ok(url) = root_url.join(value.trim()) {
-                        urls.push(url);
+            Ok(Event::Start(element)) if xml_name_matches(element.name().as_ref(), b"loc") => {
+                if let Ok(text) = reader.read_text(element.name()) {
+                    if let Ok(value) = text.decode() {
+                        let value = unescape(value.trim())
+                            .map(|value| value.into_owned())
+                            .unwrap_or_else(|_| value.trim().to_string());
+                        if let Ok(url) = root_url.join(&value) {
+                            match current_entry {
+                                Some(SitemapEntryKind::Sitemap) => parsed.sitemaps.push(url),
+                                _ => parsed.urls.push(url),
+                            }
+                        }
                     }
                 }
+            }
+            Ok(Event::End(element)) if xml_name_matches(element.name().as_ref(), b"url") => {
+                current_entry = None;
+            }
+            Ok(Event::End(element)) if xml_name_matches(element.name().as_ref(), b"sitemap") => {
+                current_entry = None;
             }
             Ok(Event::Eof) => break,
             Err(_) => break,
@@ -910,62 +1424,130 @@ fn parse_sitemap_urls(xml: &str, root_url: &Url) -> Vec<Url> {
         }
     }
 
-    urls
+    parsed
 }
 
-fn robots_allowed(policy: Option<&RobotsPolicy>, url: &Url, respect_robots: bool) -> bool {
-    if !respect_robots {
-        return true;
-    }
-
-    policy
-        .map(|policy| policy.robot.allowed(url.as_str()))
-        .unwrap_or(true)
+fn xml_name_matches(name: &[u8], expected: &[u8]) -> bool {
+    name == expected
+        || name
+            .rsplit(|byte| *byte == b':')
+            .next()
+            .map(|local_name| local_name == expected)
+            .unwrap_or(false)
 }
 
 async fn fetch_one(
     client: Client,
     config: CrawlConfig,
     root_url: Url,
-    rate_limiter: Option<HostRateLimiter>,
+    request_policy: Arc<RequestPolicy>,
     query_rules: QueryRules,
+    control: CrawlControl,
     item: QueueItem,
 ) -> Result<FetchOutput> {
     let original_url = item.url.clone();
     let started_at = Instant::now();
+    let queue_identity = QueueIdentity {
+        storage_key: item.storage_key.clone(),
+        list_position: item.list_position,
+        list_duplicate_index: item.list_duplicate_index,
+        from_sitemap: item.from_sitemap,
+    };
     let mut current_url = item.url;
     let mut redirect_chain = Vec::new();
 
     for _ in 0..=config.max_redirects {
-        wait_for_politeness(&current_url, config.request_delay_ms, rate_limiter.as_ref()).await;
-
-        let mut network_timings = NetworkTimings::default();
-        let (dns_lookup_time_ms, resolved_ip_count) = measure_dns_lookup(&current_url).await;
-        network_timings.dns_lookup_time_ms = dns_lookup_time_ms;
-        network_timings.resolved_ip_count = resolved_ip_count;
-
-        let request_started_at = Instant::now();
-        let response = match client.get(current_url.clone()).send().await {
-            Ok(response) => response,
+        wait_if_paused(&control).await;
+        ensure_not_cancelled(&control)?;
+        let request_delay_ms = match request_policy
+            .robots_delay(&client, &config, &current_url, &control)
+            .await
+        {
+            Ok(delay) => delay,
             Err(error) => {
-                network_timings.total_network_time_ms = Some(elapsed_ms(request_started_at));
-                return Ok(FetchOutput {
-                    record: with_network_timings(
-                        error_record(
-                            &original_url,
-                            &current_url,
-                            item.depth,
-                            &root_url,
-                            started_at,
-                            error.to_string(),
-                            redirect_chain,
+                ensure_not_cancelled(&control)?;
+                let mut record = blocked_record(&current_url, item.depth, &root_url);
+                record.url = original_url.to_string();
+                record.response_time_ms = elapsed_ms(started_at);
+                record.redirect_target = redirect_chain
+                    .last()
+                    .and_then(|hop: &RedirectHop| hop.location.clone());
+                record.redirect_type = redirect_chain.last().map(|hop| hop.status_code.to_string());
+                record.redirect_chain = redirect_chain;
+                record.error = Some(format!("{error:#}"));
+                return Ok(fetch_output(
+                    record,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    &queue_identity,
+                ));
+            }
+        };
+        let mut request_attempt = 0;
+        let (response, mut network_timings, request_started_at) = loop {
+            wait_if_paused(&control).await;
+            ensure_not_cancelled(&control)?;
+
+            let mut network_timings = NetworkTimings::default();
+            let (dns_lookup_time_ms, resolved_ip_count, tcp_address) =
+                measure_dns_lookup(&current_url).await;
+            network_timings.dns_lookup_time_ms = dns_lookup_time_ms;
+            network_timings.resolved_ip_count = resolved_ip_count;
+            ensure_not_cancelled(&control)?;
+            let (tcp_connect_time_ms, tls_handshake_time_ms) =
+                measure_connection_probe(&current_url, tcp_address, tcp_connect_timeout(&config))
+                    .await;
+            network_timings.tcp_connect_time_ms = tcp_connect_time_ms;
+            network_timings.tls_handshake_time_ms = tls_handshake_time_ms;
+            request_policy
+                .wait(&current_url, request_delay_ms, &control)
+                .await?;
+
+            let request_started_at = Instant::now();
+            match client.get(current_url.clone()).send().await {
+                Ok(response) => {
+                    network_timings.ttfb_ms = Some(elapsed_ms(request_started_at));
+                    network_timings.total_network_time_ms = network_timings.ttfb_ms;
+                    if retryable_status(response.status())
+                        && request_attempt < config.retry_attempts
+                    {
+                        request_attempt = request_attempt.saturating_add(1);
+                        sleep_retry_backoff(&config, request_attempt).await;
+                        wait_if_paused(&control).await;
+                        ensure_not_cancelled(&control)?;
+                        continue;
+                    }
+                    break (response, network_timings, request_started_at);
+                }
+                Err(error) => {
+                    network_timings.total_network_time_ms = Some(elapsed_ms(request_started_at));
+                    if request_attempt < config.retry_attempts {
+                        request_attempt = request_attempt.saturating_add(1);
+                        sleep_retry_backoff(&config, request_attempt).await;
+                        wait_if_paused(&control).await;
+                        ensure_not_cancelled(&control)?;
+                        continue;
+                    }
+                    return Ok(fetch_output(
+                        with_network_timings(
+                            error_record(
+                                &original_url,
+                                &current_url,
+                                item.depth,
+                                &root_url,
+                                started_at,
+                                error.to_string(),
+                                redirect_chain,
+                            ),
+                            network_timings,
                         ),
-                        network_timings,
-                    ),
-                    links: Vec::new(),
-                    edges: Vec::new(),
-                    from_sitemap: item.from_sitemap,
-                });
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        &queue_identity,
+                    ));
+                }
             }
         };
         network_timings.ttfb_ms = Some(elapsed_ms(request_started_at));
@@ -989,19 +1571,20 @@ async fn fetch_one(
                     Some("Redirect response missing Location header".to_string()),
                 );
                 apply_network_timings(&mut record, network_timings);
-                return Ok(FetchOutput {
+                return Ok(fetch_output(
                     record,
-                    links: Vec::new(),
-                    edges: Vec::new(),
-                    from_sitemap: item.from_sitemap,
-                });
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    &queue_identity,
+                ));
             };
 
             let next_url = match current_url.join(&location) {
                 Ok(url) => url,
                 Err(error) => {
-                    return Ok(FetchOutput {
-                        record: with_network_timings(
+                    return Ok(fetch_output(
+                        with_network_timings(
                             error_record(
                                 &original_url,
                                 &current_url,
@@ -1013,10 +1596,11 @@ async fn fetch_one(
                             ),
                             network_timings,
                         ),
-                        links: Vec::new(),
-                        edges: Vec::new(),
-                        from_sitemap: item.from_sitemap,
-                    });
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        &queue_identity,
+                    ));
                 }
             };
 
@@ -1028,12 +1612,14 @@ async fn fetch_one(
                 status_code: status.as_u16(),
                 location: Some(next_url_string.clone()),
                 dns_lookup_time_ms: network_timings.dns_lookup_time_ms,
+                tcp_connect_time_ms: network_timings.tcp_connect_time_ms,
+                tls_handshake_time_ms: network_timings.tls_handshake_time_ms,
                 ttfb_ms: network_timings.ttfb_ms,
                 elapsed_ms: network_timings.ttfb_ms,
             });
             if redirect_loop_detected {
-                return Ok(FetchOutput {
-                    record: with_network_timings(
+                return Ok(fetch_output(
+                    with_network_timings(
                         error_record(
                             &original_url,
                             &current_url,
@@ -1045,10 +1631,11 @@ async fn fetch_one(
                         ),
                         network_timings,
                     ),
-                    links: Vec::new(),
-                    edges: Vec::new(),
-                    from_sitemap: item.from_sitemap,
-                });
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    &queue_identity,
+                ));
             }
             current_url = next_url;
             continue;
@@ -1061,8 +1648,8 @@ async fn fetch_one(
             Err(error) => {
                 network_timings.download_time_ms = Some(elapsed_ms(download_started_at));
                 network_timings.total_network_time_ms = Some(elapsed_ms(request_started_at));
-                return Ok(FetchOutput {
-                    record: with_network_timings(
+                return Ok(fetch_output(
+                    with_network_timings(
                         error_record(
                             &original_url,
                             &current_url,
@@ -1074,10 +1661,11 @@ async fn fetch_one(
                         ),
                         network_timings,
                     ),
-                    links: Vec::new(),
-                    edges: Vec::new(),
-                    from_sitemap: item.from_sitemap,
-                });
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    &queue_identity,
+                ));
             }
         };
         network_timings.download_time_ms = Some(elapsed_ms(download_started_at));
@@ -1105,15 +1693,39 @@ async fn fetch_one(
         apply_network_timings(&mut record, network_timings);
         let mut links = Vec::new();
         let mut edges = Vec::new();
+        let mut image_assets = Vec::new();
 
         if is_html {
-            let html = String::from_utf8_lossy(&bytes);
-            let signals = parse_html(&current_url, &html);
+            let raw_html = String::from_utf8_lossy(&bytes);
+            let rendered_html = match rendering::render_page_if_enabled(
+                &config.rendering,
+                &current_url,
+                config.timeout_secs,
+            )
+            .await
+            {
+                Ok(rendered) => rendered.map(|page| page.html),
+                Err(error) => {
+                    record.error = Some(format!("JavaScript rendering failed: {error}"));
+                    None
+                }
+            };
+            let raw_signals = rendered_html
+                .as_ref()
+                .map(|_| parse_html(&current_url, &raw_html));
+            let html = rendered_html.as_deref().unwrap_or(&raw_html);
+            let signals = parse_html(&current_url, html);
+            if let Some(raw_signals) = raw_signals.as_ref() {
+                apply_rendered_dom_diff(&mut record, raw_signals, &signals);
+            }
+            let page_images = signals.images;
             let visible_text = signals.visible_text;
             record.title = signals.title;
             record.title_len = signals.title_len;
+            record.title_pixel_width = signals.title_pixel_width;
             record.meta_description = signals.meta_description;
             record.meta_description_len = signals.meta_description_len;
+            record.meta_description_pixel_width = signals.meta_description_pixel_width;
             record.meta_robots = signals.meta_robots;
             record.h1 = signals.h1;
             record.h1_len = signals.h1_len;
@@ -1123,8 +1735,6 @@ async fn fetch_one(
             record.h2_count = signals.h2_count;
             record.canonical = signals.canonical;
             record.canonical_count = signals.canonical_count;
-            record.indexability = signals.indexability;
-            record.indexability_status = signals.indexability_status;
             record.word_count = signals.word_count;
             record.text_to_code_ratio = signals.text_to_code_ratio;
             record.image_count = signals.image_count;
@@ -1139,22 +1749,77 @@ async fn fetch_one(
             record.hreflang_count = signals.hreflang_count;
             record.hreflang_invalid_count = signals.hreflang_invalid_count;
             record.hreflang_missing_self_reference = signals.hreflang_missing_self_reference;
+            record.hreflang_links = signals
+                .hreflang_links
+                .into_iter()
+                .map(|link| HreflangLink {
+                    hreflang: link.hreflang,
+                    url: link.url,
+                    valid: link.valid,
+                })
+                .collect();
             record.json_ld_count = signals.json_ld_count;
             record.json_ld_invalid_count = signals.json_ld_invalid_count;
+            record.structured_data_error_count = signals.structured_data_error_count;
+            record.structured_data_warning_count = signals.structured_data_warning_count;
+            record.structured_data_issues = signals
+                .structured_data_issues
+                .into_iter()
+                .map(|issue| StructuredDataIssue {
+                    severity: issue.severity,
+                    message: issue.message,
+                    path: issue.path,
+                })
+                .collect();
             record.open_graph_count = signals.open_graph_count;
             record.twitter_card_count = signals.twitter_card_count;
-            apply_directives_and_canonical(&mut record, &current_url);
+            record.deprecated_html_tag_count = signals.deprecated_html_tag_count;
+            record.duplicate_id_count = signals.duplicate_id_count;
+            let page_nofollow =
+                contains_robots_directive(record.meta_robots.as_deref(), "nofollow")
+                    || contains_robots_directive(record.x_robots_tag.as_deref(), "nofollow");
             if !visible_text.is_empty() {
                 record.simhash = Some(simhash::simhash(&visible_text));
             }
-            record.custom_extractions = extract_custom_values(&html, &config.custom_extractors);
+            record.custom_extractions = extract_custom_values(html, &config.custom_extractors);
+            record.custom_searches = search_custom_values(
+                &raw_html,
+                &config.custom_searches,
+                CustomSearchSource::RawHtml,
+            );
+            if let Some(rendered_html) = rendered_html.as_deref() {
+                record.custom_searches.extend(search_custom_values(
+                    rendered_html,
+                    &config.custom_searches,
+                    CustomSearchSource::RenderedHtml,
+                ));
+            }
+
+            for image in page_images {
+                image_assets.push(ImageAsset {
+                    id: 0,
+                    page_url: current_url.to_string(),
+                    image_url: image.url,
+                    alt_text: image.alt_text,
+                    alt_len: image.alt_len,
+                    missing_alt: image.missing_alt,
+                    alt_too_long: image.alt_too_long,
+                    width: image.width,
+                    height: image.height,
+                    source_position: image.source_position,
+                    size_bytes: None,
+                    oversized: false,
+                });
+            }
 
             for link in signals.links {
+                let rel_nofollow = link.rel_nofollow || page_nofollow;
                 let mut target_url = Url::parse(&link.url)?;
                 normalize_url_query(&mut target_url, &config.query_settings, &query_rules);
                 let target_url_string = target_url.to_string();
                 let resource_type = classify_anchor_resource(&target_url);
-                let link_type = if same_host(&target_url, &root_url) {
+                let link_type = if scope_host_allows(&target_url, &root_url, config.subdomain_scope)
+                {
                     LinkType::Internal
                 } else {
                     LinkType::External
@@ -1167,6 +1832,7 @@ async fn fetch_one(
                 links.push(DiscoveredUrl {
                     url: target_url_string.clone(),
                     resource_type,
+                    rel_nofollow,
                 });
                 edges.push(LinkEdge {
                     id: 0,
@@ -1174,7 +1840,7 @@ async fn fetch_one(
                     target_url: target_url_string,
                     anchor_text: link.text,
                     rel: link.rel,
-                    rel_nofollow: link.rel_nofollow,
+                    rel_nofollow,
                     link_type,
                     source_status_code: Some(status.as_u16()),
                     target_status_code: None,
@@ -1190,7 +1856,8 @@ async fn fetch_one(
                 normalize_url_query(&mut target_url, &config.query_settings, &query_rules);
                 let target_url_string = target_url.to_string();
                 let resource_type = map_page_resource_type(resource.resource_type);
-                let link_type = if same_host(&target_url, &root_url) {
+                let link_type = if scope_host_allows(&target_url, &root_url, config.subdomain_scope)
+                {
                     LinkType::Internal
                 } else {
                     LinkType::External
@@ -1203,6 +1870,7 @@ async fn fetch_one(
                 links.push(DiscoveredUrl {
                     url: target_url_string.clone(),
                     resource_type,
+                    rel_nofollow: page_nofollow,
                 });
                 edges.push(LinkEdge {
                     id: 0,
@@ -1210,7 +1878,7 @@ async fn fetch_one(
                     target_url: target_url_string,
                     anchor_text: resource.label,
                     rel: String::new(),
-                    rel_nofollow: false,
+                    rel_nofollow: page_nofollow,
                     link_type,
                     source_status_code: Some(status.as_u16()),
                     target_status_code: None,
@@ -1222,17 +1890,19 @@ async fn fetch_one(
             }
             record.outlink_count = record.internal_outlink_count + record.external_outlink_count;
         }
+        apply_directives_and_canonical(&mut record, &current_url);
 
-        return Ok(FetchOutput {
+        return Ok(fetch_output(
             record,
             links,
             edges,
-            from_sitemap: item.from_sitemap,
-        });
+            image_assets,
+            &queue_identity,
+        ));
     }
 
-    Ok(FetchOutput {
-        record: error_record(
+    Ok(fetch_output(
+        error_record(
             &original_url,
             &current_url,
             item.depth,
@@ -1241,32 +1911,119 @@ async fn fetch_one(
             "Redirect limit exceeded".to_string(),
             redirect_chain,
         ),
-        links: Vec::new(),
-        edges: Vec::new(),
-        from_sitemap: item.from_sitemap,
-    })
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        &queue_identity,
+    ))
+}
+
+fn fetch_output(
+    mut record: CrawlRecord,
+    links: Vec<DiscoveredUrl>,
+    edges: Vec<LinkEdge>,
+    images: Vec<ImageAsset>,
+    identity: &QueueIdentity,
+) -> FetchOutput {
+    record.storage_key = identity.storage_key.clone();
+    record.list_position = identity.list_position;
+    record.list_duplicate_index = identity.list_duplicate_index;
+    FetchOutput {
+        record,
+        links,
+        edges,
+        images,
+        from_sitemap: identity.from_sitemap,
+    }
 }
 
 fn elapsed_ms(started_at: Instant) -> u64 {
     started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-async fn measure_dns_lookup(url: &Url) -> (Option<u64>, u32) {
+async fn measure_dns_lookup(url: &Url) -> (Option<u64>, u32, Option<SocketAddr>) {
     let Some(host) = url.host_str() else {
-        return (None, 0);
+        return (None, 0, None);
     };
     let Some(port) = url.port_or_known_default() else {
-        return (None, 0);
+        return (None, 0, None);
     };
 
     let started_at = Instant::now();
     match lookup_host((host, port)).await {
-        Ok(addresses) => (
-            Some(elapsed_ms(started_at)),
-            addresses.count().min(u32::MAX as usize) as u32,
-        ),
-        Err(_) => (None, 0),
+        Ok(addresses) => {
+            let addresses = addresses.collect::<Vec<_>>();
+            (
+                Some(elapsed_ms(started_at)),
+                addresses.len().min(u32::MAX as usize) as u32,
+                addresses.first().copied(),
+            )
+        }
+        Err(_) => (None, 0, None),
     }
+}
+
+async fn measure_connection_probe(
+    url: &Url,
+    address: Option<SocketAddr>,
+    timeout: Duration,
+) -> (Option<u64>, Option<u64>) {
+    let Some(address) = address else {
+        return (None, None);
+    };
+    let started_at = Instant::now();
+    let stream = match tokio::time::timeout(timeout, TcpStream::connect(address)).await {
+        Ok(Ok(stream)) => stream,
+        _ => return (None, None),
+    };
+    let tcp_connect_time_ms = Some(elapsed_ms(started_at));
+
+    if url.scheme() != "https" {
+        drop(stream);
+        return (tcp_connect_time_ms, None);
+    }
+
+    let Some(host) = url.host_str() else {
+        drop(stream);
+        return (tcp_connect_time_ms, None);
+    };
+    let Some(config) = tls_client_config() else {
+        drop(stream);
+        return (tcp_connect_time_ms, None);
+    };
+    let Ok(server_name) = ServerName::try_from(host.to_string()) else {
+        drop(stream);
+        return (tcp_connect_time_ms, None);
+    };
+    let connector = TlsConnector::from(config);
+    let started_at = Instant::now();
+    let tls_handshake_time_ms =
+        match tokio::time::timeout(timeout, connector.connect(server_name, stream)).await {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                Some(elapsed_ms(started_at))
+            }
+            _ => None,
+        };
+
+    (tcp_connect_time_ms, tls_handshake_time_ms)
+}
+
+fn tls_client_config() -> Option<Arc<ClientConfig>> {
+    static TLS_CLIENT_CONFIG: OnceLock<Result<Arc<ClientConfig>, String>> = OnceLock::new();
+    TLS_CLIENT_CONFIG
+        .get_or_init(|| {
+            ClientConfig::with_platform_verifier()
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .ok()
+        .cloned()
+}
+
+fn tcp_connect_timeout(config: &CrawlConfig) -> Duration {
+    Duration::from_secs(config.timeout_secs.clamp(1, 5))
 }
 
 fn transfer_rate_bytes_per_sec(size_bytes: usize, download_time_ms: Option<u64>) -> Option<u64> {
@@ -1285,6 +2042,8 @@ fn with_network_timings(mut record: CrawlRecord, timings: NetworkTimings) -> Cra
 
 fn apply_network_timings(record: &mut CrawlRecord, timings: NetworkTimings) {
     record.dns_lookup_time_ms = timings.dns_lookup_time_ms;
+    record.tcp_connect_time_ms = timings.tcp_connect_time_ms;
+    record.tls_handshake_time_ms = timings.tls_handshake_time_ms;
     record.ttfb_ms = timings.ttfb_ms;
     record.download_time_ms = timings.download_time_ms;
     record.total_network_time_ms = timings.total_network_time_ms;
@@ -1299,18 +2058,100 @@ fn host_rate_limiter(requests_per_second: u32) -> Option<HostRateLimiter> {
         .map(Arc::new)
 }
 
-async fn wait_for_politeness(
-    url: &Url,
-    request_delay_ms: u64,
-    rate_limiter: Option<&HostRateLimiter>,
-) {
-    if let Some(rate_limiter) = rate_limiter {
-        let host = url.host_str().unwrap_or_default().to_string();
-        rate_limiter.until_key_ready(&host).await;
+impl RequestPolicy {
+    async fn origin(&self, url: &Url) -> Arc<OriginPolicy> {
+        self.origins
+            .lock()
+            .await
+            .entry(url.origin().ascii_serialization())
+            .or_default()
+            .clone()
     }
 
-    if request_delay_ms > 0 {
-        sleep(Duration::from_millis(request_delay_ms)).await;
+    async fn robots_delay(
+        &self,
+        client: &Client,
+        config: &CrawlConfig,
+        url: &Url,
+        control: &CrawlControl,
+    ) -> Result<u64> {
+        wait_if_paused(control).await;
+        ensure_not_cancelled(control)?;
+        if !config.respect_robots {
+            return Ok(config.request_delay_ms);
+        }
+        let origin = self.origin(url).await;
+        let robots = tokio::select! {
+            robots = origin.robots.get_or_init(|| async {
+                fetch_robots(client, url, config, self, control)
+                    .await
+                    .map_err(|error| format!("{error:#}"))
+            }) => robots,
+            _ = wait_until_cancelled(control) => anyhow::bail!(CRAWL_CANCELLED_MESSAGE),
+        };
+        match robots {
+            Ok(Some(robot)) => {
+                if !robot.allowed(url.as_str()) {
+                    anyhow::bail!("Blocked by robots.txt");
+                }
+                Ok(config
+                    .request_delay_ms
+                    .max(robots_crawl_delay_ms(robot).unwrap_or(0)))
+            }
+            Ok(None) => Ok(config.request_delay_ms),
+            Err(error) => anyhow::bail!("Cannot verify robots.txt: {error}"),
+        }
+    }
+
+    async fn wait(&self, url: &Url, delay_ms: u64, control: &CrawlControl) -> Result<()> {
+        let origin = self.origin(url).await;
+        let mut last_request = origin.last_request.lock().await;
+        // Read only initialized policies: fetching robots.txt must not recursively load them.
+        let delay_ms = match origin.robots.get() {
+            Some(Ok(Some(robot))) => delay_ms.max(robots_crawl_delay_ms(robot).unwrap_or(0)),
+            _ => delay_ms,
+        };
+        wait_if_paused(control).await;
+        ensure_not_cancelled(control)?;
+        if let Some(last_request) = *last_request {
+            let remaining = Duration::from_millis(delay_ms).saturating_sub(last_request.elapsed());
+            tokio::select! {
+                _ = sleep(remaining) => {},
+                _ = wait_until_cancelled(control) => anyhow::bail!(CRAWL_CANCELLED_MESSAGE),
+            }
+        }
+        if let Some(rate_limiter) = &self.rate_limiter {
+            let host = url.host_str().unwrap_or_default().to_string();
+            tokio::select! {
+                _ = rate_limiter.until_key_ready(&host) => {},
+                _ = wait_until_cancelled(control) => anyhow::bail!(CRAWL_CANCELLED_MESSAGE),
+            }
+        }
+        wait_if_paused(control).await;
+        ensure_not_cancelled(control)?;
+        *last_request = Some(Instant::now());
+        Ok(())
+    }
+}
+
+fn retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+async fn sleep_retry_backoff(config: &CrawlConfig, attempt: u32) {
+    if config.retry_backoff_ms == 0 {
+        return;
+    }
+    let exponent = attempt.saturating_sub(1).min(10);
+    let multiplier = 1_u64 << exponent;
+    let delay_ms = config
+        .retry_backoff_ms
+        .saturating_mul(multiplier)
+        .min(30_000);
+    if delay_ms > 0 {
+        sleep(Duration::from_millis(delay_ms)).await;
     }
 }
 
@@ -1334,14 +2175,75 @@ fn extract_custom_values(html: &str, extractors: &[CustomExtractor]) -> Vec<Cust
     }
 }
 
+fn search_custom_values(
+    html: &str,
+    searches: &[CustomSearch],
+    source: CustomSearchSource,
+) -> Vec<CustomSearchValue> {
+    if searches.is_empty() {
+        return Vec::new();
+    }
+
+    match run_searches(html, searches) {
+        Ok(results) => results
+            .into_iter()
+            .map(|result| CustomSearchValue {
+                name: result.name,
+                source: source.clone(),
+                matched: result.matched,
+                match_count: result.match_count,
+                snippets: result.snippets,
+            })
+            .collect(),
+        Err(error) => vec![CustomSearchValue {
+            name: "search_error".to_string(),
+            source,
+            matched: false,
+            match_count: 0,
+            snippets: vec![error.to_string()],
+        }],
+    }
+}
+
+fn apply_rendered_dom_diff(
+    record: &mut CrawlRecord,
+    raw_signals: &PageSignals,
+    rendered_signals: &PageSignals,
+) {
+    record.js_rendered = true;
+    record.rendered_word_count_delta =
+        signed_delta(rendered_signals.word_count, raw_signals.word_count);
+    record.rendered_link_count_delta =
+        signed_delta(rendered_signals.links.len(), raw_signals.links.len());
+    record.rendered_dom_changed = raw_signals.title != rendered_signals.title
+        || raw_signals.meta_description != rendered_signals.meta_description
+        || raw_signals.h1 != rendered_signals.h1
+        || raw_signals.canonical != rendered_signals.canonical
+        || raw_signals.word_count != rendered_signals.word_count
+        || raw_signals.links.len() != rendered_signals.links.len()
+        || raw_signals.image_count != rendered_signals.image_count
+        || raw_signals.json_ld_count != rendered_signals.json_ld_count;
+}
+
+fn signed_delta(current: usize, previous: usize) -> i32 {
+    let delta = current as i128 - previous as i128;
+    delta.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
+}
+
 fn apply_directives_and_canonical(record: &mut CrawlRecord, current_url: &Url) {
-    if contains_directive(record.x_robots_tag.as_deref(), "noindex") {
+    if !record
+        .status_code
+        .is_some_and(|status| (200..300).contains(&status))
+    {
+        return;
+    }
+    if contains_robots_directive(record.x_robots_tag.as_deref(), "noindex") {
         record.indexability = "Non-indexable".to_string();
         record.indexability_status = "X-Robots-Tag noindex".to_string();
         return;
     }
 
-    if contains_directive(record.meta_robots.as_deref(), "noindex") {
+    if contains_robots_directive(record.meta_robots.as_deref(), "noindex") {
         record.indexability = "Non-indexable".to_string();
         record.indexability_status = "Meta robots noindex".to_string();
         return;
@@ -1353,16 +2255,6 @@ fn apply_directives_and_canonical(record: &mut CrawlRecord, current_url: &Url) {
             record.indexability_status = "Canonicalized".to_string();
         }
     }
-}
-
-fn contains_directive(value: Option<&str>, directive: &str) -> bool {
-    value
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .split([',', ';'])
-        .flat_map(str::split_whitespace)
-        .map(|part| part.trim_matches(':'))
-        .any(|part| part == directive)
 }
 
 fn assign_near_duplicate_cluster(
@@ -1418,7 +2310,15 @@ fn status_record(
     } else {
         Some(blake3::hash(&body).to_hex().to_string())
     };
-    let x_robots_tag = header_string(&headers, HeaderName::from_static("x-robots-tag"));
+    let x_robots_tag = headers
+        .get_all(HeaderName::from_static("x-robots-tag"))
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let x_robots_tag = (!x_robots_tag.is_empty()).then_some(x_robots_tag);
     let hsts_header = headers.contains_key(HeaderName::from_static("strict-transport-security"));
     let content_security_policy_header =
         headers.contains_key(HeaderName::from_static("content-security-policy"));
@@ -1428,8 +2328,11 @@ fn status_record(
 
     CrawlRecord {
         id: 0,
+        storage_key: final_url.to_string(),
         url: original_url.to_string(),
         final_url: final_url.to_string(),
+        list_position: None,
+        list_duplicate_index: 0,
         classification: if same_host(final_url, root_url) {
             UrlClassification::Internal
         } else {
@@ -1451,6 +2354,8 @@ fn status_record(
         },
         response_time_ms,
         dns_lookup_time_ms: None,
+        tcp_connect_time_ms: None,
+        tls_handshake_time_ms: None,
         ttfb_ms: None,
         download_time_ms: None,
         total_network_time_ms: None,
@@ -1464,8 +2369,10 @@ fn status_record(
         redirect_chain,
         title: None,
         title_len: 0,
+        title_pixel_width: 0,
         meta_description: None,
         meta_description_len: 0,
+        meta_description_pixel_width: 0,
         meta_robots: None,
         x_robots_tag,
         h1: None,
@@ -1495,16 +2402,34 @@ fn status_record(
         hreflang_count: 0,
         hreflang_invalid_count: 0,
         hreflang_missing_self_reference: false,
+        hreflang_links: Vec::new(),
         json_ld_count: 0,
         json_ld_invalid_count: 0,
+        structured_data_error_count: 0,
+        structured_data_warning_count: 0,
+        structured_data_issues: Vec::new(),
         open_graph_count: 0,
         twitter_card_count: 0,
+        deprecated_html_tag_count: 0,
+        duplicate_id_count: 0,
+        js_rendered: false,
+        rendered_dom_changed: false,
+        rendered_word_count_delta: 0,
+        rendered_link_count_delta: 0,
         near_duplicate_cluster_id: None,
         inlink_count: 0,
+        first_inlink_source_url: None,
+        first_inlink_anchor_text: None,
+        first_inlink_source_position: None,
         outlink_count: 0,
         internal_outlink_count: 0,
         external_outlink_count: 0,
         custom_extractions: Vec::new(),
+        custom_searches: Vec::new(),
+        search_console_clicks: None,
+        search_console_impressions: None,
+        search_console_ctr: None,
+        search_console_average_position: None,
         error,
     }
 }
@@ -1521,8 +2446,11 @@ fn error_record(
     let response_time_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     CrawlRecord {
         id: 0,
+        storage_key: final_url.to_string(),
         url: original_url.to_string(),
         final_url: final_url.to_string(),
+        list_position: None,
+        list_duplicate_index: 0,
         classification: if same_host(final_url, root_url) {
             UrlClassification::Internal
         } else {
@@ -1536,6 +2464,8 @@ fn error_record(
         indexability_status: "No response".to_string(),
         response_time_ms,
         dns_lookup_time_ms: None,
+        tcp_connect_time_ms: None,
+        tls_handshake_time_ms: None,
         ttfb_ms: None,
         download_time_ms: None,
         total_network_time_ms: None,
@@ -1549,8 +2479,10 @@ fn error_record(
         redirect_chain,
         title: None,
         title_len: 0,
+        title_pixel_width: 0,
         meta_description: None,
         meta_description_len: 0,
+        meta_description_pixel_width: 0,
         meta_robots: None,
         x_robots_tag: None,
         h1: None,
@@ -1580,16 +2512,34 @@ fn error_record(
         hreflang_count: 0,
         hreflang_invalid_count: 0,
         hreflang_missing_self_reference: false,
+        hreflang_links: Vec::new(),
         json_ld_count: 0,
         json_ld_invalid_count: 0,
+        structured_data_error_count: 0,
+        structured_data_warning_count: 0,
+        structured_data_issues: Vec::new(),
         open_graph_count: 0,
         twitter_card_count: 0,
+        deprecated_html_tag_count: 0,
+        duplicate_id_count: 0,
+        js_rendered: false,
+        rendered_dom_changed: false,
+        rendered_word_count_delta: 0,
+        rendered_link_count_delta: 0,
         near_duplicate_cluster_id: None,
         inlink_count: 0,
+        first_inlink_source_url: None,
+        first_inlink_anchor_text: None,
+        first_inlink_source_position: None,
         outlink_count: 0,
         internal_outlink_count: 0,
         external_outlink_count: 0,
         custom_extractions: Vec::new(),
+        custom_searches: Vec::new(),
+        search_console_clicks: None,
+        search_console_impressions: None,
+        search_console_ctr: None,
+        search_console_average_position: None,
         error: Some(error),
     }
 }
@@ -1597,8 +2547,11 @@ fn error_record(
 fn blocked_record(url: &Url, depth: usize, root_url: &Url) -> CrawlRecord {
     CrawlRecord {
         id: 0,
+        storage_key: url.to_string(),
         url: url.to_string(),
         final_url: url.to_string(),
+        list_position: None,
+        list_duplicate_index: 0,
         classification: if same_host(url, root_url) {
             UrlClassification::Internal
         } else {
@@ -1612,6 +2565,8 @@ fn blocked_record(url: &Url, depth: usize, root_url: &Url) -> CrawlRecord {
         indexability_status: "Blocked by robots.txt".to_string(),
         response_time_ms: 0,
         dns_lookup_time_ms: None,
+        tcp_connect_time_ms: None,
+        tls_handshake_time_ms: None,
         ttfb_ms: None,
         download_time_ms: None,
         total_network_time_ms: None,
@@ -1625,8 +2580,10 @@ fn blocked_record(url: &Url, depth: usize, root_url: &Url) -> CrawlRecord {
         redirect_chain: Vec::new(),
         title: None,
         title_len: 0,
+        title_pixel_width: 0,
         meta_description: None,
         meta_description_len: 0,
+        meta_description_pixel_width: 0,
         meta_robots: None,
         x_robots_tag: None,
         h1: None,
@@ -1656,16 +2613,34 @@ fn blocked_record(url: &Url, depth: usize, root_url: &Url) -> CrawlRecord {
         hreflang_count: 0,
         hreflang_invalid_count: 0,
         hreflang_missing_self_reference: false,
+        hreflang_links: Vec::new(),
         json_ld_count: 0,
         json_ld_invalid_count: 0,
+        structured_data_error_count: 0,
+        structured_data_warning_count: 0,
+        structured_data_issues: Vec::new(),
         open_graph_count: 0,
         twitter_card_count: 0,
+        deprecated_html_tag_count: 0,
+        duplicate_id_count: 0,
+        js_rendered: false,
+        rendered_dom_changed: false,
+        rendered_word_count_delta: 0,
+        rendered_link_count_delta: 0,
         near_duplicate_cluster_id: None,
         inlink_count: 0,
+        first_inlink_source_url: None,
+        first_inlink_anchor_text: None,
+        first_inlink_source_position: None,
         outlink_count: 0,
         internal_outlink_count: 0,
         external_outlink_count: 0,
         custom_extractions: Vec::new(),
+        custom_searches: Vec::new(),
+        search_console_clicks: None,
+        search_console_impressions: None,
+        search_console_ctr: None,
+        search_console_average_position: None,
         error: Some("Blocked by robots.txt".to_string()),
     }
 }
@@ -1711,31 +2686,98 @@ fn progress(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrous_frog_storage::{IssueView, MemoryStore};
+    use ferrous_frog_storage::{GridQuery, IssueView, MemoryStore};
+    use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     #[test]
+    fn scope_modes_limit_subdomains_and_folders() {
+        let root = Url::parse("https://www.example.com/docs/").unwrap();
+        let same_folder = Url::parse("https://www.example.com/docs/page").unwrap();
+        let child_folder = Url::parse("https://www.example.com/docs/guides/page").unwrap();
+        let sibling_folder = Url::parse("https://www.example.com/blog/page").unwrap();
+        let subdomain = Url::parse("https://cdn.example.com/docs/page").unwrap();
+        let rules = ScopeRules {
+            include: Vec::new(),
+            exclude: Vec::new(),
+        };
+
+        let mut config = CrawlConfig {
+            subdomain_scope: SubdomainScope::ExactHost,
+            folder_scope: FolderScope::StartFolder,
+            ..CrawlConfig::default()
+        };
+
+        assert!(scope_allows(&same_folder, &root, &rules, &config));
+        assert!(scope_allows(&child_folder, &root, &rules, &config));
+        assert!(!scope_allows(&sibling_folder, &root, &rules, &config));
+        assert!(!scope_allows(&subdomain, &root, &rules, &config));
+
+        config.subdomain_scope = SubdomainScope::IncludeSubdomains;
+        assert!(scope_allows(&subdomain, &root, &rules, &config));
+
+        config.folder_scope = FolderScope::ExactFolder;
+        assert!(scope_allows(&same_folder, &root, &rules, &config));
+        assert!(!scope_allows(&child_folder, &root, &rules, &config));
+    }
+
+    #[test]
     fn parses_sitemap_locations() {
         let root_url = Url::parse("https://example.com/start").unwrap();
-        let urls = parse_sitemap_urls(
+        let parsed = parse_sitemap_document(
             r#"
                 <urlset>
                   <url><loc>/one</loc></url>
                   <url><loc>https://example.com/two</loc></url>
+                  <url><loc>https://example.com/event/MVNO&apos;s%20World%202026</loc></url>
+                  <url><loc>https://example.com/search?a=1&amp;b=2</loc></url>
                 </urlset>
             "#,
             &root_url,
         );
 
-        assert_eq!(urls.len(), 2);
+        let urls = parsed.urls;
+        assert_eq!(urls.len(), 4);
         assert_eq!(urls[0].as_str(), "https://example.com/one");
         assert_eq!(urls[1].as_str(), "https://example.com/two");
+        assert_eq!(
+            urls[2].as_str(),
+            "https://example.com/event/MVNO's%20World%202026"
+        );
+        assert_eq!(urls[3].as_str(), "https://example.com/search?a=1&b=2");
+    }
+
+    #[test]
+    fn parses_sitemap_index_locations_separately() {
+        let root_url = Url::parse("https://example.com/sitemap.xml").unwrap();
+        let parsed = parse_sitemap_document(
+            r#"
+                <sitemapindex>
+                  <sitemap><loc>/posts-sitemap.xml</loc></sitemap>
+                  <sitemap><loc>https://example.com/pages-sitemap.xml</loc></sitemap>
+                </sitemapindex>
+            "#,
+            &root_url,
+        );
+
+        assert!(parsed.urls.is_empty());
+        assert_eq!(parsed.sitemaps.len(), 2);
+        assert_eq!(
+            parsed.sitemaps[0].as_str(),
+            "https://example.com/posts-sitemap.xml"
+        );
+        assert_eq!(
+            parsed.sitemaps[1].as_str(),
+            "https://example.com/pages-sitemap.xml"
+        );
     }
 
     #[test]
     fn parses_robots_crawl_delay() {
-        let delay = parse_robots_crawl_delay(b"User-agent: *\nCrawl-delay: 0.02\n");
+        let robot =
+            parse_robots(DEFAULT_USER_AGENT, b"User-agent: *\nCrawl-delay: 0.02\n").unwrap();
+        let delay = robots_crawl_delay_ms(&robot);
         assert_eq!(delay, Some(20));
     }
 
@@ -1752,6 +2794,620 @@ mod tests {
         assert_eq!(result.crawl_delay_ms, Some(500));
     }
 
+    #[test]
+    fn tests_robots_txt_rules_in_batches() {
+        let result = test_robots_txt_batch(RobotsTxtBatchTestRequest {
+            user_agent: "FerrousFrogSeoSpider/Test".to_string(),
+            robots_txt: "User-agent: *\nDisallow: /private\nCrawl-delay: 0.5\n".to_string(),
+            urls: vec![
+                "https://example.com/public".to_string(),
+                "https://example.com/private/page".to_string(),
+                "not a url".to_string(),
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(result.allowed, 1);
+        assert_eq!(result.blocked, 1);
+        assert_eq!(result.invalid, 1);
+        assert_eq!(result.crawl_delay_ms, Some(500));
+        assert_eq!(result.rows.len(), 3);
+    }
+
+    #[test]
+    fn robots_rules_and_delay_use_the_crawler_product_token() {
+        let robots_txt = "User-agent: OtherBot\nCrawl-delay: 9\n\nUser-agent: *\nAllow: /\nCrawl-delay: 0.01\n\nUser-agent: FerrousFrogSeoSpider\nDisallow: /private\nCrawl-delay: 0.06\n";
+        let result = test_robots_txt(RobotsTxtTestRequest {
+            user_agent: "FerrousFrogSeoSpider/Test".to_string(),
+            robots_txt: robots_txt.to_string(),
+            url: "https://example.com/private".to_string(),
+        })
+        .unwrap();
+        assert!(!result.allowed);
+        assert_eq!(result.crawl_delay_ms, Some(60));
+
+        let batch = test_robots_txt_batch(RobotsTxtBatchTestRequest {
+            user_agent: "FerrousFrogSeoSpider/Test".to_string(),
+            robots_txt: robots_txt.to_string(),
+            urls: vec!["https://example.com/private".to_string()],
+        })
+        .unwrap();
+        assert_eq!(batch.blocked, 1);
+        assert_eq!(batch.crawl_delay_ms, Some(60));
+    }
+
+    #[tokio::test]
+    async fn robots_policies_are_cached_separately_for_each_list_origin() {
+        let (first, first_requests, first_server) = spawn_recording_site(|path| {
+            if path == "/robots.txt" {
+                response(200, "OK", "text/plain", "User-agent: *\nDisallow: /a\n")
+            } else {
+                response(200, "OK", "text/html", "<h1>Public</h1>")
+            }
+        })
+        .await;
+        let (second, second_requests, second_server) = spawn_recording_site(|path| {
+            if path == "/robots.txt" {
+                response(200, "OK", "text/plain", "User-agent: *\nDisallow: /b\n")
+            } else {
+                response(200, "OK", "text/html", "<h1>Public</h1>")
+            }
+        })
+        .await;
+        let store = MemoryStore::new();
+        let result = crawl(
+            CrawlConfig {
+                mode: CrawlMode::List,
+                list_urls: vec![
+                    format!("{first}a"),
+                    format!("{first}b"),
+                    format!("{second}a"),
+                    format!("{second}b"),
+                ],
+                concurrency: 4,
+                requests_per_second: 100,
+                request_delay_ms: 0,
+                ..CrawlConfig::default()
+            },
+            store.clone(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await;
+        first_server.abort();
+        second_server.abort();
+        assert_eq!(result.unwrap().crawled, 4);
+        for (requests, allowed, blocked) in
+            [(first_requests, "/b", "/a"), (second_requests, "/a", "/b")]
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(path, _)| path == "/robots.txt")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                requests.iter().filter(|(path, _)| path == allowed).count(),
+                1
+            );
+            assert!(!requests.iter().any(|(path, _)| path == blocked));
+        }
+        let records = store.records();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.status_code == Some(200))
+                .count(),
+            2
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.status_text == "Blocked by robots.txt")
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn robots_block_same_origin_and_cross_origin_redirect_targets() {
+        let (target, target_requests, target_server) = spawn_recording_site(|path| {
+            if path == "/robots.txt" {
+                response(
+                    200,
+                    "OK",
+                    "text/plain",
+                    "User-agent: *\nDisallow: /private\n",
+                )
+            } else {
+                response(200, "OK", "text/html", "<h1>Private</h1>")
+            }
+        })
+        .await;
+        let private_target = format!("{target}private");
+        let redirect_target = private_target.clone();
+        let (source, source_requests, source_server) =
+            spawn_recording_site(move |path| match path {
+                "/robots.txt" => response(
+                    200,
+                    "OK",
+                    "text/plain",
+                    "User-agent: *\nDisallow: /blocked\n",
+                ),
+                "/same" => redirect_response("/blocked"),
+                "/external" => redirect_response(&redirect_target),
+                _ => response(200, "OK", "text/html", "<h1>Private</h1>"),
+            })
+            .await;
+        let store = MemoryStore::new();
+        let result = crawl(
+            CrawlConfig {
+                mode: CrawlMode::List,
+                list_urls: vec![format!("{source}same"), format!("{source}external")],
+                requests_per_second: 100,
+                request_delay_ms: 0,
+                ..CrawlConfig::default()
+            },
+            store.clone(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await;
+        source_server.abort();
+        target_server.abort();
+        assert_eq!(result.unwrap().crawled, 2);
+        assert!(
+            !source_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(path, _)| path == "/blocked")
+        );
+        assert!(
+            !target_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(path, _)| path == "/private")
+        );
+        let records = store.records();
+        for (original, blocked) in [
+            (format!("{source}same"), format!("{source}blocked")),
+            (format!("{source}external"), private_target),
+        ] {
+            let record = records
+                .iter()
+                .find(|record| record.url == original)
+                .unwrap();
+            assert_eq!(record.final_url, blocked);
+            assert_eq!(record.redirect_chain.len(), 1);
+            assert_eq!(record.redirect_target.as_deref(), Some(blocked.as_str()));
+            assert_eq!(record.status_text, "Blocked by robots.txt");
+            assert_eq!(record.status_code, None);
+            assert_eq!(record.indexability, "Non-indexable");
+        }
+    }
+
+    #[tokio::test]
+    async fn robots_and_configured_delays_space_concurrent_requests_and_redirects() {
+        for respect_robots in [true, false] {
+            let (base_url, requests, server) = spawn_recording_site(|path| match path {
+                "/robots.txt" => {
+                    response(200, "OK", "text/plain", "User-agent: *\nCrawl-delay: 0.1\n")
+                }
+                "/redirect" => redirect_response("/target"),
+                _ => response(200, "OK", "text/html", "<h1>Public</h1>"),
+            })
+            .await;
+            let result = crawl(
+                CrawlConfig {
+                    mode: CrawlMode::List,
+                    list_urls: vec![
+                        format!("{base_url}a"),
+                        format!("{base_url}b"),
+                        format!("{base_url}redirect"),
+                    ],
+                    concurrency: 3,
+                    requests_per_second: 100,
+                    request_delay_ms: if respect_robots { 0 } else { 100 },
+                    respect_robots,
+                    ..CrawlConfig::default()
+                },
+                MemoryStore::new(),
+                CrawlControl::default(),
+                |_| {},
+            )
+            .await;
+            server.abort();
+            assert_eq!(result.unwrap().crawled, 3);
+            let requests = requests.lock().unwrap();
+            let page_requests = requests
+                .iter()
+                .filter(|(path, _)| path != "/robots.txt")
+                .collect::<Vec<_>>();
+            assert_eq!(page_requests.len(), 4);
+            for pair in page_requests.windows(2) {
+                let gap = pair[1].1.duration_since(pair[0].1);
+                assert!(
+                    gap >= Duration::from_millis(80),
+                    "requests arrived only {gap:?} apart (respect_robots={respect_robots})"
+                );
+            }
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|(path, _)| path == "/robots.txt")
+                    .count(),
+                usize::from(respect_robots)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn robots_server_errors_block_crawling_but_missing_robots_and_opt_out_allow_it() {
+        for (robots_status, respect_robots, should_fetch) in
+            [(503, true, false), (404, true, true), (503, false, true)]
+        {
+            let (base_url, requests, server) = spawn_recording_site(move |path| {
+                if path == "/robots.txt" {
+                    response(robots_status, "Unavailable", "text/plain", "unavailable")
+                } else {
+                    response(200, "OK", "text/html", "<h1>Public</h1>")
+                }
+            })
+            .await;
+            let store = MemoryStore::new();
+            let result = crawl(
+                CrawlConfig {
+                    start_url: format!("{base_url}page"),
+                    max_urls: 1,
+                    request_delay_ms: 0,
+                    respect_robots,
+                    ..CrawlConfig::default()
+                },
+                store.clone(),
+                CrawlControl::default(),
+                |_| {},
+            )
+            .await;
+            server.abort();
+            assert_eq!(result.unwrap().crawled, 1);
+            assert_eq!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(path, _)| path == "/page"),
+                should_fetch
+            );
+            let records = store.records();
+            if should_fetch {
+                assert_eq!(records[0].status_code, Some(200));
+            } else {
+                assert_eq!(records[0].status_code, None);
+                assert!(records[0].error.as_deref().unwrap().contains("503"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn robots_redirects_are_followed_before_crawling() {
+        let (base_url, requests, server) = spawn_recording_site(|path| match path {
+            "/robots.txt" => redirect_response("/rules-1"),
+            "/rules-1" => redirect_response("/rules-2"),
+            "/rules-2" => redirect_response("/rules-3"),
+            "/rules-3" => redirect_response("/rules-4"),
+            "/rules-4" => redirect_response("/rules-5"),
+            "/rules-5" => response(
+                200,
+                "OK",
+                "text/plain",
+                "User-agent: *\nDisallow: /private\n",
+            ),
+            _ => response(200, "OK", "text/html", "<h1>Private</h1>"),
+        })
+        .await;
+        let result = crawl(
+            CrawlConfig {
+                start_url: format!("{base_url}private"),
+                max_urls: 1,
+                request_delay_ms: 0,
+                requests_per_second: 100,
+                ..CrawlConfig::default()
+            },
+            MemoryStore::new(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await;
+        server.abort();
+        assert_eq!(result.unwrap().crawled, 1);
+        let requests = requests.lock().unwrap();
+        assert!(requests.iter().any(|(path, _)| path == "/rules-5"));
+        assert!(!requests.iter().any(|(path, _)| path == "/private"));
+    }
+
+    #[tokio::test]
+    async fn robots_redirects_honor_the_destination_origins_cached_delay() {
+        let (destination, requests, destination_server) = spawn_recording_site(|path| match path {
+            "/robots.txt" => response(200, "OK", "text/plain", "User-agent: *\nCrawl-delay: 0.1\n"),
+            "/delegated-robots" => response(200, "OK", "text/plain", "User-agent: *\nAllow: /\n"),
+            _ => response(200, "OK", "text/html", "<h1>Public</h1>"),
+        })
+        .await;
+        let delegated_robots = format!("{destination}delegated-robots");
+        let (source, _, source_server) = spawn_recording_site(move |path| {
+            if path == "/robots.txt" {
+                redirect_response(&delegated_robots)
+            } else {
+                response(200, "OK", "text/html", "<h1>Public</h1>")
+            }
+        })
+        .await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            crawl(
+                CrawlConfig {
+                    mode: CrawlMode::List,
+                    list_urls: vec![format!("{destination}warmup"), format!("{source}page")],
+                    concurrency: 1,
+                    requests_per_second: 100,
+                    request_delay_ms: 0,
+                    ..CrawlConfig::default()
+                },
+                MemoryStore::new(),
+                CrawlControl::default(),
+                |_| {},
+            ),
+        )
+        .await;
+        destination_server.abort();
+        source_server.abort();
+        assert_eq!(result.unwrap().unwrap().crawled, 2);
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["/robots.txt", "/warmup", "/delegated-robots"]
+        );
+        let gap = requests[2].1.duration_since(requests[1].1);
+        assert!(
+            gap >= Duration::from_millis(80),
+            "robots redirect ignored cached 100 ms delay: {gap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn robots_rules_also_guard_default_sitemap_requests() {
+        let (base_url, requests, server) = spawn_recording_site(|path| {
+            if path == "/robots.txt" {
+                response(
+                    200,
+                    "OK",
+                    "text/plain",
+                    "User-agent: *\nDisallow: /sitemap.xml\n",
+                )
+            } else {
+                response(200, "OK", "text/html", "<h1>Public</h1>")
+            }
+        })
+        .await;
+        let result = crawl(
+            CrawlConfig {
+                start_url: base_url,
+                max_urls: 1,
+                request_delay_ms: 0,
+                ..CrawlConfig::default()
+            },
+            MemoryStore::new(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await;
+        server.abort();
+        assert_eq!(result.unwrap().crawled, 1);
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(path, _)| path == "/sitemap.xml")
+        );
+    }
+
+    #[tokio::test]
+    async fn indexability_preserves_http_errors_after_parsing_html() {
+        let (base_url, _, server) = spawn_recording_site(|path| match path {
+            "/missing" => response(
+                404,
+                "Not Found",
+                "text/html",
+                "<html><head><title>Missing</title></head><body>Not found</body></html>",
+            ),
+            "/failure" => response(
+                500,
+                "Internal Server Error",
+                "text/html",
+                r#"<html><head><title>Failure</title><meta name="robots" content="noindex"><link rel="canonical" href="/elsewhere"></head></html>"#,
+            ),
+            _ => response(200, "OK", "text/html", "<html><title>Public</title></html>"),
+        })
+        .await;
+        let store = MemoryStore::new();
+        let result = crawl(
+            CrawlConfig {
+                mode: CrawlMode::List,
+                list_urls: ["missing", "failure", "public"]
+                    .map(|path| format!("{base_url}{path}"))
+                    .to_vec(),
+                respect_robots: false,
+                request_delay_ms: 0,
+                requests_per_second: 100,
+                retry_attempts: 0,
+                ..CrawlConfig::default()
+            },
+            store.clone(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await;
+        server.abort();
+        assert_eq!(result.unwrap().crawled, 3);
+        let records = store.records();
+        for (path, status, indexability, reason) in [
+            ("missing", 404, "Non-indexable", "HTTP 404"),
+            ("failure", 500, "Non-indexable", "HTTP 500"),
+            ("public", 200, "Indexable", "Indexable"),
+        ] {
+            let record = records
+                .iter()
+                .find(|record| record.url == format!("{base_url}{path}"))
+                .unwrap();
+            assert_eq!(record.status_code, Some(status));
+            assert_eq!(record.indexability, indexability, "path: {path}");
+            assert_eq!(record.indexability_status, reason, "path: {path}");
+            assert!(record.title.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn indexability_honors_repeated_robots_headers_meta_and_non_html_directives() {
+        let (base_url, _, server) = spawn_recording_site(|path| {
+            let plain_html = "<html><head><title>Public</title></head></html>";
+            match path {
+                "/file.pdf" => robots_response("application/pdf", "%PDF-1.4", &["noindex"]),
+                "/headers" => robots_response("text/html", plain_html, &["index, follow", "NoInDeX"]),
+                "/header-none" => robots_response("text/html", plain_html, &["all", "NoNe"]),
+                "/meta" => robots_response("text/html", r#"<html><head><meta name="robots" content="index"><meta name="ROBOTS" content="noindex"></head></html>"#, &["index, follow"]),
+                "/meta-none" => robots_response("text/html", r#"<html><head><meta name="robots" content="none"></head></html>"#, &["index"]),
+                "/preview" => robots_response("text/html", r#"<html><head><meta name="robots" content="max-image-preview: none"></head></html>"#, &["max-image-preview: none"]),
+                _ => unreachable!(),
+            }
+        })
+        .await;
+        let store = MemoryStore::new();
+        let result = crawl(
+            CrawlConfig {
+                mode: CrawlMode::List,
+                list_urls: [
+                    "file.pdf",
+                    "headers",
+                    "header-none",
+                    "meta",
+                    "meta-none",
+                    "preview",
+                ]
+                .map(|path| format!("{base_url}{path}"))
+                .to_vec(),
+                respect_robots: false,
+                request_delay_ms: 0,
+                requests_per_second: 100,
+                ..CrawlConfig::default()
+            },
+            store.clone(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await;
+        server.abort();
+        assert_eq!(result.unwrap().crawled, 6);
+        let records = store.records();
+        for (path, expected, reason) in [
+            ("file.pdf", "Non-indexable", "X-Robots-Tag noindex"),
+            ("headers", "Non-indexable", "X-Robots-Tag noindex"),
+            ("header-none", "Non-indexable", "X-Robots-Tag noindex"),
+            ("meta", "Non-indexable", "Meta robots noindex"),
+            ("meta-none", "Non-indexable", "Meta robots noindex"),
+            ("preview", "Indexable", "Indexable"),
+        ] {
+            let record = records
+                .iter()
+                .find(|record| record.url == format!("{base_url}{path}"))
+                .unwrap();
+            assert_eq!(record.indexability, expected, "path: {path}");
+            assert_eq!(record.indexability_status, reason, "path: {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn indexability_page_nofollow_directives_respect_the_follow_setting() {
+        for (source, directive) in [
+            ("meta", "nofollow"),
+            ("meta", "none"),
+            ("header", "nofollow"),
+            ("header", "none"),
+            ("header", "max-image-preview: none nofollow"),
+        ] {
+            for follow_nofollow in [false, true] {
+                let (base_url, requests, server) = spawn_recording_site(move |path| {
+                    if path == "/start" {
+                        let meta = if source == "meta" { directive } else { "index, follow" };
+                        let headers = if source == "header" { vec!["index, follow", directive] } else { Vec::new() };
+                        robots_response("text/html", &format!(r#"<html><head>
+                            <meta name="robots" content="index, follow"><meta name="robots" content="{meta}">
+                            <link rel="stylesheet" href="/style.css"><script src="/script.js"></script>
+                            </head><body><a href="/target">Target</a><img src="/image.png"></body></html>"#), &headers)
+                    } else {
+                        response(200, "OK", "text/plain", "resource")
+                    }
+                })
+                .await;
+                let store = MemoryStore::new();
+                let result = crawl(
+                    CrawlConfig {
+                        start_url: format!("{base_url}start"),
+                        max_depth: 1,
+                        respect_robots: false,
+                        request_delay_ms: 0,
+                        requests_per_second: 100,
+                        follow_nofollow,
+                        resource_types: CrawlResourceTypes {
+                            images: true,
+                            css: true,
+                            javascript: true,
+                            ..CrawlResourceTypes::default()
+                        },
+                        ..CrawlConfig::default()
+                    },
+                    store.clone(),
+                    CrawlControl::default(),
+                    |_| {},
+                )
+                .await;
+                server.abort();
+                assert_eq!(
+                    result.unwrap().crawled,
+                    if follow_nofollow { 5 } else { 1 },
+                    "{source} {directive}, follow={follow_nofollow}"
+                );
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    if follow_nofollow { 5 } else { 1 }
+                );
+                let edges = store.link_edges(ferrous_frog_storage::LinkEdgeQuery::default());
+                assert_eq!(edges.edges.len(), 4);
+                assert!(edges.edges.iter().all(|edge| edge.rel_nofollow));
+                let records = store.records();
+                let page = records
+                    .iter()
+                    .find(|record| record.url == format!("{base_url}start"))
+                    .unwrap();
+                assert_eq!(
+                    page.indexability,
+                    if directive == "none" {
+                        "Non-indexable"
+                    } else {
+                        "Indexable"
+                    }
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn crawls_mock_site_with_redirects_broken_links_and_duplicate_titles() {
         let (base_url, server) = spawn_mock_site().await;
@@ -1761,6 +3417,7 @@ mod tests {
             mode: CrawlMode::Spider,
             start_url: base_url.clone(),
             list_urls: Vec::new(),
+            list_sitemap_urls: Vec::new(),
             max_urls: 12,
             max_depth: 3,
             concurrency: 2,
@@ -1772,12 +3429,20 @@ mod tests {
             user_agent: "FerrousFrogSeoSpider/Test".to_string(),
             timeout_secs: 5,
             max_redirects: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
             near_duplicate_threshold: 6,
             include_url_patterns: Vec::new(),
             exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
             resource_types: CrawlResourceTypes::default(),
             query_settings: QuerySettings::default(),
             custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
         };
 
         let result = crawl(config, store.clone(), CrawlControl::default(), |_| {}).await;
@@ -1785,10 +3450,25 @@ mod tests {
         result.unwrap();
 
         let records = store.records();
-        assert!(records.iter().any(|record| record.final_url == base_url));
-        assert!(records.iter().any(|record| {
-            record.final_url == format!("{base_url}missing") && record.status_code == Some(404)
-        }));
+        let home_record = records
+            .iter()
+            .find(|record| record.final_url == base_url)
+            .expect("home page should be crawled");
+        assert!(home_record.tcp_connect_time_ms.is_some());
+        let missing_record = records
+            .iter()
+            .find(|record| {
+                record.final_url == format!("{base_url}missing") && record.status_code == Some(404)
+            })
+            .expect("missing URL should be crawled with 404 status");
+        assert_eq!(
+            missing_record.first_inlink_source_url.as_deref(),
+            Some(base_url.as_str())
+        );
+        assert_eq!(
+            missing_record.first_inlink_anchor_text.as_deref(),
+            Some("Missing page")
+        );
         assert!(records.iter().any(|record| {
             record.final_url == format!("{base_url}target") && !record.redirect_chain.is_empty()
         }));
@@ -1846,6 +3526,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resumes_from_persisted_frontier_state() {
+        let (base_url, server) = spawn_mock_site().await;
+        let store = MemoryStore::new();
+        let resumed_url = format!("{base_url}a");
+        let mut existing_root = CrawlRecord::pending(base_url.clone(), 0);
+        existing_root.status_code = Some(299);
+        store.upsert(existing_root);
+        store.save_frontier_state(CrawlFrontierState {
+            queued: vec![CrawlFrontierItem {
+                url: resumed_url.clone(),
+                depth: 1,
+                from_sitemap: false,
+                storage_key: resumed_url.clone(),
+                list_position: None,
+                list_duplicate_index: 0,
+            }],
+            seen: vec![base_url.clone(), resumed_url.clone()],
+            crawled: 1,
+        });
+
+        let config = CrawlConfig {
+            start_url: base_url.clone(),
+            max_urls: 2,
+            max_depth: 3,
+            concurrency: 1,
+            requests_per_second: 50,
+            request_delay_ms: 0,
+            respect_robots: false,
+            timeout_secs: 5,
+            resume_from_state: true,
+            ..CrawlConfig::default()
+        };
+
+        let progress = crawl(config, store.clone(), CrawlControl::default(), |_| {})
+            .await
+            .unwrap();
+        server.abort();
+
+        let records = store.records();
+        assert_eq!(progress.crawled, 2);
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.final_url == base_url)
+                .and_then(|record| record.status_code),
+            Some(299)
+        );
+        assert!(
+            records.iter().any(|record| {
+                record.final_url == resumed_url && record.status_code == Some(200)
+            })
+        );
+        assert_eq!(store.load_frontier_state(), None);
+    }
+
+    #[tokio::test]
     async fn flags_redirect_loops_before_redirect_limit() {
         let (base_url, server) = spawn_mock_site().await;
         let store = MemoryStore::new();
@@ -1854,6 +3590,7 @@ mod tests {
             mode: CrawlMode::Spider,
             start_url: format!("{base_url}loop-a"),
             list_urls: Vec::new(),
+            list_sitemap_urls: Vec::new(),
             max_urls: 4,
             max_depth: 1,
             concurrency: 1,
@@ -1865,12 +3602,20 @@ mod tests {
             user_agent: "FerrousFrogSeoSpider/Test".to_string(),
             timeout_secs: 5,
             max_redirects: 10,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
             near_duplicate_threshold: 6,
             include_url_patterns: Vec::new(),
             exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
             resource_types: CrawlResourceTypes::default(),
             query_settings: QuerySettings::default(),
             custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
         };
 
         let result = crawl(config, store.clone(), CrawlControl::default(), |_| {}).await;
@@ -1898,6 +3643,7 @@ mod tests {
             mode: CrawlMode::Spider,
             start_url: base_url,
             list_urls: Vec::new(),
+            list_sitemap_urls: Vec::new(),
             max_urls: 2,
             max_depth: 1,
             concurrency: 1,
@@ -1909,12 +3655,20 @@ mod tests {
             user_agent: "FerrousFrogSeoSpider/Test".to_string(),
             timeout_secs: 5,
             max_redirects: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
             near_duplicate_threshold: 6,
             include_url_patterns: Vec::new(),
             exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
             resource_types: CrawlResourceTypes::default(),
             query_settings: QuerySettings::default(),
             custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
         };
 
         let progress = crawl(config, store, CrawlControl::default(), |_| {})
@@ -1934,6 +3688,7 @@ mod tests {
             mode: CrawlMode::Spider,
             start_url: base_url.clone(),
             list_urls: Vec::new(),
+            list_sitemap_urls: Vec::new(),
             max_urls: 12,
             max_depth: 3,
             concurrency: 2,
@@ -1945,12 +3700,20 @@ mod tests {
             user_agent: "FerrousFrogSeoSpider/Test".to_string(),
             timeout_secs: 5,
             max_redirects: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
             near_duplicate_threshold: 6,
             include_url_patterns: Vec::new(),
             exclude_url_patterns: vec!["/missing$".to_string()],
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
             resource_types: CrawlResourceTypes::default(),
             query_settings: QuerySettings::default(),
             custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
         };
 
         crawl(config, store.clone(), CrawlControl::default(), |_| {})
@@ -1967,6 +3730,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn can_record_but_not_crawl_nofollow_links() {
+        let (base_url, server) = spawn_mock_site().await;
+        let store = MemoryStore::new();
+
+        let config = CrawlConfig {
+            mode: CrawlMode::Spider,
+            start_url: base_url.clone(),
+            list_urls: Vec::new(),
+            list_sitemap_urls: Vec::new(),
+            max_urls: 20,
+            max_depth: 1,
+            concurrency: 2,
+            requests_per_second: 20,
+            request_delay_ms: 0,
+            respect_robots: false,
+            use_robots_txt_override: false,
+            robots_txt_override: String::new(),
+            user_agent: "FerrousFrogSeoSpider/Test".to_string(),
+            timeout_secs: 5,
+            max_redirects: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
+            near_duplicate_threshold: 6,
+            include_url_patterns: Vec::new(),
+            exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: false,
+            resource_types: CrawlResourceTypes::default(),
+            query_settings: QuerySettings::default(),
+            custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
+        };
+
+        crawl(config, store.clone(), CrawlControl::default(), |_| {})
+            .await
+            .unwrap();
+        server.abort();
+
+        assert!(
+            !store
+                .records()
+                .iter()
+                .any(|record| { record.final_url == format!("{base_url}nofollow-target") })
+        );
+
+        let edges = store.link_edges(ferrous_frog_storage::LinkEdgeQuery {
+            limit: 100,
+            ..ferrous_frog_storage::LinkEdgeQuery::default()
+        });
+        assert!(edges.edges.iter().any(|edge| {
+            edge.target_url == format!("{base_url}nofollow-target") && edge.rel_nofollow
+        }));
+    }
+
+    #[tokio::test]
     async fn uses_custom_robots_txt_override() {
         let (base_url, server) = spawn_mock_site().await;
         let store = MemoryStore::new();
@@ -1975,6 +3796,7 @@ mod tests {
             mode: CrawlMode::Spider,
             start_url: base_url.clone(),
             list_urls: Vec::new(),
+            list_sitemap_urls: Vec::new(),
             max_urls: 12,
             max_depth: 2,
             concurrency: 2,
@@ -1986,12 +3808,20 @@ mod tests {
             user_agent: "FerrousFrogSeoSpider/Test".to_string(),
             timeout_secs: 5,
             max_redirects: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
             near_duplicate_threshold: 6,
             include_url_patterns: Vec::new(),
             exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
             resource_types: CrawlResourceTypes::default(),
             query_settings: QuerySettings::default(),
             custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
         };
 
         crawl(config, store.clone(), CrawlControl::default(), |_| {})
@@ -2032,6 +3862,7 @@ mod tests {
             mode: CrawlMode::Spider,
             start_url: base_url.clone(),
             list_urls: Vec::new(),
+            list_sitemap_urls: Vec::new(),
             max_urls: 20,
             max_depth: 1,
             concurrency: 4,
@@ -2043,9 +3874,14 @@ mod tests {
             user_agent: "FerrousFrogSeoSpider/Test".to_string(),
             timeout_secs: 5,
             max_redirects: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
             near_duplicate_threshold: 6,
             include_url_patterns: Vec::new(),
             exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
             resource_types: CrawlResourceTypes {
                 images: true,
                 css: true,
@@ -2054,6 +3890,9 @@ mod tests {
             },
             query_settings: QuerySettings::default(),
             custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
         };
 
         crawl(config, store.clone(), CrawlControl::default(), |_| {})
@@ -2085,6 +3924,7 @@ mod tests {
             mode: CrawlMode::Spider,
             start_url: base_url.clone(),
             list_urls: Vec::new(),
+            list_sitemap_urls: Vec::new(),
             max_urls: 20,
             max_depth: 1,
             concurrency: 4,
@@ -2096,9 +3936,14 @@ mod tests {
             user_agent: "FerrousFrogSeoSpider/Test".to_string(),
             timeout_secs: 5,
             max_redirects: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
             near_duplicate_threshold: 6,
             include_url_patterns: Vec::new(),
             exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
             resource_types: CrawlResourceTypes::default(),
             query_settings: QuerySettings {
                 sort_parameters: true,
@@ -2107,6 +3952,9 @@ mod tests {
                 strip_parameter_patterns: vec!["^utm_".to_string()],
             },
             custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
         };
 
         crawl(config, store.clone(), CrawlControl::default(), |_| {})
@@ -2127,6 +3975,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runs_custom_searches_against_raw_html() {
+        let (base_url, server) = spawn_mock_site().await;
+        let store = MemoryStore::new();
+
+        let config = CrawlConfig {
+            mode: CrawlMode::Spider,
+            start_url: base_url.clone(),
+            list_urls: Vec::new(),
+            list_sitemap_urls: Vec::new(),
+            max_urls: 1,
+            max_depth: 0,
+            concurrency: 1,
+            requests_per_second: 50,
+            request_delay_ms: 0,
+            respect_robots: false,
+            use_robots_txt_override: false,
+            robots_txt_override: String::new(),
+            user_agent: "FerrousFrogSeoSpider/Test".to_string(),
+            timeout_secs: 5,
+            max_redirects: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
+            near_duplicate_threshold: 6,
+            include_url_patterns: Vec::new(),
+            exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
+            resource_types: CrawlResourceTypes::default(),
+            query_settings: QuerySettings::default(),
+            custom_extractors: Vec::new(),
+            custom_searches: vec![CustomSearch {
+                name: "duplicate_links".to_string(),
+                pattern: "Duplicate".to_string(),
+                regex: false,
+                case_sensitive: true,
+                max_snippets: 2,
+            }],
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
+        };
+
+        crawl(config, store.clone(), CrawlControl::default(), |_| {})
+            .await
+            .unwrap();
+        server.abort();
+
+        let records = store.records();
+        let search = records[0]
+            .custom_searches
+            .iter()
+            .find(|search| search.name == "duplicate_links")
+            .expect("custom search result should be stored");
+        assert!(search.matched);
+        assert_eq!(search.match_count, 2);
+        assert_eq!(search.source, CustomSearchSource::RawHtml);
+        assert_eq!(search.snippets.len(), 2);
+    }
+
+    #[test]
+    fn custom_search_values_preserve_raw_and_rendered_sources() {
+        let searches = [CustomSearch {
+            name: "injected".to_string(),
+            pattern: "Injected".to_string(),
+            regex: false,
+            case_sensitive: true,
+            max_snippets: 1,
+        }];
+        let mut values = search_custom_values(
+            "<html><body>Raw</body></html>",
+            &searches,
+            CustomSearchSource::RawHtml,
+        );
+        values.extend(search_custom_values(
+            "<html><body>Injected</body></html>",
+            &searches,
+            CustomSearchSource::RenderedHtml,
+        ));
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].source, CustomSearchSource::RawHtml);
+        assert!(!values[0].matched);
+        assert_eq!(values[1].source, CustomSearchSource::RenderedHtml);
+        assert!(values[1].matched);
+    }
+
+    #[tokio::test]
+    async fn preserves_encoded_spaces_when_fetching_discovered_urls() {
+        let encoded_hits = Arc::new(AtomicUsize::new(0));
+        let double_encoded_hits = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) =
+            spawn_encoded_space_site(encoded_hits.clone(), double_encoded_hits.clone()).await;
+        let store = MemoryStore::new();
+
+        let config = CrawlConfig {
+            mode: CrawlMode::Spider,
+            start_url: format!("{base_url}start"),
+            list_urls: Vec::new(),
+            list_sitemap_urls: Vec::new(),
+            max_urls: 5,
+            max_depth: 1,
+            concurrency: 2,
+            requests_per_second: 50,
+            request_delay_ms: 0,
+            respect_robots: false,
+            use_robots_txt_override: false,
+            robots_txt_override: String::new(),
+            user_agent: "FerrousFrogSeoSpider/Test".to_string(),
+            timeout_secs: 5,
+            max_redirects: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
+            near_duplicate_threshold: 6,
+            include_url_patterns: Vec::new(),
+            exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
+            resource_types: CrawlResourceTypes::default(),
+            query_settings: QuerySettings::default(),
+            custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
+        };
+
+        crawl(config, store.clone(), CrawlControl::default(), |_| {})
+            .await
+            .unwrap();
+        server.abort();
+
+        let target_url = format!("{base_url}en/content-hub/event/MVNOs%20World%202026");
+        assert!(
+            store.records().iter().any(|record| {
+                record.final_url == target_url && record.status_code == Some(200)
+            })
+        );
+        assert_eq!(encoded_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(double_encoded_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn list_mode_crawls_only_supplied_urls() {
         let (base_url, server) = spawn_mock_site().await;
         let store = MemoryStore::new();
@@ -2134,7 +4124,12 @@ mod tests {
         let config = CrawlConfig {
             mode: CrawlMode::List,
             start_url: base_url.clone(),
-            list_urls: vec![format!("{base_url}a"), format!("{base_url}missing")],
+            list_urls: vec![
+                format!("{base_url}a"),
+                format!("{base_url}missing"),
+                format!("{base_url}a"),
+            ],
+            list_sitemap_urls: Vec::new(),
             max_urls: 20,
             max_depth: 3,
             concurrency: 2,
@@ -2146,12 +4141,20 @@ mod tests {
             user_agent: "FerrousFrogSeoSpider/Test".to_string(),
             timeout_secs: 5,
             max_redirects: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
             near_duplicate_threshold: 6,
             include_url_patterns: Vec::new(),
             exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
             resource_types: CrawlResourceTypes::default(),
             query_settings: QuerySettings::default(),
             custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
         };
 
         crawl(config, store.clone(), CrawlControl::default(), |_| {})
@@ -2160,11 +4163,18 @@ mod tests {
         server.abort();
 
         let records = store.records();
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 3);
         assert!(
             records
                 .iter()
                 .any(|record| record.final_url == format!("{base_url}a"))
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.final_url == format!("{base_url}a"))
+                .count(),
+            2
         );
         assert!(
             records
@@ -2173,6 +4183,240 @@ mod tests {
                     && record.status_code == Some(404))
         );
         assert!(!records.iter().any(|record| record.final_url == base_url));
+
+        let ordered = store.query(GridQuery::default()).rows;
+        assert_eq!(ordered[0].list_position, Some(1));
+        assert_eq!(ordered[0].list_duplicate_index, 1);
+        assert_eq!(ordered[1].list_position, Some(2));
+        assert_eq!(ordered[2].list_position, Some(3));
+        assert_eq!(ordered[2].list_duplicate_index, 2);
+    }
+
+    #[tokio::test]
+    async fn list_mode_expands_sitemap_url_sources() {
+        let (base_url, server) = spawn_mock_site().await;
+        let store = MemoryStore::new();
+
+        let config = CrawlConfig {
+            mode: CrawlMode::List,
+            start_url: base_url.clone(),
+            list_urls: Vec::new(),
+            list_sitemap_urls: vec![format!("{base_url}list-sitemap.xml")],
+            max_urls: 20,
+            max_depth: 3,
+            concurrency: 2,
+            requests_per_second: 50,
+            request_delay_ms: 0,
+            respect_robots: false,
+            use_robots_txt_override: false,
+            robots_txt_override: String::new(),
+            user_agent: "FerrousFrogSeoSpider/Test".to_string(),
+            timeout_secs: 5,
+            max_redirects: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
+            near_duplicate_threshold: 6,
+            include_url_patterns: Vec::new(),
+            exclude_url_patterns: Vec::new(),
+            subdomain_scope: SubdomainScope::default(),
+            folder_scope: FolderScope::default(),
+            follow_nofollow: true,
+            resource_types: CrawlResourceTypes::default(),
+            query_settings: QuerySettings::default(),
+            custom_extractors: Vec::new(),
+            custom_searches: Vec::new(),
+            rendering: JsRenderingConfig::default(),
+            resume_from_state: false,
+        };
+
+        crawl(config, store.clone(), CrawlControl::default(), |_| {})
+            .await
+            .unwrap();
+        server.abort();
+
+        let records = store.records();
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.final_url == format!("{base_url}a"))
+                .count(),
+            2
+        );
+        assert!(
+            records
+                .iter()
+                .any(|record| record.final_url == format!("{base_url}missing")
+                    && record.status_code == Some(404))
+        );
+        assert!(records.iter().all(|record| record.in_sitemap));
+
+        let ordered = store.query(GridQuery::default()).rows;
+        assert_eq!(ordered[0].list_position, Some(1));
+        assert_eq!(ordered[1].list_position, Some(2));
+        assert_eq!(ordered[2].list_position, Some(3));
+        assert_eq!(ordered[2].list_duplicate_index, 2);
+    }
+
+    #[tokio::test]
+    async fn retries_retryable_status_codes() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = spawn_retry_site(attempts.clone()).await;
+        let store = MemoryStore::new();
+
+        let config = CrawlConfig {
+            start_url: base_url.clone(),
+            max_urls: 1,
+            max_depth: 0,
+            requests_per_second: 0,
+            request_delay_ms: 0,
+            respect_robots: false,
+            retry_attempts: 1,
+            retry_backoff_ms: 1,
+            ..CrawlConfig::default()
+        };
+
+        crawl(config, store.clone(), CrawlControl::default(), |_| {})
+            .await
+            .unwrap();
+        server.abort();
+
+        let records = store.records();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status_code, Some(200));
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_active_requests_without_waiting_for_timeout() {
+        let (base_url, server) = spawn_slow_page_site(Duration::from_secs(5)).await;
+        let store = MemoryStore::new();
+        let control = CrawlControl::default();
+        let task_control = control.clone();
+        let started_at = Instant::now();
+
+        let handle = tokio::spawn(async move {
+            let config = CrawlConfig {
+                start_url: base_url,
+                max_urls: 1,
+                max_depth: 0,
+                concurrency: 1,
+                requests_per_second: 0,
+                request_delay_ms: 0,
+                respect_robots: false,
+                timeout_secs: 10,
+                ..CrawlConfig::default()
+            };
+            crawl(config, store, task_control, |_| {}).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        control.cancel();
+
+        let progress = handle.await.unwrap().unwrap();
+        server.abort();
+
+        assert_eq!(progress.status, "stopped");
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn pause_blocks_worker_before_following_redirect_request() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = spawn_pause_redirect_site(requests.clone()).await;
+        let store = MemoryStore::new();
+        let control = CrawlControl::default();
+        let task_control = control.clone();
+
+        let handle = tokio::spawn(async move {
+            let config = CrawlConfig {
+                start_url: base_url,
+                max_urls: 1,
+                max_depth: 0,
+                concurrency: 1,
+                requests_per_second: 0,
+                request_delay_ms: 0,
+                respect_robots: false,
+                timeout_secs: 10,
+                ..CrawlConfig::default()
+            };
+            crawl(config, store, task_control, |_| {}).await
+        });
+
+        for _ in 0..50 {
+            if requests.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        control.pause();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        control.resume();
+        let progress = handle.await.unwrap().unwrap();
+        server.abort();
+
+        assert_eq!(progress.status, "finished");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    type RecordedRequests = Arc<std::sync::Mutex<Vec<(String, Instant)>>>;
+
+    fn robots_response(content_type: &str, body: &str, directives: &[&str]) -> String {
+        let headers = directives
+            .iter()
+            .map(|directive| format!("X-Robots-Tag: {directive}\r\n"))
+            .collect::<String>();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn redirect_response(target: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    async fn spawn_recording_site(
+        handler: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (String, RecordedRequests, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let handler = Arc::new(handler);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let requests = recorded.clone();
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 2048];
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((path.to_string(), Instant::now()));
+                    let _ = stream.write_all(handler(path).as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (base_url, requests, server)
     }
 
     async fn spawn_mock_site() -> (String, tokio::task::JoinHandle<()>) {
@@ -2189,6 +4433,9 @@ mod tests {
                     let Ok(read) = stream.read(&mut buffer).await else {
                         return;
                     };
+                    if read == 0 {
+                        return;
+                    }
                     let request = String::from_utf8_lossy(&buffer[..read]);
                     let path = request
                         .lines()
@@ -2196,6 +4443,204 @@ mod tests {
                         .and_then(|line| line.split_whitespace().nth(1))
                         .unwrap_or("/");
                     let response = mock_response(path);
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (base_url, handle)
+    }
+
+    async fn spawn_pause_redirect_site(
+        requests: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let requests = requests.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 2048];
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let response = match path {
+                        "/" => {
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            "HTTP/1.1 302 Found\r\nLocation: /after-pause\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                        }
+                        "/after-pause" => {
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            response(
+                                200,
+                                "OK",
+                                "text/html",
+                                "<html><head><title>After Pause</title></head><body><h1>After Pause</h1></body></html>",
+                            )
+                        }
+                        _ => response(404, "Not Found", "text/plain", "not found"),
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (base_url, handle)
+    }
+
+    async fn spawn_encoded_space_site(
+        encoded_hits: Arc<AtomicUsize>,
+        double_encoded_hits: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let encoded_hits = encoded_hits.clone();
+                let double_encoded_hits = double_encoded_hits.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 2048];
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let body =
+                        "<html><head><title>Event</title></head><body><h1>Event</h1></body></html>";
+                    let output = match path {
+                        "/start" => response(
+                            200,
+                            "OK",
+                            "text/html",
+                            r#"
+                                <html>
+                                  <head><title>Start</title></head>
+                                  <body>
+                                    <a href="/en/content-hub/event/MVNOs%20World%202026">Event</a>
+                                  </body>
+                                </html>
+                            "#,
+                        ),
+                        "/en/content-hub/event/MVNOs%20World%202026" => {
+                            encoded_hits.fetch_add(1, Ordering::SeqCst);
+                            response(200, "OK", "text/html", body)
+                        }
+                        "/en/content-hub/event/MVNOs%2520World%25202026" => {
+                            double_encoded_hits.fetch_add(1, Ordering::SeqCst);
+                            response(404, "Not Found", "text/html", "<h1>Double encoded</h1>")
+                        }
+                        _ => response(404, "Not Found", "text/html", "<h1>Not found</h1>"),
+                    };
+                    let _ = stream.write_all(output.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (base_url, handle)
+    }
+
+    async fn spawn_slow_page_site(delay: Duration) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 2048];
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    if path == "/" {
+                        tokio::time::sleep(delay).await;
+                        let body = "<html><head><title>Slow Page</title></head><body><h1>Slow</h1></body></html>";
+                        let _ = stream
+                            .write_all(response(200, "OK", "text/html", body).as_bytes())
+                            .await;
+                    } else {
+                        let _ = stream
+                            .write_all(
+                                response(404, "Not Found", "text/plain", "not found").as_bytes(),
+                            )
+                            .await;
+                    }
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (base_url, handle)
+    }
+
+    async fn spawn_retry_site(attempts: Arc<AtomicUsize>) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let attempts = attempts.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 2048];
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let response = if path == "/" {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            response(503, "Service Unavailable", "text/plain", "try again")
+                        } else {
+                            response(200, "OK", "text/html", "<html><body>ok</body></html>")
+                        }
+                    } else {
+                        response(404, "Not Found", "text/plain", "not found")
+                    };
                     let _ = stream.write_all(response.as_bytes()).await;
                     let _ = stream.shutdown().await;
                 });
@@ -2222,6 +4667,18 @@ mod tests {
                     </urlset>
                 "#,
             ),
+            "/list-sitemap.xml" => response(
+                200,
+                "OK",
+                "application/xml",
+                r#"
+                    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+                      <url><loc>/a</loc></url>
+                      <url><loc>/missing</loc></url>
+                      <url><loc>/a</loc></url>
+                    </urlset>
+                "#,
+            ),
             "/" => response(
                 200,
                 "OK",
@@ -2245,6 +4702,7 @@ mod tests {
                         <a href="/hreflang">Hreflang issue page</a>
                         <a href="/structured">Structured data issue page</a>
                         <a href="/params?b=2&utm_source=test&a=1&keep=3">Parameterized page</a>
+                        <a href="/nofollow-target" rel="nofollow">Nofollow target</a>
                       </body>
                     </html>
                 "#,
@@ -2312,6 +4770,12 @@ mod tests {
                 "OK",
                 "text/html",
                 "<html><head><title>Parameterized Page</title></head><body><h1>Parameterized</h1></body></html>",
+            ),
+            "/nofollow-target" => response(
+                200,
+                "OK",
+                "text/html",
+                "<html><head><title>Nofollow Target</title></head><body><h1>Nofollow Target</h1></body></html>",
             ),
             "/assets/logo.png" => response(200, "OK", "image/png", "png"),
             "/assets/site.css" => response(200, "OK", "text/css", "body { color: #222; }"),

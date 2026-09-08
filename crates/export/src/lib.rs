@@ -1,12 +1,15 @@
 use csv::Writer;
-use ferrous_frog_storage::{CrawlRecord, LinkEdge, summarize};
+use ferrous_frog_storage::{
+    CrawlRecord, GraphNode, LinkEdge, SitemapValidationRow, is_broken_record,
+    is_success_html_record, is_success_record, summarize,
+};
 use minijinja::{Environment, context};
 use rust_xlsxwriter::{Workbook, XlsxError};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
-const HEADERS: [&str; 65] = [
+const HEADERS: [&str; 89] = [
     "id",
     "url",
     "final_url",
@@ -63,15 +66,39 @@ const HEADERS: [&str; 65] = [
     "hreflang_missing_self_reference",
     "json_ld_count",
     "json_ld_invalid_count",
+    "structured_data_error_count",
+    "structured_data_warning_count",
+    "structured_data_issues",
     "open_graph_count",
     "twitter_card_count",
+    "deprecated_html_tag_count",
+    "duplicate_id_count",
+    "js_rendered",
+    "rendered_dom_changed",
+    "rendered_word_count_delta",
+    "rendered_link_count_delta",
     "inlink_count",
     "outlink_count",
     "internal_outlink_count",
     "external_outlink_count",
     "custom_extractions",
+    "custom_searches",
     "error",
     "in_sitemap",
+    "storage_key",
+    "list_position",
+    "list_duplicate_index",
+    "first_inlink_source_url",
+    "first_inlink_anchor_text",
+    "first_inlink_source_position",
+    "tcp_connect_time_ms",
+    "tls_handshake_time_ms",
+    "title_pixel_width",
+    "meta_description_pixel_width",
+    "search_console_clicks",
+    "search_console_impressions",
+    "search_console_ctr",
+    "search_console_average_position",
 ];
 
 const LINK_EDGE_HEADERS: [&str; 13] = [
@@ -90,7 +117,19 @@ const LINK_EDGE_HEADERS: [&str; 13] = [
     "discovery_order",
 ];
 
-const REDIRECT_CHAIN_HEADERS: [&str; 10] = [
+const GRAPH_NODE_HEADERS: [&str; 9] = [
+    "url",
+    "label",
+    "crawled",
+    "classification",
+    "status_code",
+    "depth",
+    "indexability",
+    "inlink_count",
+    "outlink_count",
+];
+
+const REDIRECT_CHAIN_HEADERS: [&str; 12] = [
     "record_id",
     "source_url",
     "final_url",
@@ -99,8 +138,24 @@ const REDIRECT_CHAIN_HEADERS: [&str; 10] = [
     "status_code",
     "location",
     "dns_lookup_time_ms",
+    "tcp_connect_time_ms",
+    "tls_handshake_time_ms",
     "ttfb_ms",
     "elapsed_ms",
+];
+
+const SITEMAP_VALIDATION_HEADERS: [&str; 11] = [
+    "url",
+    "final_url",
+    "status_code",
+    "status_text",
+    "indexability",
+    "indexability_status",
+    "inlink_count",
+    "redirect_target",
+    "canonical",
+    "severity",
+    "issues",
 ];
 
 const HTML_REPORT_ROW_LIMIT: usize = 50;
@@ -201,15 +256,63 @@ pub fn records_to_csv<W: Write>(records: &[CrawlRecord], writer: W) -> csv::Resu
             record.hreflang_missing_self_reference.to_string(),
             record.json_ld_count.to_string(),
             record.json_ld_invalid_count.to_string(),
+            record.structured_data_error_count.to_string(),
+            record.structured_data_warning_count.to_string(),
+            serde_json::to_string(&record.structured_data_issues).unwrap_or_default(),
             record.open_graph_count.to_string(),
             record.twitter_card_count.to_string(),
+            record.deprecated_html_tag_count.to_string(),
+            record.duplicate_id_count.to_string(),
+            record.js_rendered.to_string(),
+            record.rendered_dom_changed.to_string(),
+            record.rendered_word_count_delta.to_string(),
+            record.rendered_link_count_delta.to_string(),
             record.inlink_count.to_string(),
             record.outlink_count.to_string(),
             record.internal_outlink_count.to_string(),
             record.external_outlink_count.to_string(),
             serde_json::to_string(&record.custom_extractions).unwrap_or_default(),
+            serde_json::to_string(&record.custom_searches).unwrap_or_default(),
             record.error.clone().unwrap_or_default(),
             record.in_sitemap.to_string(),
+            record.storage_key.clone(),
+            record
+                .list_position
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record.list_duplicate_index.to_string(),
+            record.first_inlink_source_url.clone().unwrap_or_default(),
+            record.first_inlink_anchor_text.clone().unwrap_or_default(),
+            record
+                .first_inlink_source_position
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .tcp_connect_time_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .tls_handshake_time_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record.title_pixel_width.to_string(),
+            record.meta_description_pixel_width.to_string(),
+            record
+                .search_console_clicks
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_default(),
+            record
+                .search_console_impressions
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_default(),
+            record
+                .search_console_ctr
+                .map(|value| format!("{value:.6}"))
+                .unwrap_or_default(),
+            record
+                .search_console_average_position
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_default(),
         ])?;
     }
 
@@ -261,6 +364,41 @@ pub fn link_edges_to_csv_string(edges: &[LinkEdge]) -> csv::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+pub fn graph_nodes_to_csv<W: Write>(nodes: &[GraphNode], writer: W) -> csv::Result<()> {
+    let mut writer = Writer::from_writer(writer);
+    writer.write_record(GRAPH_NODE_HEADERS)?;
+
+    for node in nodes {
+        writer.write_record([
+            node.url.clone(),
+            node.label.clone(),
+            node.crawled.to_string(),
+            node.classification
+                .as_ref()
+                .map(|classification| format!("{classification:?}"))
+                .unwrap_or_default(),
+            node.status_code
+                .map(|code| code.to_string())
+                .unwrap_or_default(),
+            node.depth
+                .map(|depth| depth.to_string())
+                .unwrap_or_default(),
+            node.indexability.clone().unwrap_or_default(),
+            node.inlink_count.to_string(),
+            node.outlink_count.to_string(),
+        ])?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+pub fn graph_nodes_to_csv_string(nodes: &[GraphNode]) -> csv::Result<String> {
+    let mut bytes = Vec::new();
+    graph_nodes_to_csv(nodes, &mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 pub fn redirect_chains_to_csv<W: Write>(records: &[CrawlRecord], writer: W) -> csv::Result<()> {
     let mut writer = Writer::from_writer(writer);
     writer.write_record(REDIRECT_CHAIN_HEADERS)?;
@@ -276,6 +414,12 @@ pub fn redirect_chains_to_csv<W: Write>(records: &[CrawlRecord], writer: W) -> c
                 hop.status_code.to_string(),
                 hop.location.clone().unwrap_or_default(),
                 hop.dns_lookup_time_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                hop.tcp_connect_time_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                hop.tls_handshake_time_ms
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
                 hop.ttfb_ms
@@ -295,6 +439,41 @@ pub fn redirect_chains_to_csv<W: Write>(records: &[CrawlRecord], writer: W) -> c
 pub fn redirect_chains_to_csv_string(records: &[CrawlRecord]) -> csv::Result<String> {
     let mut bytes = Vec::new();
     redirect_chains_to_csv(records, &mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+pub fn sitemap_validation_to_csv<W: Write>(
+    rows: &[SitemapValidationRow],
+    writer: W,
+) -> csv::Result<()> {
+    let mut writer = Writer::from_writer(writer);
+    writer.write_record(SITEMAP_VALIDATION_HEADERS)?;
+
+    for row in rows {
+        writer.write_record([
+            row.url.clone(),
+            row.final_url.clone(),
+            row.status_code
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            row.status_text.clone(),
+            row.indexability.clone(),
+            row.indexability_status.clone(),
+            row.inlink_count.to_string(),
+            row.redirect_target.clone().unwrap_or_default(),
+            row.canonical.clone().unwrap_or_default(),
+            format!("{:?}", row.severity),
+            row.issues.join("; "),
+        ])?;
+    }
+
+    writer.flush()?;
+    Ok(())
+}
+
+pub fn sitemap_validation_to_csv_string(rows: &[SitemapValidationRow]) -> csv::Result<String> {
+    let mut bytes = Vec::new();
+    sitemap_validation_to_csv(rows, &mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -394,19 +573,81 @@ pub fn records_to_xlsx_bytes(records: &[CrawlRecord]) -> Result<Vec<u8>, XlsxErr
         worksheet.write_string(row, 53, record.hreflang_missing_self_reference.to_string())?;
         worksheet.write_number(row, 54, f64::from(record.json_ld_count))?;
         worksheet.write_number(row, 55, f64::from(record.json_ld_invalid_count))?;
-        worksheet.write_number(row, 56, f64::from(record.open_graph_count))?;
-        worksheet.write_number(row, 57, f64::from(record.twitter_card_count))?;
-        worksheet.write_number(row, 58, f64::from(record.inlink_count))?;
-        worksheet.write_number(row, 59, f64::from(record.outlink_count))?;
-        worksheet.write_number(row, 60, f64::from(record.internal_outlink_count))?;
-        worksheet.write_number(row, 61, f64::from(record.external_outlink_count))?;
+        worksheet.write_number(row, 56, f64::from(record.structured_data_error_count))?;
+        worksheet.write_number(row, 57, f64::from(record.structured_data_warning_count))?;
         worksheet.write_string(
             row,
-            62,
+            58,
+            serde_json::to_string(&record.structured_data_issues).unwrap_or_default(),
+        )?;
+        worksheet.write_number(row, 59, f64::from(record.open_graph_count))?;
+        worksheet.write_number(row, 60, f64::from(record.twitter_card_count))?;
+        worksheet.write_number(row, 61, f64::from(record.deprecated_html_tag_count))?;
+        worksheet.write_number(row, 62, f64::from(record.duplicate_id_count))?;
+        worksheet.write_string(row, 63, record.js_rendered.to_string())?;
+        worksheet.write_string(row, 64, record.rendered_dom_changed.to_string())?;
+        worksheet.write_number(row, 65, f64::from(record.rendered_word_count_delta))?;
+        worksheet.write_number(row, 66, f64::from(record.rendered_link_count_delta))?;
+        worksheet.write_number(row, 67, f64::from(record.inlink_count))?;
+        worksheet.write_number(row, 68, f64::from(record.outlink_count))?;
+        worksheet.write_number(row, 69, f64::from(record.internal_outlink_count))?;
+        worksheet.write_number(row, 70, f64::from(record.external_outlink_count))?;
+        worksheet.write_string(
+            row,
+            71,
             serde_json::to_string(&record.custom_extractions).unwrap_or_default(),
         )?;
-        worksheet.write_string(row, 63, record.error.as_deref().unwrap_or_default())?;
-        worksheet.write_boolean(row, 64, record.in_sitemap)?;
+        worksheet.write_string(
+            row,
+            72,
+            serde_json::to_string(&record.custom_searches).unwrap_or_default(),
+        )?;
+        worksheet.write_string(row, 73, record.error.as_deref().unwrap_or_default())?;
+        worksheet.write_boolean(row, 74, record.in_sitemap)?;
+        worksheet.write_string(row, 75, &record.storage_key)?;
+        if let Some(list_position) = record.list_position {
+            worksheet.write_number(row, 76, f64::from(list_position))?;
+        }
+        worksheet.write_number(row, 77, f64::from(record.list_duplicate_index))?;
+        worksheet.write_string(
+            row,
+            78,
+            record
+                .first_inlink_source_url
+                .as_deref()
+                .unwrap_or_default(),
+        )?;
+        worksheet.write_string(
+            row,
+            79,
+            record
+                .first_inlink_anchor_text
+                .as_deref()
+                .unwrap_or_default(),
+        )?;
+        if let Some(source_position) = record.first_inlink_source_position {
+            worksheet.write_number(row, 80, f64::from(source_position))?;
+        }
+        if let Some(value) = record.tcp_connect_time_ms {
+            worksheet.write_number(row, 81, value as f64)?;
+        }
+        if let Some(value) = record.tls_handshake_time_ms {
+            worksheet.write_number(row, 82, value as f64)?;
+        }
+        worksheet.write_number(row, 83, f64::from(record.title_pixel_width))?;
+        worksheet.write_number(row, 84, f64::from(record.meta_description_pixel_width))?;
+        if let Some(value) = record.search_console_clicks {
+            worksheet.write_number(row, 85, value)?;
+        }
+        if let Some(value) = record.search_console_impressions {
+            worksheet.write_number(row, 86, value)?;
+        }
+        if let Some(value) = record.search_console_ctr {
+            worksheet.write_number(row, 87, value)?;
+        }
+        if let Some(value) = record.search_console_average_position {
+            worksheet.write_number(row, 88, value)?;
+        }
     }
 
     workbook.save_to_buffer()
@@ -500,22 +741,37 @@ struct ReportRow {
 
 fn build_html_report(records: &[CrawlRecord], edges: &[LinkEdge]) -> HtmlReport {
     let summary = summarize(records);
-    let broken_url_count = records
+    let failed_urls =
+        records
+            .iter()
+            .filter(|record| is_broken_record(record))
+            .flat_map(|record| {
+                [
+                    record.storage_key.as_str(),
+                    record.url.as_str(),
+                    record.final_url.as_str(),
+                ]
+                .into_iter()
+                .chain(record.redirect_chain.iter().flat_map(|hop| {
+                    std::iter::once(hop.url.as_str()).chain(hop.location.as_deref())
+                }))
+            })
+            .collect::<HashSet<_>>();
+    let broken_edge_count = edges
         .iter()
-        .filter(|record| broken_record(record))
+        .filter(|edge| broken_edge(edge, &failed_urls))
         .count();
-    let broken_edge_count = edges.iter().filter(|edge| broken_edge(edge)).count();
     let image_issue_count = records
         .iter()
-        .filter(|record| {
-            record.images_missing_alt > 0
-                || record.images_alt_too_long > 0
-                || large_image_record(record)
-        })
+        .filter(|record| !image_issues(record).is_empty())
         .count();
     let security_issue_count = records
         .iter()
         .filter(|record| has_security_issue(record))
+        .count();
+    let validation_issue_count = records
+        .iter()
+        .filter(|record| !html_validation_issues(record).is_empty())
         .count();
 
     HtmlReport {
@@ -524,11 +780,12 @@ fn build_html_report(records: &[CrawlRecord], edges: &[LinkEdge]) -> HtmlReport 
         row_limit: HTML_REPORT_ROW_LIMIT,
         kpis: vec![
             kpi("URLs crawled", summary.total, "Total stored URL records", "default"),
-            kpi("Broken URLs", broken_url_count, "No response, 4xx, 5xx, or fetch error", "danger"),
+            kpi("Broken URLs", summary.broken, "No response, 4xx, 5xx, or redirect error", "danger"),
             kpi("Broken link edges", broken_edge_count, "Source pages linking to known broken targets", "danger"),
             kpi("Non-indexable", summary.non_indexable, "Pages currently marked non-indexable", "warning"),
             kpi("Image issues", image_issue_count, "Missing alt, long alt, or large image assets where crawled", "warning"),
             kpi("Security issues", security_issue_count, "Mixed content, insecure forms, or missing headers", "danger"),
+            kpi("HTML validation", validation_issue_count, "Deprecated tags or duplicate id attributes", "warning"),
         ],
         facts: vec![
             fact("2xx success", summary.success),
@@ -542,16 +799,19 @@ fn build_html_report(records: &[CrawlRecord], edges: &[LinkEdge]) -> HtmlReport 
             route("Content", "Missing or duplicate titles, descriptions, headings, and image alt text."),
             route("Performance", "Large pages, slow TTFB, slow responses, and large image assets where crawled."),
             route("Security", "Mixed content, insecure forms, HSTS, CSP, X-Frame-Options, and content-type headers."),
+            route("Frontend", "Deprecated HTML tags, duplicate id attributes, and reusable template issues."),
         ],
         sections: vec![
             broken_url_section(records),
-            broken_link_section(edges),
+            broken_link_section(edges, &failed_urls),
             metadata_section(records),
             headings_and_canonicals_section(records),
             image_section(records),
             performance_section(records),
             security_section(records),
             structured_data_section(records),
+            html_validation_section(records),
+            rendering_section(records),
         ],
     }
 }
@@ -613,7 +873,7 @@ fn row(cells: Vec<String>) -> ReportRow {
 }
 
 fn broken_url_section(records: &[CrawlRecord]) -> ReportSection {
-    let matching = records.iter().filter(|record| broken_record(record));
+    let matching = records.iter().filter(|record| is_broken_record(record));
     let total_count = matching.clone().count();
     let rows = matching
         .take(HTML_REPORT_ROW_LIMIT)
@@ -640,8 +900,8 @@ fn broken_url_section(records: &[CrawlRecord]) -> ReportSection {
     )
 }
 
-fn broken_link_section(edges: &[LinkEdge]) -> ReportSection {
-    let matching = edges.iter().filter(|edge| broken_edge(edge));
+fn broken_link_section(edges: &[LinkEdge], failed_urls: &HashSet<&str>) -> ReportSection {
+    let matching = edges.iter().filter(|edge| broken_edge(edge, failed_urls));
     let total_count = matching.clone().count();
     let rows = matching
         .take(HTML_REPORT_ROW_LIMIT)
@@ -675,10 +935,13 @@ fn broken_link_section(edges: &[LinkEdge]) -> ReportSection {
 }
 
 fn metadata_section(records: &[CrawlRecord]) -> ReportSection {
-    let title_counts = text_counts(records.iter().filter_map(|record| record.title.as_deref()));
+    let records = records
+        .iter()
+        .filter(|record| is_success_html_record(record));
+    let title_counts = text_counts(records.clone().filter_map(|record| record.title.as_deref()));
     let meta_counts = text_counts(
         records
-            .iter()
+            .clone()
             .filter_map(|record| record.meta_description.as_deref()),
     );
     let mut rows = Vec::new();
@@ -720,7 +983,10 @@ fn metadata_section(records: &[CrawlRecord]) -> ReportSection {
 }
 
 fn headings_and_canonicals_section(records: &[CrawlRecord]) -> ReportSection {
-    let h1_counts = text_counts(records.iter().filter_map(|record| record.h1.as_deref()));
+    let records = records
+        .iter()
+        .filter(|record| is_success_html_record(record));
+    let h1_counts = text_counts(records.clone().filter_map(|record| record.h1.as_deref()));
     let mut rows = Vec::new();
     let mut total_count = 0;
 
@@ -918,15 +1184,87 @@ fn structured_data_section(records: &[CrawlRecord]) -> ReportSection {
     )
 }
 
-fn broken_record(record: &CrawlRecord) -> bool {
-    record.error.is_some()
-        || record.status_code.is_none()
-        || matches!(record.status_code, Some(code) if code >= 400)
+fn html_validation_section(records: &[CrawlRecord]) -> ReportSection {
+    let mut rows = Vec::new();
+    let mut total_count = 0;
+
+    for record in records {
+        let issues = html_validation_issues(record);
+        if issues.is_empty() {
+            continue;
+        }
+        total_count += 1;
+        if rows.len() < HTML_REPORT_ROW_LIMIT {
+            rows.push(row(vec![
+                safe_text(&record.final_url),
+                safe_text(&issues.join("; ")),
+                record.deprecated_html_tag_count.to_string(),
+                record.duplicate_id_count.to_string(),
+                "Replace obsolete markup and ensure id attributes are unique within each page."
+                    .to_string(),
+            ]));
+        }
+    }
+
+    make_section(
+        "HTML Validation",
+        "Frontend / Engineering",
+        "Medium",
+        "Template-level HTML quality signals that can affect accessibility, maintainability, and browser behavior.",
+        &[
+            "URL",
+            "Issue",
+            "Deprecated tags",
+            "Duplicate ids",
+            "Recommended action",
+        ],
+        rows,
+        total_count,
+        "No deprecated HTML tags or duplicate id attributes were found.",
+    )
 }
 
-fn broken_edge(edge: &LinkEdge) -> bool {
-    edge.target_status_code.is_none()
-        || matches!(edge.target_status_code, Some(code) if code >= 400)
+fn rendering_section(records: &[CrawlRecord]) -> ReportSection {
+    let mut rows = Vec::new();
+    let mut total_count = 0;
+
+    for record in records
+        .iter()
+        .filter(|record| is_success_html_record(record) && record.rendered_dom_changed)
+    {
+        total_count += 1;
+        if rows.len() < HTML_REPORT_ROW_LIMIT {
+            rows.push(row(vec![
+                safe_text(&record.final_url),
+                record.rendered_word_count_delta.to_string(),
+                record.rendered_link_count_delta.to_string(),
+                safe_text(record.title.as_deref().unwrap_or("")),
+                "Review JS-rendered content and links against the raw HTML response.".to_string(),
+            ]));
+        }
+    }
+
+    make_section(
+        "Rendered DOM Differences",
+        "SEO / Engineering",
+        "Medium",
+        "Pages where Chrome-rendered DOM signals differ from the raw HTML response.",
+        &[
+            "URL",
+            "Word delta",
+            "Link delta",
+            "Rendered title",
+            "Recommended action",
+        ],
+        rows,
+        total_count,
+        "No raw-versus-rendered DOM differences were captured.",
+    )
+}
+
+fn broken_edge(edge: &LinkEdge, failed_urls: &HashSet<&str>) -> bool {
+    edge.target_status_code.is_some_and(|code| code >= 400)
+        || failed_urls.contains(edge.target_url.as_str())
 }
 
 fn metadata_issues(
@@ -1027,10 +1365,10 @@ fn heading_canonical_issues(
 
 fn image_issues(record: &CrawlRecord) -> Vec<String> {
     let mut issues = Vec::new();
-    if record.images_missing_alt > 0 {
+    if is_success_html_record(record) && record.images_missing_alt > 0 {
         issues.push(format!("{} images missing alt", record.images_missing_alt));
     }
-    if record.images_alt_too_long > 0 {
+    if is_success_html_record(record) && record.images_alt_too_long > 0 {
         issues.push(format!(
             "{} image alt values too long",
             record.images_alt_too_long
@@ -1065,38 +1403,34 @@ fn has_security_issue(record: &CrawlRecord) -> bool {
 
 fn security_issues(record: &CrawlRecord) -> Vec<String> {
     let mut issues = Vec::new();
-    let is_success = matches!(record.status_code, Some(code) if (200..300).contains(&code));
-    let is_html = record
-        .content_type
-        .as_deref()
-        .map(|value| value.to_ascii_lowercase().contains("text/html"))
-        .unwrap_or(false);
+    let is_success = is_success_record(record);
+    let is_html = is_success_html_record(record);
 
     if record.final_url.starts_with("http://") {
         issues.push("HTTP URL".to_string());
     }
-    if record.mixed_content_count > 0 {
+    if is_html && record.mixed_content_count > 0 {
         issues.push(format!(
             "{} mixed-content references",
             record.mixed_content_count
         ));
     }
-    if record.insecure_form_count > 0 {
+    if is_html && record.insecure_form_count > 0 {
         issues.push(format!("{} insecure forms", record.insecure_form_count));
     }
     if is_success && record.final_url.starts_with("https://") && !record.hsts_header {
         issues.push("Missing HSTS".to_string());
     }
-    if is_success && is_html && !record.content_security_policy_header {
+    if is_html && !record.content_security_policy_header {
         issues.push("Missing CSP".to_string());
     }
-    if is_success && is_html && !record.x_frame_options_header {
+    if is_html && !record.x_frame_options_header {
         issues.push("Missing X-Frame-Options".to_string());
     }
     if is_success && !record.x_content_type_options_header {
         issues.push("Missing X-Content-Type-Options".to_string());
     }
-    if is_success && is_html && !record.viewport {
+    if is_html && !record.viewport {
         issues.push("Missing viewport".to_string());
     }
 
@@ -1104,6 +1438,9 @@ fn security_issues(record: &CrawlRecord) -> Vec<String> {
 }
 
 fn structured_data_issues(record: &CrawlRecord) -> Vec<String> {
+    if !is_success_html_record(record) {
+        return Vec::new();
+    }
     let mut issues = Vec::new();
     if record.json_ld_invalid_count > 0 {
         issues.push(format!(
@@ -1111,6 +1448,25 @@ fn structured_data_issues(record: &CrawlRecord) -> Vec<String> {
             record.json_ld_invalid_count
         ));
     }
+    if record.structured_data_error_count > 0 {
+        issues.push(format!(
+            "{} structured data errors",
+            record.structured_data_error_count
+        ));
+    }
+    if record.structured_data_warning_count > 0 {
+        issues.push(format!(
+            "{} structured data warnings",
+            record.structured_data_warning_count
+        ));
+    }
+    issues.extend(
+        record
+            .structured_data_issues
+            .iter()
+            .take(5)
+            .map(|issue| format!("{}: {} ({})", issue.severity, issue.message, issue.path)),
+    );
     if record.hreflang_invalid_count > 0 {
         issues.push(format!(
             "{} invalid hreflang tags",
@@ -1123,12 +1479,33 @@ fn structured_data_issues(record: &CrawlRecord) -> Vec<String> {
     issues
 }
 
+fn html_validation_issues(record: &CrawlRecord) -> Vec<String> {
+    if !is_success_html_record(record) {
+        return Vec::new();
+    }
+    let mut issues = Vec::new();
+    if record.deprecated_html_tag_count > 0 {
+        issues.push(format!(
+            "{} deprecated HTML tag instances",
+            record.deprecated_html_tag_count
+        ));
+    }
+    if record.duplicate_id_count > 0 {
+        issues.push(format!(
+            "{} duplicate id instances",
+            record.duplicate_id_count
+        ));
+    }
+    issues
+}
+
 fn large_image_record(record: &CrawlRecord) -> bool {
-    record
-        .content_type
-        .as_deref()
-        .map(|value| value.to_ascii_lowercase().starts_with("image/"))
-        .unwrap_or(false)
+    is_success_record(record)
+        && record
+            .content_type
+            .as_deref()
+            .map(|value| value.to_ascii_lowercase().starts_with("image/"))
+            .unwrap_or(false)
         && record.size_bytes > LARGE_IMAGE_BYTES
 }
 
@@ -1213,8 +1590,156 @@ fn escape_xml(value: &str) -> String {
 mod tests {
     use super::*;
     use ferrous_frog_storage::{
-        CrawlRecord, CustomExtractionValue, LinkEdge, LinkType, RedirectHop,
+        CrawlRecord, CustomExtractionValue, CustomSearchSource, CustomSearchValue, GraphNode,
+        LinkEdge, LinkType, RedirectHop, Severity, SitemapValidationRow, UrlClassification,
     };
+
+    #[test]
+    fn report_excludes_unfetched_and_non_html_metadata_and_broken_links() {
+        let mut page = CrawlRecord::pending("https://example.test/page".to_string(), 0);
+        page.status_code = Some(200);
+        page.content_type = Some("text/html".to_string());
+        page.error = Some("JavaScript rendering failed: timeout".to_string());
+        page.images_missing_alt = 1;
+        page.structured_data_error_count = 1;
+        page.deprecated_html_tag_count = 1;
+        page.rendered_dom_changed = true;
+        let mut image = CrawlRecord::pending("https://example.test/image.png".to_string(), 1);
+        image.status_code = Some(200);
+        image.content_type = Some("image/png".to_string());
+        let mut blocked = CrawlRecord::pending("https://example.test/private".to_string(), 1);
+        blocked.status_text = "Blocked by robots.txt".to_string();
+        blocked.error = Some("Blocked by robots.txt".to_string());
+        let mut failed = CrawlRecord::pending("https://example.test/missing".to_string(), 1);
+        failed.status_code = Some(404);
+        failed.content_type = Some("text/html".to_string());
+        failed.images_missing_alt = 1;
+        failed.structured_data_error_count = 1;
+        failed.deprecated_html_tag_count = 1;
+        failed.rendered_dom_changed = true;
+        failed.mixed_content_count = 1;
+        failed.insecure_form_count = 1;
+        let mut unreachable = CrawlRecord::pending("https://example.test/offline".to_string(), 1);
+        unreachable.final_url = "https://example.test/offline-final".to_string();
+        unreachable.redirect_chain = vec![RedirectHop {
+            url: "https://example.test/offline-hop".to_string(),
+            status_code: 302,
+            location: Some(unreachable.final_url.clone()),
+            dns_lookup_time_ms: None,
+            tcp_connect_time_ms: None,
+            tls_handshake_time_ms: None,
+            ttfb_ms: None,
+            elapsed_ms: None,
+        }];
+        unreachable.error = Some("Connection refused".to_string());
+        assert!(!has_security_issue(&failed));
+        let records = vec![page, image, blocked, failed, unreachable];
+        assert_eq!(metadata_section(&records).count, 1);
+        assert_eq!(headings_and_canonicals_section(&records).count, 1);
+        assert_eq!(broken_url_section(&records).count, 2);
+        assert_eq!(image_section(&records).count, 1);
+        assert_eq!(structured_data_section(&records).count, 1);
+        assert_eq!(html_validation_section(&records).count, 1);
+        assert_eq!(rendering_section(&records).count, 1);
+
+        let edges = [
+            "private",
+            "missing",
+            "offline",
+            "offline-final",
+            "offline-hop",
+            "not-crawled",
+            "edge-only",
+        ]
+        .map(|path| LinkEdge {
+            id: 0,
+            source_url: "https://example.test/page".to_string(),
+            target_url: format!("https://example.test/{path}"),
+            anchor_text: path.to_string(),
+            rel: String::new(),
+            rel_nofollow: false,
+            link_type: LinkType::Internal,
+            source_status_code: Some(200),
+            target_status_code: match path {
+                "missing" => Some(404),
+                "edge-only" => Some(503),
+                _ => None,
+            },
+            source_depth: 0,
+            target_depth: None,
+            source_position: 0,
+            discovery_order: 0,
+        });
+        let report = build_html_report(&records, &edges);
+        assert_eq!(
+            report
+                .sections
+                .iter()
+                .find(|section| section.title == "Broken Links")
+                .unwrap()
+                .count,
+            5
+        );
+        assert_eq!(
+            report
+                .kpis
+                .iter()
+                .find(|kpi| kpi.label == "Broken link edges")
+                .unwrap()
+                .value,
+            "5"
+        );
+        assert_eq!(
+            report
+                .kpis
+                .iter()
+                .find(|kpi| kpi.label == "Image issues")
+                .unwrap()
+                .value,
+            "1"
+        );
+        assert_eq!(
+            report
+                .kpis
+                .iter()
+                .find(|kpi| kpi.label == "HTML validation")
+                .unwrap()
+                .value,
+            "1"
+        );
+    }
+
+    #[test]
+    fn report_duplicate_counts_only_include_successful_html() {
+        let mut page = CrawlRecord::pending("https://example.test/page".to_string(), 0);
+        page.status_code = Some(200);
+        page.content_type = Some("text/html".to_string());
+        page.title = Some("A sufficiently descriptive page title".to_string());
+        page.title_len = 36;
+        page.meta_description = Some(
+            "A unique page description with enough context to explain the content of the page."
+                .to_string(),
+        );
+        page.meta_description_len = 80;
+        page.h1 = Some("A useful heading".to_string());
+        page.h1_len = 16;
+        page.canonical = Some(page.final_url.clone());
+        let mut failed = page.clone();
+        failed.final_url = "https://example.test/failed".to_string();
+        failed.status_code = Some(404);
+        let mut image = page.clone();
+        image.final_url = "https://example.test/image.png".to_string();
+        image.content_type = Some("image/png".to_string());
+        let mut records = vec![page.clone(), failed, image];
+        assert_eq!(metadata_section(&records).count, 0);
+        assert_eq!(headings_and_canonicals_section(&records).count, 0);
+
+        page.final_url = "https://example.test/duplicate".to_string();
+        page.canonical = Some(page.final_url.clone());
+        records.push(page);
+        assert_eq!(metadata_section(&records).count, 2);
+        assert_eq!(headings_and_canonicals_section(&records).count, 2);
+    }
 
     #[test]
     fn writes_csv_headers_and_rows() {
@@ -1225,12 +1750,20 @@ mod tests {
             name: "heading".to_string(),
             values: vec!["Home".to_string()],
         }];
+        record.custom_searches = vec![CustomSearchValue {
+            name: "analytics".to_string(),
+            source: CustomSearchSource::RawHtml,
+            matched: true,
+            match_count: 1,
+            snippets: vec!["analytics snippet".to_string()],
+        }];
 
         let csv = records_to_csv_string(&[record]).unwrap();
 
         assert!(csv.contains("final_url"));
         assert!(csv.contains("https://example.com/"));
         assert!(csv.contains("heading"));
+        assert!(csv.contains("analytics snippet"));
     }
 
     #[test]
@@ -1329,6 +1862,27 @@ mod tests {
     }
 
     #[test]
+    fn writes_graph_node_csv() {
+        let node = GraphNode {
+            url: "https://example.com/".to_string(),
+            label: "example.com".to_string(),
+            crawled: true,
+            classification: Some(UrlClassification::Internal),
+            status_code: Some(200),
+            depth: Some(0),
+            indexability: Some("Indexable".to_string()),
+            inlink_count: 3,
+            outlink_count: 7,
+        };
+
+        let csv = graph_nodes_to_csv_string(&[node]).unwrap();
+
+        assert!(csv.contains("inlink_count"));
+        assert!(csv.contains("https://example.com/"));
+        assert!(csv.contains("Internal"));
+    }
+
+    #[test]
     fn writes_redirect_chain_csv() {
         let mut record = CrawlRecord::pending("https://example.com/old".to_string(), 0);
         record.id = 3;
@@ -1338,6 +1892,8 @@ mod tests {
             status_code: 301,
             location: Some("https://example.com/new".to_string()),
             dns_lookup_time_ms: Some(4),
+            tcp_connect_time_ms: Some(12),
+            tls_handshake_time_ms: Some(20),
             ttfb_ms: Some(70),
             elapsed_ms: Some(74),
         }];
@@ -1347,5 +1903,32 @@ mod tests {
         assert!(csv.contains("hop_url"));
         assert!(csv.contains("https://example.com/old"));
         assert!(csv.contains("301"));
+    }
+
+    #[test]
+    fn writes_sitemap_validation_csv() {
+        let row = SitemapValidationRow {
+            url: "https://example.com/missing".to_string(),
+            final_url: "https://example.com/missing".to_string(),
+            status_code: Some(404),
+            status_text: "Not Found".to_string(),
+            indexability: "Non-indexable".to_string(),
+            indexability_status: "HTTP 404".to_string(),
+            inlink_count: 0,
+            redirect_target: None,
+            canonical: None,
+            issue_count: 2,
+            severity: Severity::Error,
+            issues: vec![
+                "4xx URL in sitemap".to_string(),
+                "Orphan URL in sitemap".to_string(),
+            ],
+        };
+
+        let csv = sitemap_validation_to_csv_string(&[row]).unwrap();
+
+        assert!(csv.contains("severity"));
+        assert!(csv.contains("4xx URL in sitemap"));
+        assert!(csv.contains("Orphan URL in sitemap"));
     }
 }

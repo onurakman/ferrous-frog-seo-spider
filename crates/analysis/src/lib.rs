@@ -1,4 +1,7 @@
-use ferrous_frog_storage::{CrawlRecord, Issue, IssueView, Severity};
+use ferrous_frog_storage::{
+    CrawlRecord, Issue, IssueView, Severity, is_no_response_record, is_success_html_record,
+    is_success_record,
+};
 use std::collections::HashMap;
 
 const TITLE_MIN: usize = 30;
@@ -10,37 +13,53 @@ const H2_MAX: usize = 70;
 const IMAGE_ALT_MAX: usize = 125;
 
 pub fn analyze_records(records: &[CrawlRecord]) -> Vec<Issue> {
-    let title_counts =
-        duplicate_counts(records.iter().filter_map(|record| record.title.as_deref()));
+    let html_records = records
+        .iter()
+        .filter(|record| is_success_html_record(record));
+    let title_counts = duplicate_counts(
+        html_records
+            .clone()
+            .filter_map(|record| record.title.as_deref()),
+    );
     let meta_counts = duplicate_counts(
-        records
-            .iter()
+        html_records
+            .clone()
             .filter_map(|record| record.meta_description.as_deref()),
     );
-    let h1_counts = duplicate_counts(records.iter().filter_map(|record| record.h1.as_deref()));
-    let h2_counts = duplicate_counts(records.iter().filter_map(|record| record.h2.as_deref()));
-    let near_duplicate_counts = cluster_counts(
-        records
-            .iter()
-            .filter_map(|record| record.near_duplicate_cluster_id),
+    let h1_counts = duplicate_counts(
+        html_records
+            .clone()
+            .filter_map(|record| record.h1.as_deref()),
     );
+    let h2_counts = duplicate_counts(
+        html_records
+            .clone()
+            .filter_map(|record| record.h2.as_deref()),
+    );
+    let near_duplicate_counts =
+        cluster_counts(html_records.filter_map(|record| record.near_duplicate_cluster_id));
     let mut issues = Vec::new();
 
     for record in records {
         response_issues(record, &mut issues);
+        directive_issues(record, &mut issues);
+        security_issues(record, &mut issues);
+        sitemap_issues(record, &mut issues);
+        if !is_success_html_record(record) {
+            continue;
+        }
         title_issues(record, &title_counts, &mut issues);
         meta_issues(record, &meta_counts, &mut issues);
         h1_issues(record, &h1_counts, &mut issues);
         h2_issues(record, &h2_counts, &mut issues);
         canonical_issues(record, &mut issues);
-        directive_issues(record, &mut issues);
         image_issues(record, &mut issues);
-        security_issues(record, &mut issues);
         mobile_issues(record, &mut issues);
         hreflang_issues(record, &mut issues);
         structured_data_issues(record, &mut issues);
+        html_validation_issues(record, &mut issues);
+        rendering_issues(record, &mut issues);
         near_duplicate_issues(record, &near_duplicate_counts, &mut issues);
-        sitemap_issues(record, &mut issues);
     }
 
     issues
@@ -62,7 +81,14 @@ fn response_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
             record,
             format!("Server error response: {code}"),
         )),
-        None if record.error.is_some() => issues.push(issue(
+        Some(300..=399) if record.error.is_some() => issues.push(issue(
+            "response.redirect_error",
+            IssueView::BrokenLinks,
+            Severity::Error,
+            record,
+            record.error.clone().unwrap_or_default(),
+        )),
+        None if is_no_response_record(record) => issues.push(issue(
             "response.no_response",
             IssueView::NoResponse,
             Severity::Error,
@@ -312,7 +338,7 @@ fn image_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
 }
 
 fn security_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
-    if record.mixed_content_count > 0 {
+    if is_success_html_record(record) && record.mixed_content_count > 0 {
         issues.push(issue(
             "security.mixed_content",
             IssueView::SecurityMixedContent,
@@ -322,7 +348,7 @@ fn security_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
         ));
     }
 
-    if record.insecure_form_count > 0 {
+    if is_success_html_record(record) && record.insecure_form_count > 0 {
         issues.push(issue(
             "security.insecure_forms",
             IssueView::SecurityInsecureForms,
@@ -412,31 +438,76 @@ fn hreflang_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
 }
 
 fn structured_data_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
-    if record.json_ld_invalid_count > 0 {
+    if record.structured_data_error_count > 0 || record.json_ld_invalid_count > 0 {
         issues.push(issue(
             "structured_data.invalid_json_ld",
             IssueView::StructuredDataInvalid,
+            Severity::Error,
+            record,
+            format!(
+                "Page has {} structured data error(s)",
+                record
+                    .structured_data_error_count
+                    .max(record.json_ld_invalid_count)
+            ),
+        ));
+    }
+
+    if record.structured_data_warning_count > 0 {
+        issues.push(issue(
+            "structured_data.warning",
+            IssueView::StructuredDataWarning,
             Severity::Warning,
             record,
             format!(
-                "Page has {} invalid JSON-LD block(s)",
-                record.json_ld_invalid_count
+                "Page has {} structured data warning(s)",
+                record.structured_data_warning_count
             ),
         ));
     }
 }
 
-fn is_success_record(record: &CrawlRecord) -> bool {
-    matches!(record.status_code, Some(code) if (200..300).contains(&code))
+fn html_validation_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
+    if record.deprecated_html_tag_count > 0 {
+        issues.push(issue(
+            "html.deprecated_tags",
+            IssueView::HtmlDeprecatedTags,
+            Severity::Warning,
+            record,
+            format!(
+                "{} deprecated HTML tag instance(s)",
+                record.deprecated_html_tag_count
+            ),
+        ));
+    }
+
+    if record.duplicate_id_count > 0 {
+        issues.push(issue(
+            "html.duplicate_ids",
+            IssueView::HtmlDuplicateIds,
+            Severity::Warning,
+            record,
+            format!(
+                "{} duplicate HTML id instance(s)",
+                record.duplicate_id_count
+            ),
+        ));
+    }
 }
 
-fn is_success_html_record(record: &CrawlRecord) -> bool {
-    is_success_record(record)
-        && record
-            .content_type
-            .as_deref()
-            .map(|value| value.to_ascii_lowercase().contains("text/html"))
-            .unwrap_or(false)
+fn rendering_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
+    if record.rendered_dom_changed {
+        issues.push(issue(
+            "rendering.dom_changed",
+            IssueView::RenderedDomChanged,
+            Severity::Info,
+            record,
+            format!(
+                "Rendered DOM changed the crawlable content by {} words and {} links",
+                record.rendered_word_count_delta, record.rendered_link_count_delta
+            ),
+        ));
+    }
 }
 
 fn sitemap_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
@@ -523,6 +594,91 @@ mod tests {
     use ferrous_frog_storage::CrawlRecord;
 
     #[test]
+    fn on_page_issues_require_successful_html() {
+        let mut page = CrawlRecord::pending("https://example.com/page".to_string(), 0);
+        page.status_code = Some(200);
+        page.content_type = Some("text/html; charset=utf-8".to_string());
+        let mut image = CrawlRecord::pending("https://example.com/image.png".to_string(), 0);
+        image.status_code = Some(200);
+        image.content_type = Some("image/png".to_string());
+        let mut missing = CrawlRecord::pending("https://example.com/missing".to_string(), 0);
+        missing.status_code = Some(404);
+        missing.content_type = Some("text/html".to_string());
+
+        let issues = analyze_records(&[page, image, missing]);
+        for view in [
+            IssueView::TitleMissing,
+            IssueView::MetaMissing,
+            IssueView::H1Missing,
+            IssueView::H2Missing,
+            IssueView::CanonicalMissing,
+        ] {
+            let matching = issues
+                .iter()
+                .filter(|issue| issue.view == view)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "{view:?}");
+            assert_eq!(matching[0].url, "https://example.com/page");
+        }
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.rule_id == "response.client_error")
+        );
+        assert!(issues.iter().any(|issue| {
+            issue.url.ends_with("image.png") && issue.rule_id == "security.missing_hsts"
+        }));
+    }
+
+    #[test]
+    fn failed_pages_do_not_create_duplicate_issues() {
+        let mut page = CrawlRecord::pending("https://example.com/page".to_string(), 0);
+        page.status_code = Some(200);
+        page.content_type = Some("text/html".to_string());
+        page.title = Some("A unique page title".to_string());
+        page.meta_description = Some("A unique description".to_string());
+        page.h1 = Some("A unique heading".to_string());
+        page.h2 = Some("A unique subheading".to_string());
+        page.near_duplicate_cluster_id = Some(7);
+        let mut failed = page.clone();
+        failed.final_url = "https://example.com/failed".to_string();
+        failed.status_code = Some(500);
+
+        let issues = analyze_records(&[page, failed]);
+        for view in [
+            IssueView::TitleDuplicate,
+            IssueView::MetaDuplicate,
+            IssueView::H1Duplicate,
+            IssueView::H2Duplicate,
+            IssueView::NearDuplicate,
+        ] {
+            assert!(!issues.iter().any(|issue| issue.view == view), "{view:?}");
+        }
+    }
+
+    #[test]
+    fn response_issues_distinguish_robots_blocks_from_fetch_failures() {
+        let mut blocked = CrawlRecord::pending("https://example.com/blocked".to_string(), 0);
+        blocked.status_text = "Blocked by robots.txt".to_string();
+        blocked.error = Some("Blocked by robots.txt".to_string());
+        let pending = CrawlRecord::pending("https://example.com/pending".to_string(), 0);
+        let mut failed = CrawlRecord::pending("https://example.com/failed".to_string(), 0);
+        failed.error = Some("Connection refused".to_string());
+        let mut redirect = CrawlRecord::pending("https://example.com/redirect".to_string(), 0);
+        redirect.status_code = Some(302);
+        redirect.error = Some("Redirect response missing Location header".to_string());
+
+        let issues = analyze_records(&[blocked, pending, failed, redirect]);
+        assert_eq!(issues.len(), 2);
+        assert!(issues.iter().any(|issue| {
+            issue.view == IssueView::NoResponse && issue.url == "https://example.com/failed"
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.view == IssueView::BrokenLinks && issue.url == "https://example.com/redirect"
+        }));
+    }
+
+    #[test]
     fn emits_duplicate_title_issues() {
         let mut first = CrawlRecord::pending("https://example.com/a".to_string(), 0);
         first.status_code = Some(200);
@@ -540,6 +696,14 @@ mod tests {
         first.hreflang_invalid_count = 1;
         first.hreflang_missing_self_reference = true;
         first.json_ld_invalid_count = 1;
+        first.structured_data_error_count = 1;
+        first.structured_data_warning_count = 1;
+        first.deprecated_html_tag_count = 2;
+        first.duplicate_id_count = 1;
+        first.js_rendered = true;
+        first.rendered_dom_changed = true;
+        first.rendered_word_count_delta = 10;
+        first.rendered_link_count_delta = 2;
         first.meta_description = Some(
             "This description is long enough to avoid a missing issue in this unit test."
                 .to_string(),
@@ -604,6 +768,26 @@ mod tests {
             issues
                 .iter()
                 .any(|issue| issue.rule_id == "structured_data.invalid_json_ld")
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.rule_id == "structured_data.warning")
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.rule_id == "html.deprecated_tags")
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.rule_id == "html.duplicate_ids")
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.rule_id == "rendering.dom_changed")
         );
         assert!(
             issues

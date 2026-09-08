@@ -12,6 +12,18 @@
   "app": {
     "windows": [
       {
+        "label": "splashscreen",
+        "title": "Starting Ferrous Frog",
+        "url": "splash.html",
+        "width": 400,
+        "height": 280,
+        "center": true,
+        "resizable": false,
+        "decorations": false
+      },
+      {
+        "label": "main",
+        "visible": false,
         "title": "Ferrous Frog SEO Spider",
         "width": 1280,
         "height": 840,

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+js-rendering = ["ferrous-frog-crawler-core/js-rendering"]
+
 [build-dependencies]
 tauri-build.workspace = true
 
@@ -12,12 +16,16 @@ tauri-build.workspace = true
 ferrous-frog-analysis.workspace = true
 ferrous-frog-crawler-core.workspace = true
 ferrous-frog-export.workspace = true
+ferrous-frog-integrations.workspace = true
 ferrous-frog-storage.workspace = true
+keyring.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri = { workspace = true, features = [] }
+tauri-plugin-opener.workspace = true
 tokio.workspace = true
+url.workspace = true
 
 [[bin]]
 name = "ferrous-frog"

@@ -49,9 +49,23 @@ check-rust: ## Check Rust workspace crates except the Tauri app.
 check-tauri: ## Check the Tauri app crate.
 	cargo check -p ferrous-frog-app
 
+.PHONY: check-js-rendering
+check-js-rendering: ## Check the optional Chrome CDP JavaScript rendering backend.
+	cargo check -p ferrous-frog-crawler-core --features js-rendering
+
 .PHONY: test
 test: ## Run all Rust tests.
 	cargo test --workspace
+
+.PHONY: test-ui
+test-ui: ## Exercise the React workspace in headless Chrome with Tauri IPC fixtures.
+	node scripts/smoke-ui.mjs
+
+BENCH_URLS ?= 1000000
+
+.PHONY: bench-synthetic
+bench-synthetic: ## Run the ignored SQLite synthetic URL benchmark. Override with BENCH_URLS=10000.
+	BENCH_URLS=$(BENCH_URLS) cargo test -p ferrous-frog-storage sqlite_large_synthetic_storage_benchmark -- --ignored --nocapture
 
 .PHONY: fmt
 fmt: ## Format Rust source.

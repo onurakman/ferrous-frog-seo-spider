@@ -5,19 +5,29 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+js-rendering = ["dep:chromiumoxide", "dep:futures"]
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+chromiumoxide = { workspace = true, optional = true }
 ferrous-frog-extractors.workspace = true
 ferrous-frog-parser.workspace = true
 ferrous-frog-storage.workspace = true
+futures = { workspace = true, optional = true }
 governor.workspace = true
 quick-xml = "0.40.1"
 regex.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-platform-verifier.workspace = true
 serde.workspace = true
 simhash.workspace = true
 texting_robots.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tracing.workspace = true
 url.workspace = true

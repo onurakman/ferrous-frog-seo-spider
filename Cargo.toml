@@ -4,6 +4,7 @@ members = [
     "crates/crawler-core",
     "crates/export",
     "crates/extractors",
+    "crates/integrations",
     "crates/parser",
     "crates/storage",
     "src-tauri",
@@ -21,17 +22,24 @@ ferrous-frog-analysis = { path = "crates/analysis" }
 ferrous-frog-crawler-core = { path = "crates/crawler-core" }
 ferrous-frog-export = { path = "crates/export" }
 ferrous-frog-extractors = { path = "crates/extractors" }
+ferrous-frog-integrations = { path = "crates/integrations" }
 ferrous-frog-parser = { path = "crates/parser" }
 ferrous-frog-storage = { path = "crates/storage" }
 
 anyhow = "1.0.102"
 blake3 = "1.8.5"
+chromiumoxide = "0.9.1"
 csv = "1.4.0"
+futures = "0.3.32"
 governor = "0.10.4"
+keyring = "4.1.1"
 minijinja = "2.20.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["brotli", "charset", "cookies", "deflate", "gzip", "http2", "json", "rustls"] }
 regex = "1.12.4"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+rustls = "0.23.40"
+rustls-pki-types = "1.14.1"
+rustls-platform-verifier = "0.7.0"
 rust_xlsxwriter = "0.95.0"
 scraper = "0.27.0"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -41,8 +49,10 @@ sxd-document = "0.3.2"
 sxd-xpath = "0.4.2"
 tauri = "2.11.2"
 tauri-build = "2.6.2"
+tauri-plugin-opener = "2.5.4"
 texting_robots = "0.2.2"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26.4"
 tracing = "0.1.44"
 url = { version = "2.5.8", features = ["serde"] }
