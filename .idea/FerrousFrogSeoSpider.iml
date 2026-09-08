@@ -1,7 +1,17 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <module type="EMPTY_MODULE" version="4">
   <component name="NewModuleRootManager">
-    <content url="file://$MODULE_DIR$" />
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/crates/analysis/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/crawler-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/export/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/extractors/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/integrations/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/parser/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/storage/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/src-tauri/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
