@@ -31,6 +31,7 @@ Existing capabilities:
 
 - Cargo workspace with engine crates.
 - Tauri 2 desktop shell.
+- Original graphite-and-mint frog icon across desktop installers, the workspace toolbar, splash screen and browser tab. Icon source and generation notes live in [src-tauri/icons/README.md](src-tauri/icons/README.md).
 - A splash window shares the saved System/Light/Dark appearance and opens the workspace after its first results query settles. Failed queries remain visible in the workspace; a 12-second fallback reveals the main window if startup never signals readiness.
 - More > Quit and native window/app exit requests use a Yes/No confirmation. No or Escape cancels; Yes waits for crawl cancellation and final frontier saving before exiting. Unsaved memory results are called out even when the current filter is empty.
 - React, TypeScript, and Vite frontend.

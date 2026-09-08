@@ -192,12 +192,9 @@ input:read-only {
 .brand-mark {
   width: 28px;
   height: 28px;
-  border-radius: var(--radius);
-  display: inline-grid;
-  place-items: center;
-  background: var(--color-primary);
-  color: var(--color-primary-contrast);
-  font-weight: 800;
+  display: block;
+  flex-shrink: 0;
+  object-fit: contain;
 }
 
 .brand h1 {
@@ -1729,7 +1726,7 @@ input:read-only {
   text-align: center;
 }
 
-.splash-screen .brand-mark { width: 48px; height: 48px; font-size: 18px; }
+.splash-screen .brand-mark { width: 72px; height: 72px; }
 .splash-screen h1 { margin: 0; font-size: 24px; color: var(--ui-text-highlighted); }
 .splash-screen p { margin: 0; color: var(--ui-text-muted); }
 .splash-screen progress { width: 180px; height: 5px; margin-top: 14px; accent-color: var(--color-primary); }

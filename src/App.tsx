@@ -3142,7 +3142,7 @@ export default function App() {
     <main className="app-shell">
       <header className="toolbar">
         <div className="brand">
-          <span className="brand-mark">FF</span>
+          <img className="brand-mark" src="/brand/ferrous-frog.png" width="28" height="28" alt="" />
           <div>
             <h1>Ferrous Frog</h1>
             <p>SEO Spider</p>
