@@ -63,11 +63,15 @@ Linux uses native GNU/WebKitGTK builds. Its installers are not static musl execu
 1. Merging the version PR creates a tag and a draft release with changelog notes.
 2. CI checks the release commit, including UI smoke tests and optional rendering compilation.
 3. Six independent jobs check out that same SHA, use `npm ci` and locked Cargo dependencies, then upload installers to the draft. A failed job does not cancel the other platforms.
-4. Only after every build succeeds, the final job downloads the installers, computes `SHA256SUMS`, uploads it and publishes the release.
+4. Only after every build succeeds, the final job verifies that the tag still resolves to the original draft release ID, downloads the installers, computes `SHA256SUMS`, uploads it and publishes the release.
 
 The release workflow calls CI directly, so it does not depend on bot-created tags triggering another workflow. Concurrent release runs are serialized. Updates are downloaded through the browser; this workflow does not generate a signed feed for in-app installation.
 
 For a failed run, use **Re-run failed jobs**. To rebuild an existing draft later, select **Release Please → Run workflow**, leave the default branch selected, and enter its existing tag, such as `v0.1.0`. Manual retries reject published releases; create a new patch release instead of replacing downloads that users already installed. If only checksum/publication failed, rerun that failed job.
+
+Do not create another release for the tag or publish it manually while the workflow is running. GitHub can hold a draft and a published release with the same tag; tag-based CLI commands then select the published entry, even when all installers belong to the draft. The publish job reports both release IDs if they differ. Inspect the entries with `gh api repos/OWNER/REPO/releases --jq '.[] | {id, tag_name, draft, assets: (.assets | length)}'`. If an accidentally published duplicate has no assets, remove only that duplicate release by ID after confirming it is the unwanted entry, preserve the tag and the draft containing installers, then rerun only the failed publication job. Rebuilding the six platforms is unnecessary in that case. Do not delete a published release containing installers; resolve that case with a new patch release.
+
+`make test-release` exercises the publication step with local GitHub CLI responses, including duplicate IDs, already-published releases, API failures and successful checksum generation. It does not contact or modify GitHub.
 
 On Linux, verify downloaded assets with `sha256sum -c SHA256SUMS`; on macOS use `shasum -a 256 -c SHA256SUMS`. On Windows use `Get-FileHash .\FerrousFrog_*.exe -Algorithm SHA256` and compare with the manifest. Download every listed asset for a complete `-c` check, or check the line for your selected installer.
 

@@ -57,11 +57,16 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          release_info=$(gh release view "$RELEASE_TAG" --json databaseId,isDraft --jq '[.databaseId, .isDraft] | @tsv')
+          IFS=$'\t' read -r release_id is_draft <<< "$release_info"
+          if [[ "$is_draft" != true ]]; then
+            echo "::error::Release $RELEASE_TAG (ID $release_id) is already published. Check for a duplicate release before retrying; published installers must not be replaced." >&2
+            exit 1
+          fi
           echo "created=true" >> "$GITHUB_OUTPUT"
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "id=$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)" >> "$GITHUB_OUTPUT"
+          echo "id=$release_id" >> "$GITHUB_OUTPUT"
 
   verify:
     name: Verify release commit
@@ -150,8 +155,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_ID: ${{ needs.prepare.outputs.id }}
         run: |
-          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          release_info=$(gh release view "$RELEASE_TAG" --json databaseId,isDraft --jq '[.databaseId, .isDraft] | @tsv')
+          IFS=$'\t' read -r release_id is_draft <<< "$release_info"
+          if [[ "$release_id" != "$RELEASE_ID" ]]; then
+            echo "::error::Release $RELEASE_TAG resolves to ID $release_id, but installers were uploaded to draft ID $RELEASE_ID. Resolve the duplicate release without deleting the tag, then rerun this job." >&2
+            exit 1
+          fi
+          if [[ "$is_draft" != true ]]; then
+            echo "::error::Release $RELEASE_TAG (ID $release_id) is already published. Refusing to replace published installers." >&2
+            exit 1
+          fi
           gh release download "$RELEASE_TAG" --pattern 'FerrousFrog_*' --dir release-assets
           cd release-assets
           sha256sum FerrousFrog_* > SHA256SUMS

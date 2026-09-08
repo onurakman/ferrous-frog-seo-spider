@@ -62,6 +62,10 @@ check-js-rendering: ## Check the desktop app with the optional Chrome CDP backen
 check-versions: ## Verify that Rust, npm, Tauri and release versions agree.
 	node scripts/check-versions.mjs
 
+.PHONY: test-release
+test-release: ## Check release publication guards and checksum generation without GitHub writes.
+	node scripts/test-release-workflow.mjs
+
 .PHONY: lint
 lint: ## Run Clippy on all default-feature Rust targets.
 	cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -90,7 +94,7 @@ fmt-check: ## Check Rust formatting.
 
 .PHONY: verify ci
 verify: ci ## Run the same checks as GitHub Actions (Chrome required).
-ci: check-versions fmt-check lint test build-web test-ui check-js-rendering ## Run all CI checks.
+ci: check-versions test-release fmt-check lint test build-web test-ui check-js-rendering ## Run all CI checks.
 
 .PHONY: clean
 clean: ## Remove generated build outputs.
