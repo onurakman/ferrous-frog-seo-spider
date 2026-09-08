@@ -67,6 +67,10 @@ import { create } from "zustand";
 
 type Theme = "light" | "dark";
 type ThemePreference = Theme | "system";
+type UpdateCheck = {
+  currentVersion: string;
+  update: { version: string; releaseUrl: string } | null;
+};
 type StorageMode = "memory" | "database";
 type CrawlMode = "spider" | "list";
 type ExtractorKind = "cssText" | "cssAttribute" | "xpath" | "regex";
@@ -790,6 +794,8 @@ const lastUrlStorageKey = "ferrous-frog-last-url";
 const overviewWidthStorageKey = "ferrous-frog-overview-width";
 const urlSegmentsStorageKey = "ferrous-frog-url-segments";
 const settingsStorageKey = "ferrous-frog-settings";
+const updateReminderKey = "ferrous-frog-update-reminder-until";
+const updateReminderDelay = 24 * 60 * 60 * 1000;
 const overviewMinWidth = 260;
 const overviewMaxWidth = 560;
 const resultsPageSize = 500;
@@ -1569,6 +1575,60 @@ export default function App() {
   const [overviewOpen, setOverviewOpen] = useState(() => window.innerWidth > 1000);
   const [activeIssueGroup, setActiveIssueGroup] = useState(issueGroups[0]);
   const desktopRuntime = isTauri();
+  const [updateOpen, setUpdateOpen] = useState(false);
+  const [updateResult, setUpdateResult] = useState<UpdateCheck>();
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [openingUpdate, setOpeningUpdate] = useState(false);
+  const [updateError, setUpdateError] = useState<string>();
+  const updateCheckState = useRef({ running: false, checked: false, manual: false });
+  const updateDismissRef = useRef<HTMLButtonElement>(null);
+  const updateOriginRef = useRef<HTMLElement | null>(null);
+  const checkForUpdates = useCallback(async (manual: boolean) => {
+    if (!desktopRuntime) return;
+    if (manual) {
+      updateCheckState.current.manual = true;
+      updateOriginRef.current = document.activeElement as HTMLElement;
+      setUpdateOpen(true);
+    } else {
+      const reminder = Number(readPreference(updateReminderKey));
+      if (updateCheckState.current.checked || (Number.isFinite(reminder) && reminder > Date.now())) return;
+    }
+    if (updateCheckState.current.running) return;
+    updateCheckState.current = { running: true, checked: true, manual };
+    setCheckingUpdates(true);
+    setUpdateResult(undefined);
+    setUpdateError(undefined);
+    try {
+      const result = await invoke<UpdateCheck>("check_for_updates");
+      setUpdateResult(result);
+      if (result.update && !updateCheckState.current.manual) {
+        updateOriginRef.current = document.activeElement as HTMLElement;
+        setUpdateOpen(true);
+      }
+    } catch (caught) {
+      setUpdateError(errorMessage(caught));
+    } finally {
+      updateCheckState.current.running = false;
+      setCheckingUpdates(false);
+    }
+  }, [desktopRuntime]);
+  const dismissUpdate = () => {
+    if (updateResult?.update) savePreference(updateReminderKey, String(Date.now() + updateReminderDelay));
+    setUpdateOpen(false);
+  };
+  const openUpdateDownload = async () => {
+    if (!updateResult?.update || openingUpdate) return;
+    setOpeningUpdate(true);
+    setUpdateError(undefined);
+    try {
+      await invoke("open_external_url", { url: updateResult.update.releaseUrl });
+      dismissUpdate();
+    } catch (caught) {
+      setUpdateError(errorMessage(caught));
+    } finally {
+      setOpeningUpdate(false);
+    }
+  };
 
   const columns = useMemo<GridColumn[]>(() => {
     const customColumns = config.customExtractors
@@ -2179,6 +2239,12 @@ export default function App() {
     })();
     return () => { disposed = true; unlisten?.(); };
   }, [desktopRuntime, startupReady, requestQuit, setError]);
+
+  useEffect(() => {
+    if (!desktopRuntime || !startupReady) return;
+    const timer = window.setTimeout(() => void checkForUpdates(false), 2000);
+    return () => window.clearTimeout(timer);
+  }, [desktopRuntime, startupReady, checkForUpdates]);
 
   useEffect(() => {
     if (!running || !desktopRuntime) return;
@@ -3355,6 +3421,14 @@ export default function App() {
                 <DropdownMenu.Item
                   className="dropdown-item toolbar-menu-item"
                   disabled={!desktopRuntime}
+                  onSelect={() => void checkForUpdates(true)}
+                >
+                  <RefreshCw size={15} />
+                  <span>Check for updates</span>
+                </DropdownMenu.Item>
+                <DropdownMenu.Item
+                  className="dropdown-item toolbar-menu-item"
+                  disabled={!desktopRuntime}
                   onSelect={requestQuit}
                 >
                   <LogOut size={15} />
@@ -3391,6 +3465,56 @@ export default function App() {
             <div className="quit-actions">
               <Dialog.Close asChild><button ref={cancelQuitRef} disabled={quitting}>No</button></Dialog.Close>
               <button className="destructive" disabled={quitting} onClick={() => void confirmQuit()}>Yes</button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      <Dialog.Root
+        open={updateOpen && !quitOpen && !settingsOpen && !aboutOpen && !comparisonOpen && !linkReportsOpen && !graphOpen}
+        onOpenChange={(open) => { if (!open) dismissUpdate(); }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="modal-backdrop" />
+          <Dialog.Content
+            className="about-modal update-modal"
+            onOpenAutoFocus={(event) => { event.preventDefault(); updateDismissRef.current?.focus(); }}
+            onCloseAutoFocus={(event) => {
+              event.preventDefault();
+              if (quitOpen || settingsOpen || aboutOpen || comparisonOpen || linkReportsOpen || graphOpen) return;
+              const origin = updateOriginRef.current;
+              (origin?.isConnected ? origin : document.querySelector<HTMLButtonElement>('[aria-label="More tools"]'))?.focus();
+            }}
+          >
+            <div className="update-heading">
+              <img src="/brand/ferrous-frog.png" width="56" height="56" alt="" />
+              <div>
+                <p>Ferrous Frog</p>
+                <Dialog.Title>{checkingUpdates ? "Checking for updates…" : updateResult?.update ? "Update available" : updateError ? "Update check failed" : "No updates available"}</Dialog.Title>
+              </div>
+              <Dialog.Close asChild><button className="update-close" aria-label="Close update notice"><X size={16} /></button></Dialog.Close>
+            </div>
+            <Dialog.Description>
+              {checkingUpdates ? "Checking GitHub for the latest stable release." : updateResult?.update ? "A new version of Ferrous Frog is ready to download." : updateError ? "The update check could not be completed." : "No newer stable release has been published."}
+            </Dialog.Description>
+            {checkingUpdates ? <progress aria-label="Checking for updates" /> : null}
+            {updateResult ? (
+              <dl className="update-versions" data-state={updateResult.update ? "available" : "current"}>
+                <div><dt>Installed version</dt><dd>{updateResult.currentVersion}</dd></div>
+                {updateResult.update ? <div><dt>Available version</dt><dd className="update-version-new">{updateResult.update.version}</dd></div> : null}
+              </dl>
+            ) : null}
+            {updateResult?.update ? <p className="update-note">Release notes and installers open on GitHub in your browser.</p> : null}
+            {updateError ? <p className="error-bar" role="alert">{updateError}</p> : null}
+            <div className="update-actions">
+              <button ref={updateDismissRef} data-action="remind" onClick={dismissUpdate} title={updateResult?.update ? "Remind me in 24 hours" : undefined}>
+                {updateResult?.update ? "Remind me later" : "Close"}
+              </button>
+              {updateResult?.update ? (
+                <button className="primary" data-action="download" disabled={openingUpdate} onClick={() => void openUpdateDownload()}>
+                  <Download size={16} />{openingUpdate ? "Opening…" : "Download update"}
+                </button>
+              ) : updateError ? <button className="primary" data-action="retry" onClick={() => void checkForUpdates(true)}>Try again</button> : null}
             </div>
           </Dialog.Content>
         </Dialog.Portal>

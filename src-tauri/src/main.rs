@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod updates;
+
 use ferrous_frog_analysis::analyze_records;
 use ferrous_frog_crawler_core::{
     CrawlConfig, CrawlControl, CrawlerEvent, RobotsTxtBatchTestRequest, RobotsTxtBatchTestResult,
@@ -2193,6 +2195,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            updates::check_for_updates,
             complete_startup,
             quit_app,
             start_crawl,

@@ -195,6 +195,7 @@ Goal: ship a small but complete SEO crawler workflow.
 ### UI
 
 - [x] Theme-aware splash window with readiness-based handoff, visible initial-query errors, and a startup fallback.
+- [x] GitHub stable-release notifications after startup, manual update checks, persistent 24-hour reminders, and browser-based downloads with offline/error recovery.
 - [x] Yes/No confirmation for More > Quit and native close/exit requests, with keyboard focus restoration and cancellation cleanup before exit.
 - [x] Align Settings checkboxes with adjacent inputs and selects.
 - [x] Top toolbar with URL input, mode selector, Start/Pause/Resume, Stop, Export, and More actions.

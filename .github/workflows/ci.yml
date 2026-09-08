@@ -51,5 +51,12 @@ jobs:
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
       - run: npm ci
+      - name: Install the test browser
+        uses: browser-actions/setup-chrome@48ad923757ca74d66703209fe939badbdf80f2f4 # v2.2.0
+        id: chrome
+        with:
+          chrome-version: '152.0.7977.82'
       - name: Verify versions, formatting, Clippy, Rust tests, frontend and optional rendering
+        env:
+          CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
         run: make ci

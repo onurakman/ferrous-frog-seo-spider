@@ -42,6 +42,15 @@ function setupFixture(mockIPC, emit) {
   window.testSettingsWrites = 0;
   window.testStartupCalls = 0;
   window.testQuitCalls = 0;
+  window.testUpdateChecks = 0;
+  window.testUpdateFailure = new URL(location.href).searchParams.get("updates") === "error";
+  window.testUpdateResult = {
+    currentVersion: "0.1.0",
+    update: new URL(location.href).searchParams.get("updates") === "available"
+      ? { version: "0.2.0", releaseUrl: "https://github.com/onurakman/ferrous-frog-seo-spider/releases/tag/v0.2.0" }
+      : null,
+  };
+  window.testOpenedUrls = [];
   const saveItem = Storage.prototype.setItem;
   Storage.prototype.setItem = function (key, value) {
     if (key === "ferrous-frog-settings") window.testSettingsWrites++;
@@ -51,6 +60,17 @@ function setupFixture(mockIPC, emit) {
   window.testEmit = (payload) => emit("crawl-event", payload);
   window.testRequestQuit = () => emit("quit-requested");
   mockIPC(async (cmd, args) => {
+    if (cmd === "check_for_updates") {
+      window.testUpdateChecks++;
+      await new Promise((resolve) => setTimeout(resolve, window.testUpdateDelay ?? 15));
+      if (window.testUpdateFailure) throw new Error("GitHub is unavailable. Please try again later.");
+      return window.testUpdateResult;
+    }
+    if (cmd === "open_external_url") {
+      if (window.testOpenUrlFailure) throw new Error("Could not open the browser");
+      window.testOpenedUrls.push(args.url);
+      return;
+    }
     if (cmd === "complete_startup") {
       window.testStartupCalls++;
       window.testStartupHadGrid = Boolean(document.querySelector('.data-table tbody tr:not(.virtual-spacer)'));
@@ -149,17 +169,34 @@ const server = await createServer({
 
 try {
   await server.listen();
-  browser = spawn(process.env.CHROME_BIN ?? "google-chrome", ["--headless", "--no-sandbox", "--disable-gpu",
-    "--no-first-run", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: "ignore" });
-  browser.on("error", (error) => errors.push(error.message));
-  let port;
-  for (let attempt = 0; attempt < 100; attempt++) {
-    try { port = (await readFile(join(profile, "DevToolsActivePort"), "utf8")).split("\n")[0]; break; }
-    catch { if (errors.length) throw new Error(errors.join("\n")); await delay(50); }
+  const chrome = process.env.CHROME_BIN ?? "google-chrome";
+  browser = spawn(chrome, ["--headless", "--no-sandbox", "--disable-gpu",
+    "--no-first-run", "--remote-debugging-port=0", `--user-data-dir=${profile}`, "about:blank"], { stdio: ["ignore", "ignore", "pipe"] });
+  let browserLog = "";
+  let launchError;
+  browser.stderr.on("data", (chunk) => { browserLog = (browserLog + chunk.toString()).slice(-8192); });
+  browser.on("error", (error) => { launchError = error.message; });
+  let target;
+  let lastProbeError = "The debugging endpoint was not created.";
+  const startupDeadline = Date.now() + 30000;
+  while (Date.now() < startupDeadline) {
+    if (launchError || browser.exitCode !== null || browser.signalCode !== null) {
+      throw new Error(`Chrome could not start (${chrome}): ${launchError ?? `exit ${browser.exitCode}, signal ${browser.signalCode}`}\n${browserLog}`);
+    }
+    try {
+      const port = (await readFile(join(profile, "DevToolsActivePort"), "utf8")).split("\n")[0];
+      if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) throw new Error("Chrome has not written a valid debugging port yet.");
+      const response = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(1000) });
+      if (!response.ok) throw new Error(`Chrome's debugging endpoint returned HTTP ${response.status}.`);
+      const targets = await response.json();
+      target = targets.find((candidate) => candidate.type === "page" && candidate.webSocketDebuggerUrl);
+      if (target) break;
+      lastProbeError = "Chrome has not created its first page yet.";
+    } catch (error) { lastProbeError = error.message; }
+    await delay(100);
   }
-  assert.ok(port, "Chrome must start its debugging endpoint");
-  const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
-  socket = new WebSocket(targets.find((target) => target.type === "page").webSocketDebuggerUrl);
+  assert.ok(target, `Chrome did not become ready within 30 seconds (${chrome}). ${lastProbeError}\n${browserLog}`);
+  socket = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { socket.onopen = resolve; socket.onerror = reject; });
   let id = 0;
   const pending = new Map();
@@ -626,6 +663,54 @@ try {
   await cdp("Page.removeScriptToEvaluateOnNewDocument", { identifier: deniedStorage.identifier });
   await cdp("Page.navigate", { url: `http://127.0.0.1:${server.httpServer.address().port}/__smoke__?startup-error` });
   await until("window.testStartupCalls === 1 && document.querySelector('[role=\"alert\"]')?.textContent.includes('Initial results')", "A failed first query must still release the splash and display the error");
+  await cdp("Emulation.setDeviceMetricsOverride", { width: 920, height: 640, deviceScaleFactor: 1, mobile: false });
+  await cdp("Page.navigate", { url: `http://127.0.0.1:${server.httpServer.address().port}/__smoke__?updates=available` });
+  await until("window.testStartupCalls === 1 && window.testStartupHadGrid", "Update checks must not hold the splash open");
+  await until("document.querySelector('.update-modal')?.textContent.includes('0.2.0')", "A newer release must be announced after the workspace is ready");
+  assert.ok(await evaluate("document.querySelector('.update-modal').textContent.includes('0.1.0')"), "The update notice must identify the installed version");
+  assert.equal(await evaluate("testUpdateChecks"), 1, "Startup must make only one update request");
+  assert.ok(await evaluate("document.activeElement?.textContent.includes('Remind me later')"), "The update notice must focus its non-disruptive action");
+  if (process.env.UI_SCREENSHOT) {
+    for (const theme of ["dark", "light"]) {
+      await evaluate(`document.documentElement.classList.toggle('dark', ${theme === "dark"})`);
+      const shot = await cdp("Page.captureScreenshot");
+      await writeFile(`${process.env.UI_SCREENSHOT}.update-${theme}.png`, Buffer.from(shot.data, "base64"));
+    }
+  }
+  await click('.update-modal [data-action="remind"]');
+  await until("!document.querySelector('.update-modal')", "Reminding later must close the notice");
+  assert.ok(await evaluate("Number(localStorage.getItem('ferrous-frog-update-reminder-until')) > Date.now() + 23 * 60 * 60 * 1000"), "The reminder must persist for a day");
+  await reloadApp();
+  await delay(2300);
+  assert.equal(await evaluate("testUpdateChecks"), 0, "A saved reminder must suppress startup checks after a restart");
+  await menuItem("Check for updates");
+  await until("document.querySelector('.update-modal')?.textContent.includes('0.2.0') && !document.querySelector('.update-modal progress')", "A manual check must bypass the reminder");
+  await evaluate("window.testOpenUrlFailure = true");
+  await click('.update-modal [data-action="download"]');
+  await until("document.querySelector('.update-modal [role=\"alert\"]')?.textContent.includes('browser')", "Browser launch failures must stay inside the update dialog");
+  await evaluate("window.testOpenUrlFailure = false");
+  await click('.update-modal [data-action="download"]');
+  await until("testOpenedUrls.length === 1", "Download must open the release in the browser");
+  assert.equal(await evaluate("testOpenedUrls[0]"), "https://github.com/onurakman/ferrous-frog-seo-spider/releases/tag/v0.2.0", "Downloads must use the checked release URL");
+  await until("!document.querySelector('.update-modal')", "Opening the download page must return to the workspace");
+  await evaluate("window.testUpdateResult.update = null");
+  await menuItem("Check for updates");
+  await until("document.querySelector('.update-modal [data-state=\"current\"]')", "Manual checks must confirm when no newer release exists");
+  await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await until("!document.querySelector('.update-modal')", "Escape must close update information");
+  await evaluate("localStorage.removeItem('ferrous-frog-update-reminder-until')");
+  await cdp("Page.navigate", { url: `http://127.0.0.1:${server.httpServer.address().port}/__smoke__?updates=error` });
+  await until("window.testStartupCalls === 1 && window.testUpdateChecks === 1", "An offline update check must still allow startup");
+  await delay(100);
+  assert.ok(await evaluate("!document.querySelector('.update-modal') && !document.querySelector('[role=\"alert\"]')"), "Automatic connection errors must stay quiet");
+  await menuItem("Check for updates");
+  await until("document.querySelector('.update-modal [role=\"alert\"]')?.textContent.includes('GitHub')", "Manual connection failures must give visible feedback");
+  await evaluate("window.testUpdateFailure = false");
+  await click('.update-modal [data-action="retry"]');
+  await until("document.querySelector('.update-modal [data-state=\"current\"]')", "The failed update check must be retryable");
+  await cdp("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await until("!document.querySelector('.update-modal')", "The update dialog must dismiss after retry");
+
   await cdp("Emulation.setDeviceMetricsOverride", { width: 400, height: 280, deviceScaleFactor: 1, mobile: false });
   for (const preference of ["light", "dark", "system"]) {
     await evaluate(`localStorage.setItem('ferrous-frog-theme', ${JSON.stringify(preference)}); window.testBeforeReload = true`);
@@ -642,10 +727,10 @@ try {
   await systemTheme("light");
   await until("!document.documentElement.classList.contains('dark')", "System appearance must also update on the splash screen");
   assert.deepEqual(errors, [], "No browser runtime errors");
-  console.log("UI smoke passed: workbench and paging, links and retries, filters and exports, live updates, keyboard navigation, themes and contrast, responsive layouts, settings persistence and recovery, aligned checkboxes, splash startup/failure/themes, and quit confirmation/cancellation/focus/retry.");
+  console.log("UI smoke passed: workbench and paging, links and retries, filters and exports, live updates, keyboard navigation, themes and contrast, responsive layouts, settings persistence and recovery, aligned checkboxes, splash startup/failure/themes, quit confirmation/cancellation/focus/retry, and release checks/reminders/downloads/offline recovery.");
 } finally {
   socket?.close();
-  if (browser?.exitCode === null) {
+  if (browser?.exitCode === null && browser.signalCode === null) {
     browser.kill();
     await new Promise((resolve) => browser.once("exit", resolve));
   }
