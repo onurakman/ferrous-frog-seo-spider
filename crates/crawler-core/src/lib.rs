@@ -1395,19 +1395,17 @@ fn parse_sitemap_document(xml: &str, root_url: &Url) -> ParsedSitemap {
 
     loop {
         match reader.read_event() {
-            Ok(Event::Start(element)) if xml_name_matches(element.name().as_ref(), b"url") => {
+            Ok(Event::Start(element)) if element.local_name().as_ref() == "url" => {
                 current_entry = Some(SitemapEntryKind::Url);
             }
-            Ok(Event::Start(element)) if xml_name_matches(element.name().as_ref(), b"sitemap") => {
+            Ok(Event::Start(element)) if element.local_name().as_ref() == "sitemap" => {
                 current_entry = Some(SitemapEntryKind::Sitemap);
             }
-            Ok(Event::Start(element)) if xml_name_matches(element.name().as_ref(), b"loc") => {
-                if let Ok(text) = reader.read_text(element.name())
-                    && let Ok(value) = text.decode()
-                {
-                    let value = unescape(value.trim())
+            Ok(Event::Start(element)) if element.local_name().as_ref() == "loc" => {
+                if let Ok(text) = reader.read_text(element.name()) {
+                    let value = unescape(text.trim())
                         .map(|value| value.into_owned())
-                        .unwrap_or_else(|_| value.trim().to_string());
+                        .unwrap_or_else(|_| text.trim().to_string());
                     if let Ok(url) = root_url.join(&value) {
                         match current_entry {
                             Some(SitemapEntryKind::Sitemap) => parsed.sitemaps.push(url),
@@ -1416,10 +1414,10 @@ fn parse_sitemap_document(xml: &str, root_url: &Url) -> ParsedSitemap {
                     }
                 }
             }
-            Ok(Event::End(element)) if xml_name_matches(element.name().as_ref(), b"url") => {
+            Ok(Event::End(element)) if element.local_name().as_ref() == "url" => {
                 current_entry = None;
             }
-            Ok(Event::End(element)) if xml_name_matches(element.name().as_ref(), b"sitemap") => {
+            Ok(Event::End(element)) if element.local_name().as_ref() == "sitemap" => {
                 current_entry = None;
             }
             Ok(Event::Eof) => break,
@@ -1429,15 +1427,6 @@ fn parse_sitemap_document(xml: &str, root_url: &Url) -> ParsedSitemap {
     }
 
     parsed
-}
-
-fn xml_name_matches(name: &[u8], expected: &[u8]) -> bool {
-    name == expected
-        || name
-            .rsplit(|byte| *byte == b':')
-            .next()
-            .map(|local_name| local_name == expected)
-            .unwrap_or(false)
 }
 
 async fn fetch_one(
@@ -2754,6 +2743,24 @@ mod tests {
             "https://example.com/event/MVNO's%20World%202026"
         );
         assert_eq!(urls[3].as_str(), "https://example.com/search?a=1&b=2");
+    }
+
+    #[test]
+    fn parses_prefixed_sitemap_locations_with_unicode_and_entities() {
+        let root_url = Url::parse("https://example.com/sitemap.xml").unwrap();
+        let parsed = parse_sitemap_document(
+            r#"<sm:urlset xmlns:sm="http://www.sitemaps.org/schemas/sitemap/0.9">
+                <sm:url><sm:loc> /café?a=1&amp;b=2&#38;c=3 </sm:loc></sm:url>
+            </sm:urlset>"#,
+            &root_url,
+        );
+
+        assert!(parsed.sitemaps.is_empty());
+        assert_eq!(parsed.urls.len(), 1);
+        assert_eq!(
+            parsed.urls[0].as_str(),
+            "https://example.com/caf%C3%A9?a=1&b=2&c=3"
+        );
     }
 
     #[test]

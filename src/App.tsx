@@ -9,9 +9,12 @@ import Sigma from "sigma";
 import { EdgeArrowProgram, type EdgeProgramType } from "sigma/rendering";
 import {
   type ColumnDef,
+  columnSizingFeature,
+  columnVisibilityFeature,
   flexRender,
-  getCoreRowModel,
-  useReactTable,
+  rowSortingFeature,
+  tableFeatures,
+  useTable,
 } from "@tanstack/react-table";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -790,6 +793,11 @@ const settingsStorageKey = "ferrous-frog-settings";
 const overviewMinWidth = 260;
 const overviewMaxWidth = 560;
 const resultsPageSize = 500;
+const gridFeatures = tableFeatures({
+  columnSizingFeature,
+  columnVisibilityFeature,
+  rowSortingFeature,
+});
 const detailTabs = [
   { id: "page", label: "URL details" },
   { id: "inlinks", label: "Inlinks" },
@@ -1594,7 +1602,7 @@ export default function App() {
     return [...listColumns, ...visibleColumns, ...customColumns, ...searchColumns];
   }, [activeIssueGroup, showAllColumns, config.mode, config.customExtractors, config.customSearches]);
 
-  const tableColumns = useMemo<ColumnDef<CrawlRecord>[]>(
+  const tableColumns = useMemo<ColumnDef<typeof gridFeatures, CrawlRecord>[]>(
     () =>
       columns.map((column) => ({
         id: columnKey(column),
@@ -1749,10 +1757,10 @@ export default function App() {
     () => urlSegments.find((segment) => segment.id === activeSegmentId),
     [activeSegmentId, urlSegments],
   );
-  const table = useReactTable({
+  const table = useTable({
+    features: gridFeatures,
     data: rows,
     columns: tableColumns,
-    getCoreRowModel: getCoreRowModel(),
     manualSorting: true,
     getRowId: (row) => String(row.id),
     enableSortingRemoval: false,
