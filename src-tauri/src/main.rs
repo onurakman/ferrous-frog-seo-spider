@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use ferrous_frog_analysis::analyze_records;
 use ferrous_frog_crawler_core::{
     CrawlConfig, CrawlControl, CrawlerEvent, RobotsTxtBatchTestRequest, RobotsTxtBatchTestResult,
@@ -801,12 +803,12 @@ fn save_search_console_credentials(
     }
     set_integration_setting(&app, GSC_SITE_URL_SETTING, site_url)?;
 
-    if let Some(access_token) = request.access_token.as_ref().map(|token| token.trim()) {
-        if !access_token.is_empty() {
-            search_console_keyring_entry()?
-                .set_password(access_token)
-                .map_err(|error| format!("failed to save Search Console token: {error}"))?;
-        }
+    if let Some(access_token) = request.access_token.as_ref().map(|token| token.trim())
+        && !access_token.is_empty()
+    {
+        search_console_keyring_entry()?
+            .set_password(access_token)
+            .map_err(|error| format!("failed to save Search Console token: {error}"))?;
     }
 
     search_console_credential_status(&app)
@@ -1207,7 +1209,7 @@ fn write_csv_chunk(file: &mut fs::File, csv: &str, include_header: bool) -> Resu
     }
 
     if let Some(index) = csv.find('\n') {
-        file.write_all(csv[index + 1..].as_bytes())
+        file.write_all(&csv.as_bytes()[index + 1..])
             .map_err(|error| format!("failed to write export file: {error}"))?;
     }
     Ok(())
@@ -1347,8 +1349,7 @@ fn export_file(
                 )
             }
             ExportFileKind::GraphJson => {
-                let graph =
-                    store.crawl_graph(request.graph_query.unwrap_or_else(CrawlGraphQuery::default));
+                let graph = store.crawl_graph(request.graph_query.unwrap_or_default());
                 let row_count = graph.nodes.len();
                 let bytes = serde_json::to_vec_pretty(&graph).map_err(|error| error.to_string())?;
                 (
@@ -1358,8 +1359,7 @@ fn export_file(
                 )
             }
             ExportFileKind::GraphNodesCsv => {
-                let graph =
-                    store.crawl_graph(request.graph_query.unwrap_or_else(CrawlGraphQuery::default));
+                let graph = store.crawl_graph(request.graph_query.unwrap_or_default());
                 let row_count = graph.nodes.len();
                 let csv =
                     graph_nodes_to_csv_string(&graph.nodes).map_err(|error| error.to_string())?;
@@ -1370,8 +1370,7 @@ fn export_file(
                 )
             }
             ExportFileKind::GraphEdgesCsv => {
-                let graph =
-                    store.crawl_graph(request.graph_query.unwrap_or_else(CrawlGraphQuery::default));
+                let graph = store.crawl_graph(request.graph_query.unwrap_or_default());
                 let row_count = graph.edges.len();
                 let csv =
                     link_edges_to_csv_string(&graph.edges).map_err(|error| error.to_string())?;

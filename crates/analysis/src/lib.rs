@@ -146,16 +146,16 @@ fn title_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &
         ));
     }
 
-    if let Some(h1) = record.h1.as_deref() {
-        if title.eq_ignore_ascii_case(h1.trim()) {
-            issues.push(issue(
-                "title.same_as_h1",
-                IssueView::TitleSameAsH1,
-                Severity::Info,
-                record,
-                "Page title is the same as H1".to_string(),
-            ));
-        }
+    if let Some(h1) = record.h1.as_deref()
+        && title.eq_ignore_ascii_case(h1.trim())
+    {
+        issues.push(issue(
+            "title.same_as_h1",
+            IssueView::TitleSameAsH1,
+            Severity::Info,
+            record,
+            "Page title is the same as H1".to_string(),
+        ));
     }
 }
 

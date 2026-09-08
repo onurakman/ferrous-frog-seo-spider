@@ -114,6 +114,14 @@ Add tests with the feature they prove:
 - Do not add trademarked names, logos, or assets from competing products.
 - Do not commit API keys, crawl databases, generated exports, or user crawl data.
 
+## Build And Release Workflow
+
+- Use the Rust toolchain in `rust-toolchain.toml` and Node version in `.node-version`.
+- Use `npm ci` and locked Cargo commands. `make ci` mirrors the GitHub checks, including Clippy and the existing browser smoke test.
+- `make build` builds the desktop release executable; `make release` also creates installers. The Cargo target directory belongs to the workspace root.
+- Follow Conventional Commits. Release Please owns version updates across npm, Tauri and the shared Cargo workspace; run `make check-versions` after touching manifests or release configuration.
+- Preserve draft-only uploads and the all-platform success gate before publication. See `docs/RELEASING.md` for retry and signing procedures.
+
 ## Documentation
 
 When changing behavior, update the relevant docs:

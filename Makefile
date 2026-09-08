@@ -7,8 +7,8 @@ help: ## Show available targets.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nFerrous Frog commands:\n\n"} /^[a-zA-Z0-9_.-]+:.*##/ {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 .PHONY: install
-install: ## Install frontend dependencies.
-	npm install
+install: ## Install frontend dependencies from the lockfile.
+	npm ci
 
 .PHONY: dev
 dev: tauri-dev ## Start the Tauri desktop app in development mode.
@@ -32,7 +32,12 @@ tauri-dev: ## Start the Tauri desktop app in development mode.
 	npm run tauri:dev
 
 .PHONY: build
-build: build-web check-tauri ## Build frontend and check the Tauri app.
+build: ## Build the release desktop executable without installers.
+	npm run tauri:build -- --no-bundle -- --locked
+
+.PHONY: release
+release: ## Build release installers for the current platform.
+	npm run tauri:build -- -- --locked
 
 .PHONY: build-web
 build-web: ## Build the React/Vite frontend.
@@ -43,19 +48,27 @@ check: check-rust check-tauri ## Run Rust checks for workspace crates and the Ta
 
 .PHONY: check-rust
 check-rust: ## Check Rust workspace crates except the Tauri app.
-	cargo check --workspace --exclude ferrous-frog-app
+	cargo check --workspace --exclude ferrous-frog-app --locked
 
 .PHONY: check-tauri
 check-tauri: ## Check the Tauri app crate.
-	cargo check -p ferrous-frog-app
+	cargo check -p ferrous-frog-app --locked
 
 .PHONY: check-js-rendering
-check-js-rendering: ## Check the optional Chrome CDP JavaScript rendering backend.
-	cargo check -p ferrous-frog-crawler-core --features js-rendering
+check-js-rendering: ## Check the desktop app with the optional Chrome CDP backend.
+	cargo check -p ferrous-frog-app --features js-rendering --locked
+
+.PHONY: check-versions
+check-versions: ## Verify that Rust, npm, Tauri and release versions agree.
+	node scripts/check-versions.mjs
+
+.PHONY: lint
+lint: ## Run Clippy on all default-feature Rust targets.
+	cargo clippy --workspace --all-targets --locked -- -D warnings
 
 .PHONY: test
 test: ## Run all Rust tests.
-	cargo test --workspace
+	cargo test --workspace --locked
 
 .PHONY: test-ui
 test-ui: ## Exercise the React workspace in headless Chrome with Tauri IPC fixtures.
@@ -75,8 +88,9 @@ fmt: ## Format Rust source.
 fmt-check: ## Check Rust formatting.
 	cargo fmt --all -- --check
 
-.PHONY: verify
-verify: fmt-check test build-web ## Run formatting, tests, and frontend build.
+.PHONY: verify ci
+verify: ci ## Run the same checks as GitHub Actions (Chrome required).
+ci: check-versions fmt-check lint test build-web test-ui check-js-rendering ## Run all CI checks.
 
 .PHONY: clean
 clean: ## Remove generated build outputs.

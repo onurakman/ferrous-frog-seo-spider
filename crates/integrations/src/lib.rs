@@ -250,15 +250,15 @@ impl UrlMetricProvider for PageSpeedProvider {
                     ("category".to_string(), "best-practices".to_string()),
                     ("category".to_string(), "seo".to_string()),
                 ];
-                if let Some(locale) = self.config.locale.as_deref() {
-                    if !locale.trim().is_empty() {
-                        query.push(("locale".to_string(), locale.trim().to_string()));
-                    }
+                if let Some(locale) = self.config.locale.as_deref()
+                    && !locale.trim().is_empty()
+                {
+                    query.push(("locale".to_string(), locale.trim().to_string()));
                 }
-                if let Some(api_key) = self.config.api_key.as_deref() {
-                    if !api_key.trim().is_empty() {
-                        query.push(("key".to_string(), api_key.trim().to_string()));
-                    }
+                if let Some(api_key) = self.config.api_key.as_deref()
+                    && !api_key.trim().is_empty()
+                {
+                    query.push(("key".to_string(), api_key.trim().to_string()));
                 }
                 let mut endpoint =
                     url::Url::parse("https://www.googleapis.com/pagespeedonline/v5/runPagespeed")

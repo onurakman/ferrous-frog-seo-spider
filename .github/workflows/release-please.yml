@@ -1,0 +1,159 @@
+name: Release Please
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag to rebuild (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  prepare:
+    name: Prepare release
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    outputs:
+      created: ${{ steps.release.outputs.release_created || steps.retry.outputs.created }}
+      tag: ${{ steps.release.outputs.tag_name || steps.retry.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha || steps.retry.outputs.sha }}
+      id: ${{ steps.release.outputs.id || steps.retry.outputs.id }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        if: github.event_name == 'push'
+        id: release
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          target-branch: ${{ github.ref_name }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Resolve an existing draft release
+        if: github.event_name == 'workflow_dispatch'
+        id: retry
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "id=$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)" >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Verify release commit
+    needs: prepare
+    if: needs.prepare.outputs.created == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  build:
+    name: Package ${{ matrix.target }}
+    needs: [prepare, verify]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+          - os: macos-15
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - os: windows-2022
+            target: aarch64-pc-windows-msvc
+            bundles: nsis
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - name: Install Linux packaging dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils libfuse2 rpm
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - name: Install the pinned Rust toolchain and target
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release-${{ matrix.target }}
+      - run: npm ci
+      - name: Check the release version
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: node scripts/check-versions.mjs
+      - name: Build installers and upload to the draft
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        with:
+          releaseId: ${{ needs.prepare.outputs.id }}
+          args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }} -- --locked
+          uploadUpdaterJson: false
+          releaseAssetNamePattern: FerrousFrog_[version]_[platform]_[arch][setup][ext]
+
+  publish:
+    name: Add checksums and publish
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          gh release download "$RELEASE_TAG" --pattern 'FerrousFrog_*' --dir release-assets
+          cd release-assets
+          sha256sum FerrousFrog_* > SHA256SUMS
+          gh release upload "$RELEASE_TAG" SHA256SUMS --clobber
+          gh release edit "$RELEASE_TAG" --draft=false

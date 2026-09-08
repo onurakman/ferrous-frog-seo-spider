@@ -878,6 +878,10 @@ fn seed_frontier(
     Ok((queue, seen))
 }
 
+#[expect(
+    clippy::type_complexity,
+    reason = "Returns the scheduler's existing queue, seen set and counter"
+)]
 fn restore_frontier_state<S: CrawlStore>(
     store: &S,
 ) -> Result<Option<(VecDeque<QueueItem>, HashSet<String>, usize)>> {
@@ -1398,16 +1402,16 @@ fn parse_sitemap_document(xml: &str, root_url: &Url) -> ParsedSitemap {
                 current_entry = Some(SitemapEntryKind::Sitemap);
             }
             Ok(Event::Start(element)) if xml_name_matches(element.name().as_ref(), b"loc") => {
-                if let Ok(text) = reader.read_text(element.name()) {
-                    if let Ok(value) = text.decode() {
-                        let value = unescape(value.trim())
-                            .map(|value| value.into_owned())
-                            .unwrap_or_else(|_| value.trim().to_string());
-                        if let Ok(url) = root_url.join(&value) {
-                            match current_entry {
-                                Some(SitemapEntryKind::Sitemap) => parsed.sitemaps.push(url),
-                                _ => parsed.urls.push(url),
-                            }
+                if let Ok(text) = reader.read_text(element.name())
+                    && let Ok(value) = text.decode()
+                {
+                    let value = unescape(value.trim())
+                        .map(|value| value.into_owned())
+                        .unwrap_or_else(|_| value.trim().to_string());
+                    if let Ok(url) = root_url.join(&value) {
+                        match current_entry {
+                            Some(SitemapEntryKind::Sitemap) => parsed.sitemaps.push(url),
+                            _ => parsed.urls.push(url),
                         }
                     }
                 }
@@ -2249,11 +2253,11 @@ fn apply_directives_and_canonical(record: &mut CrawlRecord, current_url: &Url) {
         return;
     }
 
-    if let Some(canonical) = record.canonical.as_deref() {
-        if canonical != current_url.as_str() {
-            record.indexability = "Non-indexable".to_string();
-            record.indexability_status = "Canonicalized".to_string();
-        }
+    if let Some(canonical) = record.canonical.as_deref()
+        && canonical != current_url.as_str()
+    {
+        record.indexability = "Non-indexable".to_string();
+        record.indexability_status = "Canonicalized".to_string();
     }
 }
 
@@ -2283,6 +2287,10 @@ fn assign_near_duplicate_cluster(
     });
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Keeps HTTP response fields explicit at the record boundary"
+)]
 fn status_record(
     original_url: &Url,
     final_url: &Url,

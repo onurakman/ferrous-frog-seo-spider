@@ -48,7 +48,9 @@ pub enum Severity {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum IssueView {
+    #[default]
     All,
     Internal,
     External,
@@ -102,23 +104,13 @@ pub enum IssueView {
     SitemapOrphan,
 }
 
-impl Default for IssueView {
-    fn default() -> Self {
-        Self::All
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum SortDirection {
+    #[default]
     Asc,
     Desc,
-}
-
-impl Default for SortDirection {
-    fn default() -> Self {
-        Self::Asc
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1030,10 +1022,9 @@ impl MemoryStore {
             .global_search
             .as_ref()
             .map(|value| value.trim().to_lowercase())
+            && !search.is_empty()
         {
-            if !search.is_empty() {
-                rows.retain(|row| row_matches_search(row, &search));
-            }
+            rows.retain(|row| row_matches_search(row, &search));
         }
 
         if let Some(sort_by) = query.sort_by.as_deref() {
@@ -1062,10 +1053,9 @@ impl MemoryStore {
             .global_search
             .as_ref()
             .map(|value| value.trim().to_lowercase())
+            && !search.is_empty()
         {
-            if !search.is_empty() {
-                edges.retain(|edge| link_edge_matches_search(edge, &search));
-            }
+            edges.retain(|edge| link_edge_matches_search(edge, &search));
         }
         if let Some(sort_by) = query.sort_by.as_deref() {
             sort_link_edges(&mut edges, sort_by, &query.sort_dir);
@@ -1085,10 +1075,9 @@ impl MemoryStore {
             .global_search
             .as_ref()
             .map(|value| value.trim().to_lowercase())
+            && !search.is_empty()
         {
-            if !search.is_empty() {
-                edges.retain(|edge| link_edge_matches_search(edge, &search));
-            }
+            edges.retain(|edge| link_edge_matches_search(edge, &search));
         }
         let mut rows = aggregate_anchor_texts(edges);
         if let Some(sort_by) = query.sort_by.as_deref() {
@@ -2972,15 +2961,16 @@ fn sitemap_validation_issues(record: &CrawlRecord) -> (Severity, Vec<String>) {
         );
     }
 
-    if let Some(canonical) = record.canonical.as_deref().map(str::trim) {
-        if !canonical.is_empty() && canonical != record.final_url {
-            push_sitemap_issue(
-                &mut issues,
-                &mut severity,
-                Severity::Warning,
-                "Canonical points to a different URL",
-            );
-        }
+    if let Some(canonical) = record.canonical.as_deref().map(str::trim)
+        && !canonical.is_empty()
+        && canonical != record.final_url
+    {
+        push_sitemap_issue(
+            &mut issues,
+            &mut severity,
+            Severity::Warning,
+            "Canonical points to a different URL",
+        );
     }
 
     if record
@@ -3315,15 +3305,15 @@ fn filter_link_edges(edges: &mut Vec<LinkEdge>, query: &LinkEdgeQuery, records: 
     if query.internal_only {
         edges.retain(|edge| edge.link_type == LinkType::Internal);
     }
-    if let Some(source_url) = query.source_url.as_ref().map(|value| value.trim()) {
-        if !source_url.is_empty() {
-            edges.retain(|edge| edge.source_url == source_url);
-        }
+    if let Some(source_url) = query.source_url.as_ref().map(|value| value.trim())
+        && !source_url.is_empty()
+    {
+        edges.retain(|edge| edge.source_url == source_url);
     }
-    if let Some(target_url) = query.target_url.as_ref().map(|value| value.trim()) {
-        if !target_url.is_empty() {
-            edges.retain(|edge| edge.target_url == target_url);
-        }
+    if let Some(target_url) = query.target_url.as_ref().map(|value| value.trim())
+        && !target_url.is_empty()
+    {
+        edges.retain(|edge| edge.target_url == target_url);
     }
 }
 
@@ -4545,26 +4535,27 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
             .push("in_sitemap != 0 AND inlink_count = 0 AND classification = 'internal'".to_string()),
     }
 
-    if let Some(search) = query.global_search.as_ref().map(|value| value.trim()) {
-        if !search.is_empty() {
-            clauses.push(
+    if let Some(search) = query.global_search.as_ref().map(|value| value.trim())
+        && !search.is_empty()
+    {
+        clauses.push(
                 "(lower(url) LIKE ? OR lower(final_url) LIKE ? OR lower(title) LIKE ? OR lower(meta_description) LIKE ? OR lower(meta_robots) LIKE ? OR lower(x_robots_tag) LIKE ? OR lower(h1) LIKE ? OR lower(h2) LIKE ? OR lower(canonical) LIKE ? OR lower(amphtml) LIKE ? OR lower(rel_next) LIKE ? OR lower(rel_prev) LIKE ? OR lower(response_hash) LIKE ? OR lower(custom_extractions) LIKE ? OR lower(custom_searches) LIKE ? OR lower(structured_data_issues) LIKE ? OR CAST(status_code AS TEXT) LIKE ? OR CAST(near_duplicate_cluster_id AS TEXT) LIKE ? OR CAST(list_position AS TEXT) LIKE ? OR CAST(deprecated_html_tag_count AS TEXT) LIKE ? OR CAST(duplicate_id_count AS TEXT) LIKE ? OR CAST(js_rendered AS TEXT) LIKE ? OR CAST(rendered_dom_changed AS TEXT) LIKE ? OR CAST(rendered_word_count_delta AS TEXT) LIKE ? OR CAST(rendered_link_count_delta AS TEXT) LIKE ? OR CAST(search_console_clicks AS TEXT) LIKE ? OR CAST(search_console_impressions AS TEXT) LIKE ? OR CAST(search_console_ctr AS TEXT) LIKE ? OR CAST(search_console_average_position AS TEXT) LIKE ?)"
                     .to_string(),
             );
-            let pattern = format!("%{}%", search.to_lowercase());
-            for _ in 0..29 {
-                args.push(pattern.clone());
-            }
+        let pattern = format!("%{}%", search.to_lowercase());
+        for _ in 0..29 {
+            args.push(pattern.clone());
         }
     }
 
-    if let Some(segment) = query.segment_pattern.as_ref().map(|value| value.trim()) {
-        if !segment.is_empty() && !query.segment_regex {
-            clauses.push("(lower(url) LIKE ? OR lower(final_url) LIKE ?)".to_string());
-            let pattern = format!("%{}%", segment.to_lowercase());
-            args.push(pattern.clone());
-            args.push(pattern);
-        }
+    if let Some(segment) = query.segment_pattern.as_ref().map(|value| value.trim())
+        && !segment.is_empty()
+        && !query.segment_regex
+    {
+        clauses.push("(lower(url) LIKE ? OR lower(final_url) LIKE ?)".to_string());
+        let pattern = format!("%{}%", segment.to_lowercase());
+        args.push(pattern.clone());
+        args.push(pattern);
     }
 
     if clauses.is_empty() {
@@ -4614,28 +4605,28 @@ fn link_edge_filter_sql(
         }
         LinkEdgeView::Nofollow => clauses.push("rel_nofollow != 0".to_string()),
     }
-    if let Some(source_url) = query.source_url.as_ref().map(|value| value.trim()) {
-        if !source_url.is_empty() {
-            clauses.push("source_url = ?".to_string());
-            args.push(source_url.to_string());
-        }
+    if let Some(source_url) = query.source_url.as_ref().map(|value| value.trim())
+        && !source_url.is_empty()
+    {
+        clauses.push("source_url = ?".to_string());
+        args.push(source_url.to_string());
     }
-    if let Some(target_url) = query.target_url.as_ref().map(|value| value.trim()) {
-        if !target_url.is_empty() {
-            clauses.push("target_url = ?".to_string());
-            args.push(target_url.to_string());
-        }
+    if let Some(target_url) = query.target_url.as_ref().map(|value| value.trim())
+        && !target_url.is_empty()
+    {
+        clauses.push("target_url = ?".to_string());
+        args.push(target_url.to_string());
     }
-    if let Some(search) = query.global_search.as_ref().map(|value| value.trim()) {
-        if !search.is_empty() {
-            clauses.push(
+    if let Some(search) = query.global_search.as_ref().map(|value| value.trim())
+        && !search.is_empty()
+    {
+        clauses.push(
                 "(lower(source_url) LIKE ? OR lower(target_url) LIKE ? OR lower(anchor_text) LIKE ? OR lower(rel) LIKE ? OR lower(link_type) LIKE ? OR CAST(source_status_code AS TEXT) LIKE ? OR CAST(target_status_code AS TEXT) LIKE ? OR CAST(source_depth AS TEXT) LIKE ? OR CAST(target_depth AS TEXT) LIKE ? OR CAST(source_position AS TEXT) LIKE ?)"
                     .to_string(),
             );
-            let pattern = format!("%{}%", search.to_lowercase());
-            for _ in 0..10 {
-                args.push(pattern.clone());
-            }
+        let pattern = format!("%{}%", search.to_lowercase());
+        for _ in 0..10 {
+            args.push(pattern.clone());
         }
     }
 
@@ -4974,6 +4965,10 @@ fn compact_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Borrows precomputed audit indexes without rebuilding them per row"
+)]
 fn matches_view(
     row: &CrawlRecord,
     view: &IssueView,

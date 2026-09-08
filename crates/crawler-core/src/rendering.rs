@@ -4,14 +4,10 @@ use url::Url;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum JsRenderingBackend {
+    #[default]
     ChromeCdp,
-}
-
-impl Default for JsRenderingBackend {
-    fn default() -> Self {
-        Self::ChromeCdp
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

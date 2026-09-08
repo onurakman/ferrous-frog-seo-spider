@@ -123,7 +123,7 @@ fn css_text_values(
     let selector = parse_selector(extractor)?;
     let values = document
         .select(&selector)
-        .map(|node| normalize_whitespace(&node.text().collect::<Vec<_>>().join(" ")))
+        .map(|node| normalize_whitespace(node.text().collect::<Vec<_>>().join(" ")))
         .filter(|value| !value.is_empty());
     Ok(limit_matches(values, extractor.all_matches))
 }

@@ -51,6 +51,9 @@ Goal: keep a buildable project skeleton with clear crate boundaries.
 - [x] Root `Makefile` for common development commands.
 - [x] Dependency versions refreshed against current stable releases during implementation.
 - [x] Workspace tests and frontend build pass.
+- [x] GitHub CI and Release Please workflows, synchronized workspace/npm/Tauri versions, and desktop installer configuration.
+- [ ] Verify the first hosted six-target installer matrix and native installation/startup/quit on Windows, macOS and Linux.
+- [ ] Developer ID signing/notarization and Windows code signing before trusted signed distribution.
 
 ## Phase 1 - Make The Frog Crawl
 

@@ -216,6 +216,15 @@ Dependency versions should be verified against current stable releases before th
 
 ## Development Workflow
 
+Install the Rust toolchain specified in [rust-toolchain.toml](rust-toolchain.toml), Node.js 24 LTS, and the [Tauri platform prerequisites](https://v2.tauri.app/start/prerequisites/). On Ubuntu 22.04 or newer, the native build dependencies are:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils rpm
+```
+
+Windows builds need the Visual Studio C++ build tools and WebView2; macOS builds need Xcode command-line tools. `make` targets use Bash; the underlying npm and Cargo commands also work directly from PowerShell.
+
 The intended implementation order is:
 
 1. Scaffold the Cargo workspace and Tauri app.
@@ -229,15 +238,20 @@ The intended implementation order is:
 Common commands:
 
 ```bash
-cargo test --workspace
-npm install
+npm ci
+cargo test --workspace --locked
 npm run dev
 npm run tauri:dev
 npm run build
 make check-js-rendering
 make test-ui
 make bench-synthetic BENCH_URLS=1000000
+make ci
+make build
+make release
 ```
+
+`make ci` runs version consistency, formatting, Clippy, Rust tests, the production frontend build, browser smoke tests and the optional rendering compile check. `make build` produces the desktop release executable without installers. `make release` bundles it into platform installers under `target/release/bundle/`; explicit cross-target builds use `target/<target>/release/bundle/`. `npm run tauri:build -- -- --locked` is the direct packaging command.
 
 Use `npm run tauri:dev` for the desktop app. Opening the Vite URL directly in a browser is useful for layout work, but crawl commands require the Tauri runtime.
 
@@ -248,6 +262,14 @@ JavaScript rendering is optional and requires a Chrome or Chromium executable. S
 Startup and quit UI checks cover the splash page in each appearance mode, failed initial queries, checkbox alignment, Yes/No behavior, focus restoration, repeated close requests, and quit errors. With `UI_SCREENSHOT` set, they also save splash, quit, and Crawl/Storage/Rendering Settings screenshots. A Rust lifecycle test checks that stopping waits for task cleanup. Native window-manager behavior still needs testing in a desktop session.
 
 The synthetic benchmark target is ignored by the normal test suite. Use a smaller `BENCH_URLS` value for smoke checks and `BENCH_URLS=1000000` for the documented large SQLite crawl-storage run.
+
+## GitHub Builds and Releases
+
+CI checks pushes and pull requests to `master` or `main`. Release Please opens a version/changelog PR from Conventional Commits such as `fix: save settings` and `feat: add crawl reports`. Merging that PR starts the installer builds for Linux, macOS and Windows, each on x64 and ARM64.
+
+Packages are uploaded to a draft release. The workflow publishes it only after the release commit passes CI and all six builds succeed, then adds `SHA256SUMS`. Failed builds leave the release as a draft and can be retried. GitHub Actions are pinned to commit SHAs; Dependabot groups weekly Cargo, npm and Actions updates.
+
+See [Releasing](docs/RELEASING.md) for the one-time GitHub setting, package formats, manual retries, signing limitations and local build commands. The workflows are configured; their first complete Windows/macOS/Linux run must be verified after pushing to GitHub.
 
 ## Crawl Etiquette
 

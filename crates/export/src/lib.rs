@@ -839,6 +839,10 @@ fn route(team: &str, text: &str) -> RouteNote {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Maps report metadata directly to a section"
+)]
 fn make_section(
     title: &str,
     team: &str,

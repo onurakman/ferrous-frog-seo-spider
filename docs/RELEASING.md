@@ -1,0 +1,80 @@
+# Building and releasing Ferrous Frog
+
+## Local builds
+
+Use the Rust version in `rust-toolchain.toml`, Node.js from `.node-version`, and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your operating system.
+
+```bash
+npm ci
+make ci
+make build
+make release
+```
+
+`make build` compiles the frontend and an optimized desktop executable without installers. `make release` also produces installers. The equivalent packaging command, including on Windows, is:
+
+```bash
+npm run tauri:build -- -- --locked
+```
+
+To select formats, use `--bundles deb,rpm,appimage` on Linux, `--bundles app,dmg` on macOS, or `--bundles nsis` on Windows before the final `-- --locked`. Linux AppImage packaging needs FUSE 2 (`libfuse2` on Ubuntu 22.04, `libfuse2t64` on Ubuntu 24.04), or `APPIMAGE_EXTRACT_AND_RUN=1` in environments without FUSE. Outputs are under the workspace root's `target/release/bundle/`, or `target/<target>/release/bundle/` when a Rust target is specified.
+
+The standard release excludes the optional Chrome CDP backend. Developers can add `--features js-rendering` to build it and must provide Chrome/Chromium at runtime. CI compiles this path separately; it does not test browser crawling or subresource politeness.
+
+## GitHub setup
+
+1. Push the repository, including both lockfiles, to GitHub with `master` or `main` as the default branch.
+2. Under **Settings → Actions → General → Workflow permissions**, enable **Allow GitHub Actions to create and approve pull requests**. The workflows declare their own token permissions; CI only needs read access.
+3. Run **CI** once and inspect the result. Chrome is already available on the Ubuntu x64 hosted runner; local UI checks accept `CHROME_BIN`.
+4. Use Conventional Commits for releasable changes. The default branch's **Release Please** workflow maintains a version/changelog PR. Merge it when ready to release.
+
+No custom secret is required for the default unsigned/ad-hoc-signed pipeline. With `GITHUB_TOKEN`, bot-created release PRs do not automatically trigger another workflow. Run **CI → Run workflow** with the release PR branch in `ref` before merging; the release pipeline always repeats CI on the exact release commit before packaging. To trigger checks automatically on bot PRs, optionally supply `RELEASE_PLEASE_TOKEN` with repository contents, pull requests and issues write permissions, using a fine-grained token or a GitHub App token. See [Release Please's token documentation](https://github.com/googleapis/release-please-action#other-actions-on-release-please-prs).
+
+## Versioning
+
+Release Please uses the Node strategy to update `package.json` and both root version entries in `package-lock.json`. Targeted extra-file updaters change `workspace.package.version` in `Cargo.toml`, the local packages in `Cargo.lock`, and `src-tauri/tauri.conf.json`. All eight crates inherit the workspace version. The Rust strategy is unsuitable here because its updater expects a root `[package]` and concrete member versions.
+
+`make check-versions` verifies every workspace member, npm lock entry, Tauri version and release manifest. Packaging additionally checks that the tag equals `v<version>`. The Cargo lockfile selector updates packages without a registry/git `source`; in this workspace those are exactly the eight local crates. Keep new local packages on the shared version.
+
+| Commit | Release effect |
+| --- | --- |
+| `fix: persist crawl settings` | Patch |
+| `feat: add an export format` | Minor |
+| `feat!: change the archive format` | Minor before 1.0; major after 1.0 |
+| `docs: update setup`, `ci: update Actions` | No release on their own |
+
+The existing version is `0.1.0`. If the initial imported history has no `feat:` or `fix:` commit, Release Please has nothing releasable to collect; use a Conventional Commit for the first releasable change. Do not manually bump individual manifests. Review the generated version PR and `CHANGELOG.md` together.
+
+## Installer matrix
+
+| Platform | Architecture | Runner | Downloads |
+| --- | --- | --- | --- |
+| Linux | x64 | Ubuntu 22.04 | `.deb`, `.rpm`, `.AppImage` |
+| Linux | ARM64 | Ubuntu 22.04 ARM | `.deb`, `.rpm`, `.AppImage` |
+| macOS | Intel x64 | macOS 15 Intel | `.dmg`, `.app.tar.gz` |
+| macOS | Apple Silicon | macOS 15 ARM | `.dmg`, `.app.tar.gz` |
+| Windows | x64 | Windows 2022 | NSIS `-setup.exe` |
+| Windows | ARM64 | Windows 2022, cross-compiled | NSIS `-setup.exe` |
+
+Linux uses native GNU/WebKitGTK builds. Its installers are not static musl executables; they require compatible desktop libraries. Ubuntu 22.04 is the build baseline. An AppImage still depends on the host's graphics and system libraries. Windows uses NSIS for both architectures. The Windows release executable does not open a console window.
+
+## Release lifecycle and retries
+
+1. Merging the version PR creates a tag and a draft release with changelog notes.
+2. CI checks the release commit, including UI smoke tests and optional rendering compilation.
+3. Six independent jobs check out that same SHA, use `npm ci` and locked Cargo dependencies, then upload installers to the draft. A failed job does not cancel the other platforms.
+4. Only after every build succeeds, the final job downloads the installers, computes `SHA256SUMS`, uploads it and publishes the release.
+
+The release workflow calls CI directly, so it does not depend on bot-created tags triggering another workflow. Concurrent release runs are serialized. No updater feed is generated because the app does not currently implement automatic updates.
+
+For a failed run, use **Re-run failed jobs**. To rebuild an existing draft later, select **Release Please → Run workflow**, leave the default branch selected, and enter its existing tag, such as `v0.1.0`. Manual retries reject published releases; create a new patch release instead of replacing downloads that users already installed. If only checksum/publication failed, rerun that failed job.
+
+On Linux, verify downloaded assets with `sha256sum -c SHA256SUMS`; on macOS use `shasum -a 256 -c SHA256SUMS`. On Windows use `Get-FileHash .\FerrousFrog_*.exe -Algorithm SHA256` and compare with the manifest. Download every listed asset for a complete `-c` check, or check the line for your selected installer.
+
+## Signing and validation limits
+
+Windows installers are unsigned. macOS bundles use Tauri's ad-hoc signing identity (`-`) so Apple Silicon code has a signature, but they are not Developer ID signed or notarized. Operating-system trust prompts are expected. Before distributing trusted signed installers, configure [macOS signing and notarization](https://v2.tauri.app/distribute/sign/macos/) or [Windows signing](https://v2.tauri.app/distribute/sign/windows/) with your own certificates; replace the ad-hoc macOS identity when doing so. Checksums detect changed downloads and do not establish publisher identity.
+
+CI runs Rust tests and the real React screen with synthetic Tauri IPC on Linux. Installer builds prove compilation and bundling for each target, not native GUI operation. Test installation, the splash window, system appearance and native quit confirmation on each supported desktop before announcing the first release. The first hosted matrix run remains to be verified after this repository is pushed.
+
+The workflow follows the [official Tauri GitHub pipeline](https://v2.tauri.app/distribute/pipelines/github/), with release-commit verification and publication deferred until all assets are ready.
