@@ -18,7 +18,7 @@ ferrous-frog-parser.workspace = true
 ferrous-frog-storage.workspace = true
 futures = { workspace = true, optional = true }
 governor.workspace = true
-quick-xml = "0.40.1"
+quick-xml = "0.42.0"
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
