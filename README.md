@@ -1,8 +1,12 @@
 # Ferrous Frog SEO Spider
 
-Ferrous Frog is a clean-room desktop SEO crawler built with Rust and Tauri. It crawls websites like a search-engine bot, captures technical and on-page SEO signals, runs audit rules, and presents the results in a fast, filterable desktop UI.
+*It used to croak. Now it compiles.*
 
-Tagline: "It used to croak. Now it compiles."
+![Ferrous Frog workspace with dark and light themes joined along a diagonal cut](docs/images/workspace-themes.png)
+
+<p align="center"><sub>Dark and light themes · Sample crawl data · <a href="docs/images/workspace-dark.png">Dark screenshot</a> · <a href="docs/images/workspace-light.png">Light screenshot</a></sub></p>
+
+Ferrous Frog is a clean-room desktop SEO crawler built with Rust and Tauri. It crawls websites like a search-engine bot, captures technical and on-page SEO signals, runs audit rules, and presents the results in a fast, filterable desktop UI.
 
 ## Status
 
