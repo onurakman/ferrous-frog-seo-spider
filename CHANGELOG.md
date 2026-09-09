@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/onurakman/ferrous-frog-seo-spider/compare/v0.3.0...v0.3.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* **ci:** isolate browser pause checks from startup timing ([f7a95ec](https://github.com/onurakman/ferrous-frog-seo-spider/commit/f7a95ecda1c88aa1598ebd50974a9f83eba29c11))
+
 ## [0.3.0](https://github.com/onurakman/ferrous-frog-seo-spider/compare/v0.2.0...v0.3.0) (2026-09-09)
 
 
