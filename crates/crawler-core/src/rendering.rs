@@ -130,26 +130,11 @@ pub(super) async fn render_page_if_enabled(
 
     #[cfg(feature = "js-rendering")]
     {
-        loop {
-            crate::wait_if_paused(control).await;
-            crate::ensure_not_cancelled(control)?;
-            // Chrome command deadlines use wall time. Restart the unfinished render
-            // after a pause instead of publishing a timeout or partially rendered DOM.
-            tokio::select! {
-                biased;
-                _ = crate::wait_until_cancelled(control) => anyhow::bail!(crate::CRAWL_CANCELLED_MESSAGE),
-                _ = async {
-                    while !control.is_paused() {
-                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                    }
-                } => {},
-                result = render_with_chrome_cdp(config, url, client, request_policy, control) => {
-                    if !control.is_paused() {
-                        return result.map(Some);
-                    }
-                },
-            }
-        }
+        render_with_pause_restart(control, || {
+            render_with_chrome_cdp(config, url, client, request_policy, control)
+        })
+        .await
+        .map(Some)
     }
     #[cfg(not(feature = "js-rendering"))]
     {
@@ -157,6 +142,34 @@ pub(super) async fn render_page_if_enabled(
         anyhow::bail!(
             "JavaScript rendering for {url} requires the crawler-core js-rendering feature"
         )
+    }
+}
+
+#[cfg(any(feature = "js-rendering", test))]
+async fn render_with_pause_restart<T, F, Fut>(control: &CrawlControl, mut render: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    loop {
+        crate::wait_if_paused(control).await;
+        crate::ensure_not_cancelled(control)?;
+        // Chrome command deadlines use wall time. Restart the unfinished render
+        // after a pause instead of publishing a timeout or partially rendered DOM.
+        tokio::select! {
+            biased;
+            _ = crate::wait_until_cancelled(control) => anyhow::bail!(crate::CRAWL_CANCELLED_MESSAGE),
+            _ = async {
+                while !control.is_paused() {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            } => {},
+            result = render() => {
+                if !control.is_paused() {
+                    return result;
+                }
+            },
+        }
     }
 }
 
@@ -324,6 +337,58 @@ async fn render_with_chrome_cdp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn paused_render_work_is_discarded_before_resume_or_stop() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+
+        for (stop, finish_immediately) in [(false, false), (true, false), (false, true)] {
+            let control = CrawlControl::default();
+            let worker_control = control.clone();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let worker_started = started.clone();
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let worker_attempts = attempts.clone();
+            let task = tokio::spawn(async move {
+                render_with_pause_restart(&worker_control, || async {
+                    let attempt = worker_attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        worker_control.pause();
+                        worker_started.notify_one();
+                        if finish_immediately {
+                            anyhow::bail!("Render failed as pause was requested");
+                        }
+                        tokio::time::timeout(Duration::from_secs(1), std::future::pending::<()>())
+                            .await?;
+                    }
+                    Ok(attempt)
+                })
+                .await
+            });
+            started.notified().await;
+            // Advance beyond the render deadline without depending on Chrome or wall time.
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "Paused work must not publish an expired result"
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            if stop {
+                control.cancel();
+                assert!(task.await.unwrap().is_err());
+                assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            } else {
+                control.resume();
+                assert_eq!(task.await.unwrap().unwrap(), 1);
+                assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn rendering_disabled_returns_none() {

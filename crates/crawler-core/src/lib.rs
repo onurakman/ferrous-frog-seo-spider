@@ -7117,7 +7117,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Chrome; run make test-rendering"]
     async fn chrome_rendering_obeys_pause_resume_and_stop() {
-        for (stop, pause_seconds) in [(false, 4), (true, 0), (true, 4)] {
+        for (stop, pause_ms) in [(false, 200), (true, 0), (true, 200)] {
             let control = CrawlControl::default();
             let site_control = control.clone();
             let visits = AtomicUsize::new(0);
@@ -7144,7 +7144,6 @@ mod tests {
                 CrawlConfig {
                     start_url: base_url,
                     max_urls: 1,
-                    timeout_secs: 3,
                     rendering: JsRenderingConfig {
                         enabled: true,
                         ..JsRenderingConfig::default()
@@ -7155,19 +7154,24 @@ mod tests {
                 control.clone(),
                 |_| {},
             ));
-            tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::time::timeout(Duration::from_secs(45), async {
                 while !control.is_paused() {
                     assert!(
                         !crawl_task.is_finished(),
-                        "Rendering must reach the browser navigation"
+                        "Rendering must reach the browser navigation: {:?}",
+                        store
+                            .records()
+                            .iter()
+                            .map(|row| &row.error)
+                            .collect::<Vec<_>>()
                     );
                     sleep(Duration::from_millis(25)).await;
                 }
             })
             .await
             .unwrap();
-            // Paused time must not exhaust either the renderer or CDP command deadlines.
-            sleep(Duration::from_secs(pause_seconds)).await;
+            // Observe network silence while paused; deadline expiry is covered with virtual time.
+            sleep(Duration::from_millis(pause_ms)).await;
             assert!(
                 store.records().is_empty(),
                 "Paused rendering must not publish a raw fallback"
@@ -7184,7 +7188,7 @@ mod tests {
             } else {
                 control.resume();
             }
-            tokio::time::timeout(Duration::from_secs(5), crawl_task)
+            tokio::time::timeout(Duration::from_secs(if stop { 5 } else { 45 }), crawl_task)
                 .await
                 .unwrap()
                 .unwrap()
@@ -7204,7 +7208,15 @@ mod tests {
                         .any(|(path, _)| path == "/late.js")
                 );
             } else {
-                assert_eq!(store.records()[0].title.as_deref(), Some("Resumed"));
+                let records = store.records();
+                assert_eq!(
+                    records[0].title.as_deref(),
+                    Some("Resumed"),
+                    "Resume must finish rendering: js_rendered={}, error={:?}, requests={:?}",
+                    records[0].js_rendered,
+                    records[0].error,
+                    requests.lock().unwrap(),
+                );
             }
             server.abort();
         }

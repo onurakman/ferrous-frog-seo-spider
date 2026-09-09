@@ -61,7 +61,7 @@ check-js-rendering: ## Check the optional Chrome CDP backend and test browser di
 
 .PHONY: test-rendering
 test-rendering: check-js-rendering ## Verify browser HTTP politeness, nested requests and pause/stop with Chrome.
-	cargo test -p ferrous-frog-crawler-core --features js-rendering chrome_rendering_ --locked -- --ignored
+	cargo test -p ferrous-frog-crawler-core --features js-rendering chrome_rendering_ --locked -- --ignored --test-threads=1
 
 .PHONY: check-versions
 check-versions: ## Verify that Rust, npm, Tauri and release versions agree.

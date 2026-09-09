@@ -119,6 +119,7 @@ Add tests with the feature they prove:
 
 - Use the Rust toolchain in `rust-toolchain.toml` and Node version in `.node-version`.
 - Use `npm ci` and locked Cargo commands. `make ci` mirrors the GitHub checks, including Clippy and the existing browser smoke test.
+- Run resource-heavy Chrome fixtures through `make test-rendering`, which serializes them. Test short deadline and long-pause semantics with virtual time; browser startup must have a normal render budget.
 - Workbook inspection tests require Python 3 (`python3` or `python`) and use its standard-library ZIP/XML readers; the application itself does not require Python.
 - `make build` builds the desktop release executable; `make release` also creates installers. The Cargo target directory belongs to the workspace root.
 - Follow Conventional Commits. Release Please owns version updates across npm, Tauri and the shared Cargo workspace; run `make check-versions` after touching manifests or release configuration.
