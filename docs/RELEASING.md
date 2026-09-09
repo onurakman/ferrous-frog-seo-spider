@@ -19,7 +19,7 @@ npm run tauri:build -- -- --locked
 
 To select formats, use `--bundles deb,rpm,appimage` on Linux, `--bundles app,dmg` on macOS, or `--bundles nsis` on Windows before the final `-- --locked`. Linux AppImage packaging needs FUSE 2 (`libfuse2` on Ubuntu 22.04, `libfuse2t64` on Ubuntu 24.04), or `APPIMAGE_EXTRACT_AND_RUN=1` in environments without FUSE. Outputs are under the workspace root's `target/release/bundle/`, or `target/<target>/release/bundle/` when a Rust target is specified.
 
-The standard release excludes the optional Chrome CDP backend. Developers can add `--features js-rendering` to build it and must provide Chrome/Chromium at runtime. CI compiles this path separately; it does not test browser crawling or subresource politeness.
+The standard release excludes the optional Chrome CDP backend. Developers can add `--features js-rendering` to build it and must provide Chrome/Chromium at runtime. CI compiles this path separately and runs real-browser tests for crawling, subresource politeness, pause, resume and stop.
 
 ## GitHub setup
 
@@ -58,6 +58,8 @@ The existing version is `0.1.0`. If the initial imported history has no `feat:` 
 
 Linux uses native GNU/WebKitGTK builds. Its installers are not static musl executables; they require compatible desktop libraries. Ubuntu 22.04 is the build baseline. An AppImage still depends on the host's graphics and system libraries. Windows uses NSIS for both architectures. The Windows release executable does not open a console window.
 
+Linux CI and packaging install dependencies from the Ubuntu 22.04 runner's `/etc/apt/sources.list`, using APT's `Dir::Etc::sourceparts=-` option for both update and install. This prevents unrelated preinstalled repositories, such as Chrome's APT repository, from blocking builds with package-index errors. Package verification remains enabled; test Chrome is installed separately at its pinned version. Revisit this source path when upgrading runners: [the runner image uses `ubuntu.sources` on newer Ubuntu versions](https://github.com/actions/runner-images/blob/main/images/ubuntu/scripts/build/configure-apt.sh).
+
 ## Release lifecycle and retries
 
 1. Merging the version PR creates a tag and a draft release with changelog notes.
@@ -68,6 +70,8 @@ Linux uses native GNU/WebKitGTK builds. Its installers are not static musl execu
 The release workflow calls CI directly, so it does not depend on bot-created tags triggering another workflow. Concurrent release runs are serialized. Updates are downloaded through the browser; this workflow does not generate a signed feed for in-app installation.
 
 For a failed run, use **Re-run failed jobs**. To rebuild an existing draft later, select **Release Please → Run workflow**, leave the default branch selected, and enter its existing tag, such as `v0.1.0`. Manual retries reject published releases; create a new patch release instead of replacing downloads that users already installed. If only checksum/publication failed, rerun that failed job.
+
+After fixing a workflow, use **Run workflow** from the updated default branch with the existing draft tag. **Re-run failed jobs** retains the old workflow definition. The manual run uses the updated workflow while still checking out and packaging the original tagged release commit.
 
 Do not create another release for the tag or publish it manually while the workflow is running. GitHub can hold a draft and a published release with the same tag; tag-based CLI commands then select the published entry, even when all installers belong to the draft. The publish job reports both release IDs if they differ. Inspect the entries with `gh api repos/OWNER/REPO/releases --jq '.[] | {id, tag_name, draft, assets: (.assets | length)}'`. If an accidentally published duplicate has no assets, remove only that duplicate release by ID after confirming it is the unwanted entry, preserve the tag and the draft containing installers, then rerun only the failed publication job. Rebuilding the six platforms is unnecessary in that case. Do not delete a published release containing installers; resolve that case with a new patch release.
 
