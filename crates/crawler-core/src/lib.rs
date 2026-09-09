@@ -7068,12 +7068,26 @@ mod tests {
                     .count(),
                 1
             );
-            for pair in requests.windows(2) {
-                assert!(
-                    pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(60),
-                    "Requests must share robots crawl-delay: {pair:?}"
-                );
-            }
+            // Chrome delivery and server scheduling can compress individual arrival gaps.
+            // ponytail: exclude startup and allow one boundary interval of delivery jitter;
+            // add CDP timing capture if per-request browser assertions are needed.
+            // Exact admission spacing is verified directly in the request-policy test.
+            let start = requests
+                .iter()
+                .rposition(|(path, _)| path == "/")
+                .unwrap_or(0);
+            let rendered_requests = &requests[start..];
+            let minimum_span =
+                Duration::from_millis(80 * rendered_requests.len().saturating_sub(2) as u64);
+            assert!(
+                rendered_requests
+                    .last()
+                    .unwrap()
+                    .1
+                    .duration_since(rendered_requests[0].1)
+                    >= minimum_span,
+                "Nested requests must share sustained robots pacing: {rendered_requests:?}"
+            );
         }
         for expected in [
             "/app.js",
@@ -7748,6 +7762,60 @@ mod tests {
             parse_robots(DEFAULT_USER_AGENT, b"User-agent: *\nCrawl-delay: 0.02\n").unwrap();
         let delay = robots_crawl_delay_ms(&robot);
         assert_eq!(delay, Some(20));
+    }
+
+    #[tokio::test]
+    async fn request_policy_spaces_same_origin_admissions_using_robots_delay() {
+        let url = Url::parse("https://example.test/page").unwrap();
+        let policy = RequestPolicy {
+            origins: Default::default(),
+            rate_limiter: None,
+            respect_robots: true,
+            header_origin: url.origin(),
+            request_headers: HeaderMap::new(),
+            on_event: Arc::new(|_| {}),
+        };
+        let origin = policy.origin(&url).await;
+        origin
+            .robots
+            .set(Ok(Some(
+                parse_robots(DEFAULT_USER_AGENT, b"User-agent: *\nCrawl-delay: 0.08\n").unwrap(),
+            )))
+            .unwrap();
+        let control = CrawlControl::default();
+        policy.wait(&url, 0, &control).await.unwrap();
+        let mut previous = origin.last_request.lock().await.unwrap();
+        for (path, delay_ms, minimum_ms) in [
+            ("/style.css", 0, 80),
+            ("/redirect", 50, 80),
+            ("/worker.js", 120, 120),
+        ] {
+            policy
+                .wait(&url.join(path).unwrap(), delay_ms, &control)
+                .await
+                .unwrap();
+            let admitted = origin.last_request.lock().await.unwrap();
+            assert!(
+                admitted.duration_since(previous) >= Duration::from_millis(minimum_ms),
+                "{path} was admitted before the effective request delay"
+            );
+            previous = admitted;
+        }
+        let targets =
+            ["/image.png", "/worker-data", "/service-data"].map(|path| url.join(path).unwrap());
+        let (first, second, third) = tokio::join!(
+            policy.wait(&targets[0], 0, &control),
+            policy.wait(&targets[1], 0, &control),
+            policy.wait(&targets[2], 0, &control),
+        );
+        first.unwrap();
+        second.unwrap();
+        third.unwrap();
+        let last = origin.last_request.lock().await.unwrap();
+        assert!(
+            last.duration_since(previous) >= Duration::from_millis(240),
+            "Concurrent callers must share all three 80 ms request slots"
+        );
     }
 
     #[test]
