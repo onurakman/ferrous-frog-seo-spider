@@ -1325,14 +1325,14 @@ dependencies = [
 
 [[package]]
 name = "ferrous-frog-analysis"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ferrous-frog-storage",
 ]
 
 [[package]]
 name = "ferrous-frog-app"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "csv",
  "ferrous-frog-analysis",
@@ -1359,7 +1359,7 @@ dependencies = [
 
 [[package]]
 name = "ferrous-frog-crawler-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1390,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "ferrous-frog-export"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "csv",
  "ferrous-frog-storage",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "ferrous-frog-extractors"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "regex",
  "scraper",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "ferrous-frog-integrations"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "reqwest",
  "serde",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "ferrous-frog-parser"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "scraper",
  "serde",
@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "ferrous-frog-storage"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "regex",
  "rusqlite",
