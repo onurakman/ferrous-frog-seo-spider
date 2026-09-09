@@ -1,16 +1,93 @@
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use url::Url;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContentConfig {
+    pub include_selectors: Vec<String>,
+    pub exclude_selectors: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct ContentSelectors {
+    include: Vec<Selector>,
+    exclude: Vec<Selector>,
+}
+
+impl ContentSelectors {
+    pub fn compile(config: &ContentConfig) -> Result<Self, String> {
+        let compile = |values: &[String], kind: &str| {
+            if values.len() > 100 {
+                return Err(format!(
+                    "Content {kind} selector at row 101 exceeds the limit of 100 selectors"
+                ));
+            }
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    let value = value.trim();
+                    if value.chars().take(2_001).count() > 2_000 {
+                        return Err(format!(
+                            "Content {kind} selector at row {} exceeds 2,000 characters",
+                            index + 1
+                        ));
+                    }
+                    Selector::parse(value).map_err(|_| {
+                        format!("Invalid content {kind} selector at row {}", index + 1)
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        };
+        Ok(Self {
+            include: compile(&config.include_selectors, "include")?,
+            exclude: compile(&config.exclude_selectors, "exclude")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentPreview {
+    pub text: String,
+    pub word_count: usize,
+    pub text_to_code_ratio: f64,
+}
+
+/// Uses the same text selection as a crawl, without extracting other page signals.
+pub fn preview_content(html: &str, content: &ContentSelectors) -> ContentPreview {
+    content_preview(&Html::parse_document(html), html.len(), content)
+}
+
+fn content_preview(document: &Html, html_len: usize, content: &ContentSelectors) -> ContentPreview {
+    let text = visible_text(document, content);
+    let word_count = text.split_whitespace().count();
+    let text_to_code_ratio = if html_len == 0 {
+        0.0
+    } else {
+        text.len() as f64 / html_len as f64
+    };
+    ContentPreview {
+        text,
+        word_count,
+        text_to_code_ratio,
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageSignals {
     pub title: Option<String>,
+    #[serde(default)]
+    pub title_count: usize,
     pub title_len: usize,
     pub title_pixel_width: u32,
     pub meta_description: Option<String>,
+    #[serde(default)]
+    pub meta_description_count: usize,
     pub meta_description_len: usize,
     pub meta_description_pixel_width: u32,
     pub meta_robots: Option<String>,
@@ -52,6 +129,27 @@ pub struct PageSignals {
     pub duplicate_id_count: u32,
     pub links: Vec<PageLink>,
     pub resources: Vec<PageResource>,
+    #[serde(default)]
+    pub sitemaps: Vec<String>,
+    #[serde(default)]
+    pub reference_links: Vec<PageReferenceLink>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PageReferenceKind {
+    Canonical,
+    Hreflang,
+    Pagination,
+    Amp,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageReferenceLink {
+    pub url: String,
+    pub kind: PageReferenceKind,
+    pub rel_nofollow: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -134,9 +232,18 @@ const DEPRECATED_HTML_TAGS: &[&str] = &[
 ];
 
 pub fn parse_html(base_url: &Url, html: &str) -> PageSignals {
+    parse_html_with_content(base_url, html, &ContentSelectors::default())
+}
+
+pub fn parse_html_with_content(
+    base_url: &Url,
+    html: &str,
+    content: &ContentSelectors,
+) -> PageSignals {
     let document = Html::parse_document(html);
     let title = first_text(&document, "title");
     let meta_description = meta_content(&document, "description");
+    let (title_count, meta_description_count) = metadata_tag_counts(&document);
     let meta_robots = meta_content(&document, "robots");
     let h1 = first_text(&document, "h1");
     let h1_count = element_count(&document, "h1");
@@ -149,13 +256,11 @@ pub fn parse_html(base_url: &Url, html: &str) -> PageSignals {
     let rel_prev = link_href_by_rel(&document, base_url, "prev");
     let hreflang_stats = hreflang_stats(&document, base_url);
     let json_ld_stats = json_ld_stats(&document);
-    let visible_text = visible_text(&document);
-    let word_count = visible_text.split_whitespace().count();
-    let text_to_code_ratio = if html.is_empty() {
-        0.0
-    } else {
-        visible_text.len() as f64 / html.len() as f64
-    };
+    let ContentPreview {
+        text: visible_text,
+        word_count,
+        text_to_code_ratio,
+    } = content_preview(&document, html.len(), content);
     let links = extract_links(&document, base_url);
     let images = extract_images(&document, base_url);
     let resources = extract_resources(&document, base_url);
@@ -192,9 +297,11 @@ pub fn parse_html(base_url: &Url, html: &str) -> PageSignals {
 
     PageSignals {
         title,
+        title_count,
         title_len,
         title_pixel_width,
         meta_description,
+        meta_description_count,
         meta_description_len,
         meta_description_pixel_width,
         meta_robots,
@@ -244,6 +351,8 @@ pub fn parse_html(base_url: &Url, html: &str) -> PageSignals {
         duplicate_id_count: duplicate_id_count(&document),
         links,
         resources,
+        sitemaps: link_hrefs_by_rel(&document, base_url, "sitemap"),
+        reference_links: reference_links(&document, base_url),
     }
 }
 
@@ -293,7 +402,7 @@ pub fn contains_robots_directive(value: Option<&str>, directive: &str) -> bool {
         })
 }
 
-fn estimate_text_pixel_width(text: &str, font_size_px: f32) -> u32 {
+pub fn estimate_text_pixel_width(text: &str, font_size_px: f32) -> u32 {
     text.chars()
         .map(estimated_glyph_width)
         .map(|width| width * font_size_px)
@@ -326,14 +435,57 @@ fn first_text(document: &Html, selector_value: &str) -> Option<String> {
     let selector = selector(selector_value);
     document
         .select(&selector)
-        .next()
-        .map(|node| normalize_whitespace(&node.text().collect::<Vec<_>>().join(" ")))
+        .find(is_active_html_document_element)
+        .map(|node| {
+            let text = node
+                .descendants()
+                .filter_map(|descendant| {
+                    let text = descendant.value().as_text()?;
+                    (!descendant
+                        .ancestors()
+                        .any(|ancestor| ancestor.value().is_fragment()))
+                    .then_some(text.text.as_ref())
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            normalize_whitespace(&text)
+        })
         .filter(|value| !value.is_empty())
 }
 
 fn element_count(document: &Html, selector_value: &str) -> usize {
     let selector = selector(selector_value);
-    document.select(&selector).count()
+    document
+        .select(&selector)
+        .filter(is_active_html_document_element)
+        .count()
+}
+
+fn is_active_html_document_element(node: &ElementRef<'_>) -> bool {
+    node.value().name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+        && !node
+            .ancestors()
+            .any(|ancestor| ancestor.value().is_fragment())
+}
+
+fn metadata_tag_counts(document: &Html) -> (usize, usize) {
+    let mut counts = (0, 0);
+    let candidates = selector("title, meta[name]");
+    for node in document
+        .select(&candidates)
+        .filter(is_active_html_document_element)
+    {
+        if node.value().name() == "title" {
+            counts.0 += 1;
+        } else if node
+            .value()
+            .attr("name")
+            .is_some_and(|name| name.eq_ignore_ascii_case("description"))
+        {
+            counts.1 += 1;
+        }
+    }
+    counts
 }
 
 fn deprecated_html_tag_count(document: &Html) -> u32 {
@@ -364,20 +516,23 @@ fn duplicate_id_count(document: &Html) -> u32 {
 
 fn meta_content(document: &Html, name: &str) -> Option<String> {
     let selector = selector("meta[name], meta[property]");
-    let mut contents = document.select(&selector).filter_map(|node| {
-        let value = node
-            .value()
-            .attr("name")
-            .or_else(|| node.value().attr("property"))?;
-        if value.eq_ignore_ascii_case(name) {
-            node.value()
-                .attr("content")
-                .map(normalize_whitespace)
-                .filter(|content| !content.is_empty())
-        } else {
-            None
-        }
-    });
+    let mut contents = document
+        .select(&selector)
+        .filter(is_active_html_document_element)
+        .filter_map(|node| {
+            let value = node
+                .value()
+                .attr("name")
+                .or_else(|| node.value().attr("property"))?;
+            if value.eq_ignore_ascii_case(name) {
+                node.value()
+                    .attr("content")
+                    .map(normalize_whitespace)
+                    .filter(|content| !content.is_empty())
+            } else {
+                None
+            }
+        });
     let mut content = contents.next()?;
     if name.eq_ignore_ascii_case("robots") {
         for value in contents {
@@ -388,25 +543,110 @@ fn meta_content(document: &Html, name: &str) -> Option<String> {
     Some(content)
 }
 
-fn canonical_href(document: &Html, base_url: &Url) -> Option<String> {
-    let selector = selector("link[rel][href]");
-    document.select(&selector).find_map(|node| {
-        let rel = node.value().attr("rel")?;
-        if rel
-            .split_whitespace()
-            .any(|part| part.eq_ignore_ascii_case("canonical"))
-        {
-            normalize_url(base_url, node.value().attr("href")?).map(|url| url.to_string())
-        } else {
-            None
+/// Extract canonical targets from HTTP Link fields (RFC 8288).
+pub fn canonical_link_headers<'a>(
+    base_url: &Url,
+    values: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    canonical_header_references(base_url, values)
+        .into_iter()
+        .map(|reference| reference.url)
+        .collect()
+}
+
+/// Retain canonical relation directives for optional crawler discovery.
+pub fn canonical_header_references<'a>(
+    base_url: &Url,
+    values: impl IntoIterator<Item = &'a str>,
+) -> Vec<PageReferenceLink> {
+    values
+        .into_iter()
+        .flat_map(|value| split_link_header(value, ','))
+        .filter_map(|link| {
+            let link = link.trim().strip_prefix('<')?;
+            let (target, parameters) = link.split_once('>')?;
+            let mut relation = None;
+            let mut anchor = None;
+            for parameter in
+                split_link_header(parameters, ';').filter(|part| !part.trim().is_empty())
+            {
+                let Some((name, value)) = parameter.trim().split_once('=') else {
+                    continue;
+                };
+                let value = value.trim();
+                let value = if let Some(quoted) = value.strip_prefix('"') {
+                    let quoted = quoted.strip_suffix('"')?;
+                    let mut chars = quoted.chars();
+                    let mut decoded = String::new();
+                    while let Some(ch) = chars.next() {
+                        decoded.push(if ch == '\\' { chars.next()? } else { ch });
+                    }
+                    decoded
+                } else {
+                    value.to_string()
+                };
+                // RFC 8288 uses the first occurrence of rel and anchor.
+                if name.trim().eq_ignore_ascii_case("rel") && relation.is_none() {
+                    relation = Some(value);
+                } else if name.trim().eq_ignore_ascii_case("anchor") && anchor.is_none() {
+                    anchor = Some(value);
+                }
+            }
+            let relation = relation?;
+            if !relation
+                .split_ascii_whitespace()
+                .any(|rel| rel.eq_ignore_ascii_case("canonical"))
+            {
+                return None;
+            }
+            if let Some(anchor) = anchor
+                && base_url.join(&anchor).ok()?.as_str() != base_url.as_str()
+            {
+                return None;
+            }
+            let mut target = base_url.join(target).ok()?;
+            if !matches!(target.scheme(), "http" | "https") {
+                return None;
+            }
+            target.set_fragment(None);
+            Some(PageReferenceLink {
+                url: target.to_string(),
+                kind: PageReferenceKind::Canonical,
+                rel_nofollow: relation
+                    .split_ascii_whitespace()
+                    .any(|rel| rel.eq_ignore_ascii_case("nofollow")),
+            })
+        })
+        .collect()
+}
+
+fn split_link_header(value: &str, separator: char) -> impl Iterator<Item = &str> {
+    let (mut quoted, mut escaped, mut in_target) = (false, false, false);
+    value.split(move |ch| {
+        if escaped {
+            escaped = false;
+            return false;
         }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' if !in_target => quoted = !quoted,
+            '<' if !quoted => in_target = true,
+            '>' if !quoted => in_target = false,
+            _ => {}
+        }
+        ch == separator && !quoted && !in_target
     })
+}
+
+fn canonical_href(document: &Html, base_url: &Url) -> Option<String> {
+    link_href_by_rel(document, base_url, "canonical")
 }
 
 fn canonical_count(document: &Html) -> usize {
     let selector = selector("link[rel][href]");
     document
         .select(&selector)
+        .filter(is_active_html_document_element)
         .filter(|node| {
             node.value()
                 .attr("rel")
@@ -420,18 +660,68 @@ fn canonical_count(document: &Html) -> usize {
 }
 
 fn link_href_by_rel(document: &Html, base_url: &Url, rel_name: &str) -> Option<String> {
+    link_hrefs_by_rel(document, base_url, rel_name)
+        .into_iter()
+        .next()
+}
+
+fn link_hrefs_by_rel(document: &Html, base_url: &Url, rel_name: &str) -> Vec<String> {
     let selector = selector("link[rel][href]");
-    document.select(&selector).find_map(|node| {
-        let rel = node.value().attr("rel")?;
-        if rel
-            .split_whitespace()
-            .any(|part| part.eq_ignore_ascii_case(rel_name))
-        {
-            normalize_url(base_url, node.value().attr("href")?).map(|url| url.to_string())
-        } else {
-            None
+    document
+        .select(&selector)
+        .filter(is_active_html_document_element)
+        .filter_map(|node| {
+            let rel = node.value().attr("rel")?;
+            if rel.split_whitespace().any(|part| {
+                part.eq_ignore_ascii_case(rel_name)
+                    || (rel_name.eq_ignore_ascii_case("prev")
+                        && part.eq_ignore_ascii_case("previous"))
+            }) {
+                normalize_url(base_url, node.value().attr("href")?).map(|url| url.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn reference_links(document: &Html, base_url: &Url) -> Vec<PageReferenceLink> {
+    let mut links = Vec::new();
+    for node in document
+        .select(&selector("link[rel][href]"))
+        .filter(is_active_html_document_element)
+    {
+        let rel = node.value().attr("rel").unwrap_or_default();
+        let has_rel = |name: &str| {
+            rel.split_whitespace()
+                .any(|part| part.eq_ignore_ascii_case(name))
+        };
+        let Some(url) = normalize_url(base_url, node.value().attr("href").unwrap_or_default())
+        else {
+            continue;
+        };
+        for (kind, matches) in [
+            (PageReferenceKind::Canonical, has_rel("canonical")),
+            (
+                PageReferenceKind::Hreflang,
+                has_rel("alternate") && node.value().attr("hreflang").is_some(),
+            ),
+            (
+                PageReferenceKind::Pagination,
+                has_rel("next") || has_rel("prev") || has_rel("previous"),
+            ),
+            (PageReferenceKind::Amp, has_rel("amphtml")),
+        ] {
+            if matches {
+                links.push(PageReferenceLink {
+                    url: url.to_string(),
+                    kind,
+                    rel_nofollow: has_rel("nofollow"),
+                });
+            }
         }
-    })
+    }
+    links
 }
 
 #[derive(Default)]
@@ -447,15 +737,19 @@ fn hreflang_stats(document: &Html, base_url: &Url) -> HreflangStats {
     let mut stats = HreflangStats::default();
     let mut has_self_reference = false;
 
-    for node in document.select(&selector).filter(|node| {
-        node.value()
-            .attr("rel")
-            .map(|rel| {
-                rel.split_whitespace()
-                    .any(|part| part.eq_ignore_ascii_case("alternate"))
-            })
-            .unwrap_or(false)
-    }) {
+    for node in document
+        .select(&selector)
+        .filter(is_active_html_document_element)
+        .filter(|node| {
+            node.value()
+                .attr("rel")
+                .map(|rel| {
+                    rel.split_whitespace()
+                        .any(|part| part.eq_ignore_ascii_case("alternate"))
+                })
+                .unwrap_or(false)
+        })
+    {
         stats.count = stats.count.saturating_add(1);
 
         let hreflang = node.value().attr("hreflang").unwrap_or_default().trim();
@@ -993,13 +1287,42 @@ fn push_resource(
     });
 }
 
-fn visible_text(document: &Html) -> String {
-    let selector = selector("body");
-    document
-        .select(&selector)
-        .next()
-        .map(|node| normalize_whitespace(&node.text().collect::<Vec<_>>().join(" ")))
-        .unwrap_or_default()
+fn visible_text(document: &Html, content: &ContentSelectors) -> String {
+    if content.include.is_empty() && content.exclude.is_empty() {
+        // Saved crawls without content settings retain their original body-text metrics.
+        return document
+            .select(&selector("body"))
+            .next()
+            .map(|node| normalize_whitespace(&node.text().collect::<Vec<_>>().join(" ")))
+            .unwrap_or_default();
+    }
+
+    let mut text = String::new();
+    let mut pending = vec![(document.tree.root(), content.include.is_empty())];
+    while let Some((node, mut included)) = pending.pop() {
+        if let Some(element) = ElementRef::wrap(node) {
+            if matches!(
+                element.value().name(),
+                "head" | "script" | "style" | "noscript" | "template"
+            ) || content.exclude.iter().any(|rule| rule.matches(&element))
+            {
+                continue;
+            }
+            included |= content.include.iter().any(|rule| rule.matches(&element));
+        }
+        if included && let Some(value) = node.value().as_text() {
+            for word in value.split_whitespace() {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(word);
+            }
+        }
+        // A single document walk counts overlapping includes only once. Skipping
+        // excluded subtrees also prevents an inner include from restoring them.
+        pending.extend(node.children().rev().map(|child| (child, included)));
+    }
+    text
 }
 
 fn normalize_whitespace(value: &str) -> String {
@@ -1008,7 +1331,547 @@ fn normalize_whitespace(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn active_document_metadata_ignores_svg_titles() {
+        let signals = super::parse_html(
+            &url::Url::parse("https://example.test/").unwrap(),
+            "<html><head></head><body><svg><title>Chart label</title></svg></body></html>",
+        );
+        assert_eq!(signals.title, None);
+        assert_eq!(signals.title_count, 0);
+        assert_eq!(signals.title_len, 0);
+        assert_eq!(signals.title_pixel_width, 0);
+    }
+
+    #[test]
+    fn active_document_metadata_ignores_template_metadata_and_directives() {
+        let signals = super::parse_html(
+            &url::Url::parse("https://example.test/").unwrap(),
+            "<html><head><template><title>Template title</title><meta name='description' content='Template description'><meta name='robots' content='noindex, nofollow'><meta name='viewport' content='width=device-width'></template></head><body>Active body</body></html>",
+        );
+        assert_eq!(
+            (
+                signals.title,
+                signals.meta_description,
+                signals.meta_robots,
+                signals.viewport,
+                signals.indexability.as_str()
+            ),
+            (None, None, None, false, "Indexable")
+        );
+        assert_eq!(signals.title_count, 0);
+        assert_eq!(signals.meta_description_count, 0);
+        assert_eq!(signals.indexability_status, "Indexable");
+    }
+
+    #[test]
+    fn active_document_headings_ignore_template_elements() {
+        let signals = super::parse_html(
+            &url::Url::parse("https://example.test/").unwrap(),
+            "<body><template><h1>Template heading</h1><h2>Template subheading</h2><center>Template deprecated tag</center></template>Active body</body>",
+        );
+        assert_eq!((signals.h1, signals.h1_count, signals.h1_len), (None, 0, 0));
+        assert_eq!((signals.h2, signals.h2_count, signals.h2_len), (None, 0, 0));
+        assert_eq!(signals.deprecated_html_tag_count, 0);
+    }
+
+    #[test]
+    fn active_document_headings_ignore_nested_template_text() {
+        let signals = super::parse_html(
+            &url::Url::parse("https://example.test/").unwrap(),
+            "<body><h1>Active <svg><text>chart</text></svg> heading<template>inert text <span>nested text</span></template> end</h1><h2>Active<template><span>inert subheading</span></template> subheading</h2></body>",
+        );
+        assert_eq!(signals.h1.as_deref(), Some("Active chart heading end"));
+        assert_eq!(signals.h1_count, 1);
+        assert_eq!(signals.h2.as_deref(), Some("Active subheading"));
+        assert_eq!(signals.h2_count, 1);
+    }
+
+    #[test]
+    fn active_document_metadata_preserves_order_robots_merging_and_property_fallback() {
+        let html = "<html><head><template><title>Template title</title><meta name='description' content='Template description'><meta name='robots' content='noindex'><meta name='viewport' content='fake'></template><meta property='description' content='Legacy description'><meta NAME='DeScRiPtIoN' content='Later description'><meta name='ROBOTS' content='index, follow'><meta property='robots' content='max-image-preview: large'></head><body><svg><title>Chart label</title></svg><title>Active title</title><title>Later title</title><template><h1>Fake heading</h1><h2>Fake subheading</h2></template><h1>Active heading</h1><h1>Later heading</h1><h2>Active subheading</h2><main>Selected words</main></body></html>";
+        for (include, exclude) in [(&[][..], &[][..]), (&["main"][..], &["h1", "h2"][..])] {
+            let signals = scoped_signals(html, include, exclude);
+            assert_eq!(signals.title.as_deref(), Some("Active title"));
+            assert_eq!(signals.title_count, 2);
+            assert_eq!(
+                signals.meta_description.as_deref(),
+                Some("Legacy description")
+            );
+            assert_eq!(signals.meta_description_count, 1);
+            assert_eq!(
+                signals.meta_robots.as_deref(),
+                Some("index, follow, max-image-preview: large")
+            );
+            assert_eq!(signals.indexability, "Indexable");
+            assert!(!signals.viewport);
+            assert_eq!(signals.h1.as_deref(), Some("Active heading"));
+            assert_eq!(signals.h1_count, 2);
+            assert_eq!(signals.h2.as_deref(), Some("Active subheading"));
+            assert_eq!(signals.h2_count, 1);
+        }
+        let empty_first = scoped_signals(
+            "<template><title>Template title</title></template><title> </title><title>Later active title</title>",
+            &[],
+            &[],
+        );
+        assert_eq!(empty_first.title, None);
+        assert_eq!(empty_first.title_count, 2);
+    }
+
+    #[test]
+    fn multiple_metadata_counts_document_tags_without_changing_retained_values() {
+        let html = r#"<html><head><title>First title</title><TITLE></TITLE>
+            <meta name="description" content="First description">
+            <META NAME="DESCRIPTION"><meta name="description" content=" ">
+            <meta property="description" content="Legacy property"><meta property="og:description" content="Social description">
+            <template><title>Template title</title><meta name="description" content="Template description"></template>
+            <script>const markup = '<title>Script title</title><meta name="description">';</script>
+            </head><body><svg><title>SVG label</title></svg></body></html>"#;
+        let signals = super::parse_html(&url::Url::parse("https://example.test/").unwrap(), html);
+        assert_eq!(signals.title.as_deref(), Some("First title"));
+        assert_eq!(
+            signals.meta_description.as_deref(),
+            Some("First description")
+        );
+        let value = serde_json::to_value(signals).unwrap();
+        assert_eq!(value["titleCount"], 2);
+        assert_eq!(value["metaDescriptionCount"], 3);
+        let empty = super::parse_html(
+            &url::Url::parse("https://example.test/").unwrap(),
+            "<title> </title><title>Later title</title><meta name=description><meta name=description content='Later description'>",
+        );
+        assert_eq!(empty.title, None, "Keep the existing first-title behavior");
+        assert_eq!(empty.meta_description.as_deref(), Some("Later description"));
+        let value = serde_json::to_value(empty).unwrap();
+        assert_eq!(value["titleCount"], 2);
+        assert_eq!(value["metaDescriptionCount"], 2);
+    }
+
+    #[test]
+    fn multiple_metadata_counts_measure_zero_and_ignore_text_region_settings() {
+        let base = url::Url::parse("https://example.test/").unwrap();
+        let empty = super::parse_html(
+            &base,
+            "<template><title>Template only</title><meta name=description></template><svg><title>SVG only</title></svg>",
+        );
+        let value = serde_json::to_value(empty).unwrap();
+        assert_eq!(value["titleCount"], 0);
+        assert_eq!(value["metaDescriptionCount"], 0);
+        let content = super::ContentSelectors::compile(&super::ContentConfig {
+            include_selectors: vec!["main".into()],
+            exclude_selectors: Vec::new(),
+        })
+        .unwrap();
+        let selected = super::parse_html_with_content(
+            &base,
+            "<title>One</title><title>Two</title><meta name=description><meta name=description><main>Selected text</main>",
+            &content,
+        );
+        let value = serde_json::to_value(selected).unwrap();
+        assert_eq!(value["titleCount"], 2);
+        assert_eq!(value["metaDescriptionCount"], 2);
+    }
+
     use super::*;
+
+    fn scoped_signals(html: &str, include: &[&str], exclude: &[&str]) -> PageSignals {
+        let selectors = ContentSelectors::compile(&ContentConfig {
+            include_selectors: include.iter().map(|value| (*value).to_owned()).collect(),
+            exclude_selectors: exclude.iter().map(|value| (*value).to_owned()).collect(),
+        })
+        .unwrap();
+        parse_html_with_content(
+            &Url::parse("https://example.test/").unwrap(),
+            html,
+            &selectors,
+        )
+    }
+
+    #[test]
+    fn content_regions_union_overlapping_matches_in_document_order() {
+        let html = "<nav>Navigation</nav><main>First <section class='copy'>second <b>third</b></section> fourth</main><article>fifth</article>";
+        let signals = scoped_signals(html, &["article", ".copy", "main", "main b"], &[]);
+        assert_eq!(signals.visible_text, "First second third fourth fifth");
+        assert_eq!(signals.word_count, 5);
+        assert_eq!(
+            signals.text_to_code_ratio,
+            signals.visible_text.len() as f64 / html.len() as f64
+        );
+    }
+
+    #[test]
+    fn content_exclusions_override_included_descendants_and_nested_regions() {
+        let html = "<main>Keep <aside>discard <b>nested</b></aside><p>also keep</p></main><footer><p>discard too</p></footer>";
+        assert_eq!(
+            scoped_signals(html, &["main", "aside b", "footer p"], &["aside", "footer"])
+                .visible_text,
+            "Keep also keep"
+        );
+        assert_eq!(scoped_signals(html, &["main"], &["body"]).visible_text, "");
+        assert_eq!(scoped_signals(html, &["main"], &["main"]).visible_text, "");
+    }
+
+    #[test]
+    fn content_regions_with_no_matches_have_no_text_and_exclusions_use_the_body() {
+        let html = "<head><title>Head</title></head><body><nav>skip this</nav><main>Keep this</main></body>";
+        let no_match = scoped_signals(html, &[".missing"], &[]);
+        assert_eq!(no_match.visible_text, "");
+        assert_eq!(no_match.word_count, 0);
+        assert_eq!(no_match.text_to_code_ratio, 0.0);
+        assert_eq!(
+            scoped_signals(html, &[], &["nav"]).visible_text,
+            "Keep this"
+        );
+        assert_eq!(
+            scoped_signals(html, &["html"], &["nav"]).visible_text,
+            "Keep this"
+        );
+    }
+
+    #[test]
+    fn configured_content_regions_exclude_non_content_elements_and_keep_other_evidence() {
+        let html = "<html><head><title>Page title</title><meta name='robots' content='noindex'><link rel='canonical' href='/canonical'><link rel='stylesheet' href='/site.css'></head><body><h1>Outside heading</h1><a href='/outside'>Outside link</a><main>Keep <b>these words</b><script>script words</script><style>style words</style><noscript>noscript words</noscript><template>template words</template></main><img src='/image.png'></body></html>";
+        let scoped = scoped_signals(html, &["html", "main script"], &["h1", "a"]);
+        assert_eq!(scoped.visible_text, "Keep these words");
+        let whole = parse_html(&Url::parse("https://example.test/").unwrap(), html);
+        let mut whole_evidence = serde_json::to_value(whole).unwrap();
+        let mut scoped_evidence = serde_json::to_value(scoped).unwrap();
+        for field in ["visibleText", "wordCount", "textToCodeRatio"] {
+            whole_evidence.as_object_mut().unwrap().remove(field);
+            scoped_evidence.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(scoped_evidence, whole_evidence);
+    }
+
+    #[test]
+    fn content_regions_preserve_legacy_body_text_when_settings_are_empty() {
+        let html = "<head><title>Title</title></head><body>Visible <script>legacy script text</script><style>legacy style text</style></body>";
+        assert_eq!(
+            scoped_signals(html, &[], &[]).visible_text,
+            "Visible legacy script text legacy style text"
+        );
+    }
+
+    #[test]
+    fn content_regions_reject_invalid_or_empty_selectors_with_their_location() {
+        for (include, exclude, kind) in [
+            (vec!["[".into()], vec![], "include"),
+            (vec![], vec!["main".into(), "".into()], "exclude"),
+            (vec!["   ".into()], vec![], "include"),
+        ] {
+            let error = ContentSelectors::compile(&ContentConfig {
+                include_selectors: include,
+                exclude_selectors: exclude,
+            })
+            .unwrap_err();
+            assert!(error.contains(kind), "{error}");
+            assert!(error.contains("row"), "{error}");
+        }
+    }
+
+    #[test]
+    fn content_selector_inputs_are_bounded_before_parsing() {
+        for (kind, include) in [("include", true), ("exclude", false)] {
+            let config = |selectors: Vec<String>| ContentConfig {
+                include_selectors: if include {
+                    selectors.clone()
+                } else {
+                    Vec::new()
+                },
+                exclude_selectors: if include { Vec::new() } else { selectors },
+            };
+            assert!(ContentSelectors::compile(&config(vec!["main".into(); 100])).is_ok());
+            for values in [vec!["main".into(); 101], vec![String::new(); 101]] {
+                let error = ContentSelectors::compile(&config(values)).unwrap_err();
+                assert!(error.contains(kind), "{error}");
+                assert!(error.contains("row 101"), "{error}");
+                assert!(error.contains("100"), "{error}");
+            }
+
+            let longest = format!(".{}", "é".repeat(1_999));
+            assert!(ContentSelectors::compile(&config(vec![longest])).is_ok());
+            let too_long = format!(".{}privateTag", "é".repeat(1_990));
+            assert_eq!(too_long.chars().count(), 2_001);
+            let error =
+                ContentSelectors::compile(&config(vec!["main".into(), too_long])).unwrap_err();
+            assert!(error.contains(kind), "{error}");
+            assert!(error.contains("row 2"), "{error}");
+            assert!(error.contains("2,000"), "{error}");
+            assert!(!error.contains("privateTag"), "{error}");
+            let error = ContentSelectors::compile(&config(vec![":privateTag".into()])).unwrap_err();
+            assert!(error.contains(kind), "{error}");
+            assert!(error.contains("row 1"), "{error}");
+            assert!(!error.contains("privateTag"), "{error}");
+        }
+    }
+
+    #[test]
+    fn content_preview_matches_crawl_text_metrics_and_serialization() {
+        let config = ContentConfig {
+            include_selectors: vec!["main".into(), "b".into()],
+            exclude_selectors: vec!["aside".into()],
+        };
+        let selectors = ContentSelectors::compile(&config).unwrap();
+        for html in [
+            "<main> First <b>café 世界</b> <aside>discard</aside></main>",
+            "",
+        ] {
+            let preview = preview_content(html, &selectors);
+            let signals = parse_html_with_content(
+                &Url::parse("https://example.test/").unwrap(),
+                html,
+                &selectors,
+            );
+            assert_eq!(preview.text, signals.visible_text);
+            assert_eq!(preview.word_count, signals.word_count);
+            assert_eq!(preview.text_to_code_ratio, signals.text_to_code_ratio);
+            let json = serde_json::to_value(preview).unwrap();
+            assert_eq!(json["wordCount"], signals.word_count);
+            assert_eq!(json["textToCodeRatio"], signals.text_to_code_ratio);
+        }
+    }
+
+    #[test]
+    fn discovers_linked_sitemaps_with_http_urls_and_rel_tokens() {
+        let signals = parse_html(
+            &Url::parse("https://example.test/docs/").unwrap(),
+            "<link rel='alternate SITEMAP' href='../map.xml#fragment'><link rel='sitemap' href='/second'><link rel='sitemap' href='file:///private'><link rel='canonical' href='/page'>",
+        );
+        let serialized = serde_json::to_value(signals).unwrap();
+        assert_eq!(
+            serialized["sitemaps"],
+            serde_json::json!([
+                "https://example.test/map.xml",
+                "https://example.test/second"
+            ])
+        );
+    }
+
+    #[test]
+    fn active_document_relations_ignore_template_only_self_references() {
+        let signals = parse_html(
+            &Url::parse("https://example.test/page").unwrap(),
+            "<title>Active page</title><template><link rel='next prev canonical amphtml alternate sitemap' hreflang='en' href='/page'></template>",
+        );
+        assert_eq!(
+            (
+                signals.rel_next,
+                signals.rel_prev,
+                signals.canonical,
+                signals.amphtml
+            ),
+            (None, None, None, None)
+        );
+        assert_eq!(signals.canonical_count, 0);
+        assert_eq!(signals.hreflang_count, 0);
+        assert!(!signals.hreflang_missing_self_reference);
+        assert!(signals.hreflang_links.is_empty());
+        assert!(signals.reference_links.is_empty());
+        assert!(signals.sitemaps.is_empty());
+    }
+
+    #[test]
+    fn active_document_relations_ignore_foreign_namespace_links() {
+        let signals = parse_html(
+            &Url::parse("https://example.test/page").unwrap(),
+            "<title>Active page</title><svg><link rel='next prev canonical amphtml alternate sitemap' hreflang='en' href='/page'/></svg>",
+        );
+        assert_eq!(
+            (
+                signals.rel_next,
+                signals.rel_prev,
+                signals.canonical,
+                signals.amphtml
+            ),
+            (None, None, None, None)
+        );
+        assert_eq!(signals.canonical_count, 0);
+        assert_eq!(signals.hreflang_count, 0);
+        assert!(signals.reference_links.is_empty());
+        assert!(signals.sitemaps.is_empty());
+    }
+
+    #[test]
+    fn active_document_relations_keep_later_targets_order_and_existing_link_resource_evidence() {
+        let base = Url::parse("https://example.test/page").unwrap();
+        let html = r#"<head><title>Active page</title><template>
+            <link rel="next prev canonical amphtml alternate sitemap" hreflang="invalid_code" href="/page">
+            </template>
+            <link rel="NEXT" href="/real-next#fragment"><link rel="next" href="/second-next">
+            <link rel="prev nofollow" href="/real-prev"><link rel="CANONICAL" href="/real-canonical">
+            <link rel="canonical" href="javascript:alert(1)"><link rel="amphtml" href="/real-amp">
+            <link rel="alternate nofollow" hreflang="en" href="/page"><link rel="sitemap" href="/real.xml">
+            </head><body><template><a href="/template-anchor">Template anchor</a><img src="/template-image.png"></template>
+            <main>Selected words</main><a href="/active-anchor">Active anchor</a><link rel="stylesheet" href="/site.css"></body>"#;
+        let content = ContentSelectors::compile(&ContentConfig {
+            include_selectors: vec!["main".into()],
+            exclude_selectors: Vec::new(),
+        })
+        .unwrap();
+        for selectors in [&ContentSelectors::default(), &content] {
+            let signals = parse_html_with_content(&base, html, selectors);
+            assert_eq!(
+                signals.rel_next.as_deref(),
+                Some("https://example.test/real-next")
+            );
+            assert_eq!(
+                signals.rel_prev.as_deref(),
+                Some("https://example.test/real-prev")
+            );
+            assert_eq!(
+                signals.canonical.as_deref(),
+                Some("https://example.test/real-canonical")
+            );
+            assert_eq!(
+                signals.canonical_count, 2,
+                "Active invalid hrefs still count as canonical tags"
+            );
+            assert_eq!(
+                signals.amphtml.as_deref(),
+                Some("https://example.test/real-amp")
+            );
+            assert_eq!(signals.hreflang_count, 1);
+            assert_eq!(signals.hreflang_invalid_count, 0);
+            assert!(!signals.hreflang_missing_self_reference);
+            assert_eq!(signals.hreflang_links.len(), 1);
+            assert_eq!(signals.sitemaps, ["https://example.test/real.xml"]);
+            assert_eq!(
+                serde_json::to_value(&signals.reference_links).unwrap(),
+                serde_json::json!([
+                    {"url":"https://example.test/real-next","kind":"pagination","relNofollow":false},
+                    {"url":"https://example.test/second-next","kind":"pagination","relNofollow":false},
+                    {"url":"https://example.test/real-prev","kind":"pagination","relNofollow":true},
+                    {"url":"https://example.test/real-canonical","kind":"canonical","relNofollow":false},
+                    {"url":"https://example.test/real-amp","kind":"amp","relNofollow":false},
+                    {"url":"https://example.test/page","kind":"hreflang","relNofollow":true}
+                ])
+            );
+            assert_eq!(
+                signals
+                    .links
+                    .iter()
+                    .map(|link| (&*link.url, link.source_position))
+                    .collect::<Vec<_>>(),
+                [
+                    ("https://example.test/template-anchor", 1),
+                    ("https://example.test/active-anchor", 2)
+                ]
+            );
+            assert_eq!(
+                signals
+                    .resources
+                    .iter()
+                    .map(|resource| (&*resource.url, resource.resource_type))
+                    .collect::<Vec<_>>(),
+                [
+                    (
+                        "https://example.test/template-image.png",
+                        PageResourceType::Image
+                    ),
+                    ("https://example.test/site.css", PageResourceType::Css)
+                ]
+            );
+        }
+        assert_eq!(
+            canonical_link_headers(&base, ["</header-canonical>; rel=canonical"]),
+            ["https://example.test/header-canonical"]
+        );
+    }
+
+    #[test]
+    fn legacy_previous_relation_preserves_document_order_and_reference_discovery() {
+        for (first, second) in [("PREVIOUS", "prev"), ("prev", "PrEvIoUs")] {
+            let signals = scoped_signals(
+                &format!(
+                    "<body><template><link rel='previous' href='/inert'></template>
+                    <svg><link rel='previous' href='/foreign'/></svg>
+                    <link rel='previous' href='javascript:alert(1)'>
+                    <link rel='{first} nofollow' href='/first#fragment'>
+                    <link rel='{second}' href='/second'>
+                    <link rel='notprevious' href='/unrelated'>
+                    <main>Selected text</main></body>"
+                ),
+                &["main"],
+                &[],
+            );
+            assert_eq!(
+                signals.rel_prev.as_deref(),
+                Some("https://example.test/first")
+            );
+            assert!(signals.rel_next.is_none());
+            assert_eq!(
+                serde_json::to_value(&signals.reference_links).unwrap(),
+                serde_json::json!([
+                    {"url":"https://example.test/first","kind":"pagination","relNofollow":true},
+                    {"url":"https://example.test/second","kind":"pagination","relNofollow":false}
+                ])
+            );
+            assert_eq!(signals.visible_text, "Selected text");
+            assert!(signals.links.is_empty());
+        }
+    }
+
+    #[test]
+    fn reference_links_keep_all_typed_targets_outside_the_selected_content() {
+        let signals = scoped_signals(
+            r##"<head>
+                <link rel="CANONICAL alternate" href="/first#fragment">
+                <link rel="canonical" href="/second">
+                <link rel="alternate nofollow" hreflang="invalid_code" href="/language">
+                <link rel="NEXT prev amphtml" href="/shared">
+                <link rel="alternate" media="screen" href="/mobile">
+                <link rel="canonical" href="javascript:alert(1)">
+                <link rel="amphtml" href="file:///local">
+                <link rel="next" href="#local">
+            </head><body><main>Selected text</main><a href="/anchor">Anchor</a></body>"##,
+            &["main"],
+            &[],
+        );
+        let serialized = serde_json::to_value(&signals).unwrap();
+        assert_eq!(
+            serialized["referenceLinks"],
+            serde_json::json!([
+                {"url":"https://example.test/first","kind":"canonical","relNofollow":false},
+                {"url":"https://example.test/second","kind":"canonical","relNofollow":false},
+                {"url":"https://example.test/language","kind":"hreflang","relNofollow":true},
+                {"url":"https://example.test/shared","kind":"pagination","relNofollow":false},
+                {"url":"https://example.test/shared","kind":"amp","relNofollow":false}
+            ])
+        );
+        assert_eq!(signals.canonical_count, 3);
+        assert_eq!(signals.hreflang_invalid_count, 1);
+        assert_eq!(signals.visible_text, "Selected text");
+        assert_eq!(signals.links.len(), 1);
+        assert_eq!(signals.links[0].url, "https://example.test/anchor");
+        assert!(signals.resources.is_empty());
+    }
+
+    #[test]
+    fn canonical_http_links_handle_repeated_fields_quotes_and_context() {
+        let base = Url::parse("https://example.test/docs/file.pdf").unwrap();
+        assert_eq!(
+            canonical_link_headers(
+                &base,
+                [
+                    r#"</next>; rel=next, </docs/canonical?a=1,2>; title="A, B; \"quoted\""; rel="alternate CANONICAL""#,
+                    "<../other>; rel=canonical",
+                    "</unrelated>; rel=canonical; anchor=\"/elsewhere\"",
+                    "</ignored>; rel=next; rel=canonical",
+                    "<javascript:alert(1)>; rel=canonical",
+                    "</broken>; rel=\"canonical",
+                ]
+            ),
+            [
+                "https://example.test/docs/canonical?a=1,2",
+                "https://example.test/other"
+            ]
+        );
+        assert_eq!(
+            canonical_link_headers(&base, ["<>; rel=canonical"]),
+            [base.to_string()]
+        );
+    }
 
     #[test]
     fn extracts_basic_page_signals() {

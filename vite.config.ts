@@ -5,7 +5,14 @@ export default defineConfig({
   plugins: [react()],
   clearScreen: false,
   build: {
-    rolldownOptions: { input: { main: "index.html", splash: "splash.html" } },
+    rolldownOptions: {
+      input: { main: "index.html", splash: "splash.html" },
+      output: {
+        codeSplitting: {
+          groups: [{ name: "react-runtime", test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ }],
+        },
+      },
+    },
   },
   server: {
     host: "127.0.0.1",

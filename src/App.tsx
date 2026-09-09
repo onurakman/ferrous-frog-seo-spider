@@ -1,12 +1,12 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { MultiDirectedGraph } from "graphology";
-import forceAtlas2 from "graphology-layout-forceatlas2";
+import CrawlHome, { type SavedCrawl } from "./CrawlHome";
+import AdvancedFilters, { type GridFilterGroup } from "./AdvancedFilters";
+import { PageSpeedPanel, PageSpeedSettings, usePageSpeedCredentials, type PageSpeedSnapshot, type PageSpeedStrategy } from "./PageSpeed";
+import type { CrawlGraph, GraphLayoutMode, GraphStatusFilter } from "./crawl-graph-model";
 import * as Checkbox from "@radix-ui/react-checkbox";
-import * as Dialog from "@radix-ui/react-dialog";
+import * as Dialog from "./Dialog";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
-import Sigma from "sigma";
-import { EdgeArrowProgram, type EdgeProgramType } from "sigma/rendering";
 import {
   type ColumnDef,
   columnSizingFeature,
@@ -54,16 +54,23 @@ import {
 import {
   type CSSProperties,
   type KeyboardEvent,
+  type MouseEvent,
   type PointerEvent,
   type ReactNode,
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useEffectEvent,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
 import { create } from "zustand";
+
+const GraphDialog = lazy(() => import("./CrawlGraph"));
+const SerpPreviewDialog = lazy(() => import("./SerpPreviewDialog"));
 
 type Theme = "light" | "dark";
 type ThemePreference = Theme | "system";
@@ -75,22 +82,13 @@ type StorageMode = "memory" | "database";
 type CrawlMode = "spider" | "list";
 type ExtractorKind = "cssText" | "cssAttribute" | "xpath" | "regex";
 type JsRenderingBackend = "chromeCdp";
-type SubdomainScope = "includeSubdomains" | "exactHost";
-type FolderScope = "anywhere" | "startFolder" | "exactFolder";
+type RenderingStatus = { available: boolean; browserPath: string | null; message: string };
+type SubdomainScope = "includeSubdomains" | "exactHost" | "allSubdomains";
+type FolderScope = "anywhere" | "startFolder" | "exactFolder" | "exactUrl";
 type UrlClassification = "internal" | "external";
 type LinkType = "internal" | "external";
 type SortDirection = "asc" | "desc";
 type ResultsViewMode = "table" | "tree";
-type GraphStatusFilter =
-  | "all"
-  | "success"
-  | "redirect"
-  | "broken"
-  | "brokenLinks"
-  | "redirectLinks"
-  | "external"
-  | "uncrawled";
-type GraphLayoutMode = "depth" | "radial";
 type LinkEdgeView = "all" | "internal" | "external" | "broken" | "nofollow";
 type LinkReportKind =
   | LinkEdgeView
@@ -110,12 +108,14 @@ type IssueView =
   | "noResponse"
   | "titleMissing"
   | "titleDuplicate"
+  | "titleMultiple"
   | "titleTooShort"
   | "titleTooLong"
   | "titlePixelTooNarrow"
   | "titlePixelTooWide"
   | "metaMissing"
   | "metaDuplicate"
+  | "metaMultiple"
   | "metaTooShort"
   | "metaTooLong"
   | "metaPixelTooNarrow"
@@ -129,6 +129,19 @@ type IssueView =
   | "titleSameAsH1"
   | "canonicalMissing"
   | "canonicalMultiple"
+  | "canonicalUncrawled"
+  | "canonicalToRedirect"
+  | "canonicalToError"
+  | "canonicalNonIndexable"
+  | "canonicalChain"
+  | "canonicalLoop"
+  | "paginationNextToError"
+  | "paginationPrevToError"
+  | "paginationNextLoop"
+  | "paginationPrevLoop"
+  | "paginationNextNonReciprocal"
+  | "paginationPrevNonReciprocal"
+  | "ampToError"
   | "directivesNoindex"
   | "imagesMissingAlt"
   | "imagesAltTooLong"
@@ -149,6 +162,7 @@ type IssueView =
   | "htmlDuplicateIds"
   | "renderedDomChanged"
   | "nearDuplicate"
+  | "exactDuplicate"
   | "brokenLinks"
   | "sitemapOrphan";
 
@@ -194,9 +208,11 @@ type CrawlRecord = {
   redirectChain: RedirectHop[];
   title?: string | null;
   titleLen: number;
+  titleCount?: number | null;
   titlePixelWidth: number;
   metaDescription?: string | null;
   metaDescriptionLen: number;
+  metaDescriptionCount?: number | null;
   metaDescriptionPixelWidth: number;
   metaRobots?: string | null;
   xRobotsTag?: string | null;
@@ -255,6 +271,7 @@ type CrawlRecord = {
   searchConsoleImpressions?: number | null;
   searchConsoleCtr?: number | null;
   searchConsoleAveragePosition?: number | null;
+  pageSpeed?: PageSpeedSnapshot | null;
   error?: string | null;
 };
 
@@ -296,18 +313,34 @@ type CrawlSummary = {
   noResponse: number;
   broken: number;
   nearDuplicates: number;
+  exactDuplicates: number;
   indexable: number;
   nonIndexable: number;
   titleMissing: number;
   titleDuplicate: number;
+  titleMultiple: number;
   metaMissing: number;
   metaDuplicate: number;
+  metaMultiple: number;
   h1Missing: number;
   h1Duplicate: number;
   h2Missing: number;
   h2Duplicate: number;
   canonicalMissing: number;
   canonicalMultiple: number;
+  canonicalUncrawled: number;
+  canonicalToRedirect: number;
+  canonicalToError: number;
+  canonicalNonIndexable: number;
+  canonicalChain: number;
+  canonicalLoop: number;
+  paginationNextToError: number;
+  paginationPrevToError: number;
+  paginationNextLoop: number;
+  paginationPrevLoop: number;
+  paginationNextNonReciprocal: number;
+  paginationPrevNonReciprocal: number;
+  ampToError: number;
   noindex: number;
   imagesMissingAlt: number;
   imagesAltTooLong: number;
@@ -342,15 +375,7 @@ type ProgressSample = {
   pagesPerSecond: number;
 };
 
-type CrawlSession = {
-  id: string;
-  name: string;
-  startUrl: string;
-  databasePath: string;
-  createdAtMs: number;
-  updatedAtMs: number;
-  isCurrent: boolean;
-};
+type CrawlSession = SavedCrawl & { config?: CrawlConfig | null };
 
 type ConfigProfile = {
   id: string;
@@ -507,28 +532,13 @@ type SitemapValidationResponse = {
   total: number;
 };
 
-type GraphNode = {
-  url: string;
-  label: string;
-  crawled: boolean;
-  classification?: UrlClassification | null;
-  statusCode?: number | null;
-  depth?: number | null;
-  indexability?: string | null;
-  inlinkCount: number;
-  outlinkCount: number;
-};
-
-type CrawlGraph = {
-  nodes: GraphNode[];
-  edges: LinkEdge[];
-  totalNodes: number;
-  totalEdges: number;
-};
-
 type ExportKind =
   | "csv"
+  | "selectedCsv"
+  | "queuedUrlsCsv"
+  | "imageAltCsv"
   | "xlsx"
+  | "auditWorkbook"
   | "sitemap"
   | "linkEdgesCsv"
   | "redirectChainsCsv"
@@ -545,6 +555,7 @@ type ExportFileResult = {
 };
 
 type CrawlArchiveImportResult = {
+  session: CrawlSession;
   records: number;
   linkEdges: number;
   imageAssets: number;
@@ -608,6 +619,7 @@ type SearchConsoleMergeResult = {
 
 type DatabaseLocation = {
   path: string;
+  session?: CrawlSession;
 };
 
 type CrawlRecoveryState = {
@@ -624,28 +636,6 @@ type CrawlCapacityEstimate = {
   deviceBudgetBytes?: number;
   tone: "success" | "warning" | "danger";
   recommendation: string;
-};
-
-type GraphNodeAttributes = {
-  label: string;
-  url: string;
-  status: string;
-  depth: string;
-  inlinks: number;
-  outlinks: number;
-  x: number;
-  y: number;
-  size: number;
-  color: string;
-  forceLabel: boolean;
-};
-
-type GraphEdgeAttributes = {
-  label: string;
-  status: string;
-  size: number;
-  color: string;
-  type: "arrow";
 };
 
 type OverviewTone = "success" | "warning" | "danger" | "muted";
@@ -667,6 +657,9 @@ type OverviewStatusSegment = {
 type SettingsTab =
   | "crawl"
   | "scope"
+  | "sitemaps"
+  | "requests"
+  | "content"
   | "resources"
   | "query"
   | "storage"
@@ -680,6 +673,9 @@ type CrawlConfig = {
   startUrl: string;
   listUrls: string[];
   listSitemapUrls: string[];
+  sitemap: SitemapConfig;
+  content: { includeSelectors: string[]; excludeSelectors: string[] };
+  referenceLinks: { canonical: boolean; hreflang: boolean; pagination: boolean; amp: boolean };
   maxUrls: number;
   maxDepth: number;
   concurrency: number;
@@ -689,7 +685,9 @@ type CrawlConfig = {
   useRobotsTxtOverride: boolean;
   robotsTxtOverride: string;
   userAgent: string;
+  requestHeaders: Array<{ name: string; value: string }>;
   timeoutSecs: number;
+  maxResponseBytes: number;
   maxRedirects: number;
   retryAttempts: number;
   retryBackoffMs: number;
@@ -698,12 +696,23 @@ type CrawlConfig = {
   excludeUrlPatterns: string[];
   subdomainScope: SubdomainScope;
   folderScope: FolderScope;
+  checkLinksOutsideStartFolder: boolean;
   followNofollow: boolean;
+  followInternalNofollow: boolean;
+  followExternalNofollow: boolean;
   resourceTypes: ResourceTypeConfig;
   querySettings: QuerySettingsConfig;
   customExtractors: CustomExtractor[];
   customSearches: CustomSearch[];
   rendering: JsRenderingConfig;
+};
+
+type SitemapConfig = {
+  enabled: boolean;
+  discoverFromRobots: boolean;
+  probeDefault: boolean;
+  followLinked: boolean;
+  urls: string[];
 };
 
 type ResourceTypeConfig = {
@@ -757,6 +766,7 @@ type AppState = {
   storageMode: StorageMode;
   resumeCrawl: boolean;
   config: CrawlConfig;
+  modeStartUrls: Record<CrawlMode, string>;
   rows: CrawlRecord[];
   selected?: CrawlRecord;
   selectedView: IssueView;
@@ -789,11 +799,29 @@ type AppState = {
   setResumeCrawl: (resumeCrawl: boolean) => void;
 };
 
+type CrawlPreferences = Pick<AppState, "config" | "modeStartUrls" | "storageMode" | "resumeCrawl">;
+type ColumnLayout = { active: string; custom: string[]; presets: Array<{ name: string; columns: string[] }> };
+
+function patchCrawlConfig(current: Pick<CrawlPreferences, "config" | "modeStartUrls">, patch: Partial<CrawlConfig>) {
+  const config = { ...current.config, ...patch };
+  const modeStartUrls = { ...current.modeStartUrls, [current.config.mode]: current.config.startUrl };
+  if (config.mode !== current.config.mode && patch.startUrl === undefined) config.startUrl = modeStartUrls[config.mode];
+  modeStartUrls[config.mode] = config.startUrl;
+  return { config, modeStartUrls };
+}
+
+function saveCrawlPreferences(preferences: CrawlPreferences): boolean {
+  const value = JSON.stringify({ version: 1, config: preferences.config, modeStartUrls: preferences.modeStartUrls,
+    storageMode: preferences.storageMode, resumeCrawl: preferences.resumeCrawl });
+  return readPreference(settingsStorageKey) === value || savePreference(settingsStorageKey, value);
+}
+
 const themeStorageKey = "ferrous-frog-theme";
 const lastUrlStorageKey = "ferrous-frog-last-url";
 const overviewWidthStorageKey = "ferrous-frog-overview-width";
 const urlSegmentsStorageKey = "ferrous-frog-url-segments";
 const settingsStorageKey = "ferrous-frog-settings";
+const columnLayoutStorageKey = "ferrous-frog-column-layouts";
 const updateReminderKey = "ferrous-frog-update-reminder-until";
 const updateReminderDelay = 24 * 60 * 60 * 1000;
 const overviewMinWidth = 260;
@@ -811,6 +839,7 @@ const detailTabs = [
   { id: "links", label: "Links & indexing" },
   { id: "technical", label: "Technical" },
   { id: "custom", label: "Custom data" },
+  { id: "pagespeed", label: "PageSpeed" },
 ] as const;
 
 const emptySummary: CrawlSummary = {
@@ -824,18 +853,34 @@ const emptySummary: CrawlSummary = {
   noResponse: 0,
   broken: 0,
   nearDuplicates: 0,
+  exactDuplicates: 0,
   indexable: 0,
   nonIndexable: 0,
   titleMissing: 0,
   titleDuplicate: 0,
+  titleMultiple: 0,
   metaMissing: 0,
   metaDuplicate: 0,
+  metaMultiple: 0,
   h1Missing: 0,
   h1Duplicate: 0,
   h2Missing: 0,
   h2Duplicate: 0,
   canonicalMissing: 0,
   canonicalMultiple: 0,
+  canonicalUncrawled: 0,
+  canonicalToRedirect: 0,
+  canonicalToError: 0,
+  canonicalNonIndexable: 0,
+  canonicalChain: 0,
+  canonicalLoop: 0,
+  paginationNextToError: 0,
+  paginationPrevToError: 0,
+  paginationNextLoop: 0,
+  paginationPrevLoop: 0,
+  paginationNextNonReciprocal: 0,
+  paginationPrevNonReciprocal: 0,
+  ampToError: 0,
   noindex: 0,
   imagesMissingAlt: 0,
   imagesAltTooLong: 0,
@@ -852,21 +897,47 @@ const emptySummary: CrawlSummary = {
   sitemapOrphans: 0,
 };
 
+const crawlScopePresets: Array<{ id: string; label: string; description: string; subdomainScope: SubdomainScope; folderScope: FolderScope }> = [
+  { id: "exactHost", label: "Current host", description: "Crawl the seed hostname only, across all folders.", subdomainScope: "exactHost", folderScope: "anywhere" },
+  { id: "startFolder", label: "Start folder", description: "Crawl the seed hostname within the starting folder and its children.", subdomainScope: "exactHost", folderScope: "startFolder" },
+  { id: "allSubdomains", label: "All subdomains", description: "Crawl the registered domain and its subdomains, respecting public and private suffix boundaries. IP and local hosts stay on the same host.", subdomainScope: "allSubdomains", folderScope: "anywhere" },
+  { id: "exactUrl", label: "Exact URL", description: "Crawl only the seed and its redirects; skip sitemap discovery. Discovered links are recorded. DOM rendering can still load page resources.", subdomainScope: "exactHost", folderScope: "exactUrl" },
+  { id: "includeSubdomains", label: "Host + subdomains", description: "Crawl the starting host and its descendants. A leading www. also includes the bare host. Preserves existing profiles.", subdomainScope: "includeSubdomains", folderScope: "anywhere" },
+];
+
+function crawlScopePreset(config: CrawlConfig) {
+  return crawlScopePresets.find((scope) => config.folderScope === "exactUrl" ? scope.id === "exactUrl" :
+    scope.subdomainScope === config.subdomainScope && scope.folderScope === config.folderScope);
+}
+
+const chromeDesktopUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
+const ferrousFrogUserAgent = "FerrousFrogSeoSpider/0.1 (+https://example.invalid/ferrous-frog)";
+const chromeRequestHeaders = [
+  { name: "Accept", value: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8" },
+  { name: "Accept-Language", value: "en-US,en;q=0.9" },
+  { name: "Upgrade-Insecure-Requests", value: "1" },
+];
+
 const defaultConfig: CrawlConfig = {
   mode: "spider",
   startUrl: getInitialStartUrl(),
   listUrls: [],
   listSitemapUrls: [],
+  sitemap: { enabled: true, discoverFromRobots: true, probeDefault: true, followLinked: true, urls: [] },
+  content: { includeSelectors: [], excludeSelectors: [] },
+  referenceLinks: { canonical: false, hreflang: false, pagination: false, amp: false },
   maxUrls: 5000,
   maxDepth: 3,
-  concurrency: 4,
-  requestsPerSecond: 2,
-  requestDelayMs: 250,
+  concurrency: 8,
+  requestsPerSecond: 10,
+  requestDelayMs: 100,
   respectRobots: true,
   useRobotsTxtOverride: false,
   robotsTxtOverride: "",
-  userAgent: "FerrousFrogSeoSpider/0.1 (+https://example.invalid/ferrous-frog)",
+  userAgent: chromeDesktopUserAgent,
+  requestHeaders: chromeRequestHeaders,
   timeoutSecs: 20,
+  maxResponseBytes: 20 * 1024 * 1024,
   maxRedirects: 10,
   retryAttempts: 1,
   retryBackoffMs: 250,
@@ -875,7 +946,10 @@ const defaultConfig: CrawlConfig = {
   excludeUrlPatterns: [],
   subdomainScope: "includeSubdomains",
   folderScope: "anywhere",
+  checkLinksOutsideStartFolder: false,
   followNofollow: true,
+  followInternalNofollow: true,
+  followExternalNofollow: true,
   resourceTypes: {
     html: true,
     images: false,
@@ -903,13 +977,19 @@ function normalizeCrawlConfig(config: Partial<CrawlConfig>): CrawlConfig {
   return {
     ...defaultConfig,
     ...config,
-    listUrls: [...(config.listUrls ?? [])],
-    listSitemapUrls: [...(config.listSitemapUrls ?? [])],
-    includeUrlPatterns: [...(config.includeUrlPatterns ?? [])],
-    excludeUrlPatterns: [...(config.excludeUrlPatterns ?? [])],
+    listUrls: cleanPatterns(config.listUrls),
+    listSitemapUrls: cleanPatterns(config.listSitemapUrls),
+    sitemap: { ...defaultConfig.sitemap, ...config.sitemap, urls: cleanPatterns(config.sitemap?.urls) },
+    content: { includeSelectors: cleanPatterns(config.content?.includeSelectors), excludeSelectors: cleanPatterns(config.content?.excludeSelectors) },
+    referenceLinks: { ...defaultConfig.referenceLinks, ...config.referenceLinks },
+    includeUrlPatterns: cleanPatterns(config.includeUrlPatterns),
+    excludeUrlPatterns: cleanPatterns(config.excludeUrlPatterns),
     subdomainScope: config.subdomainScope ?? defaultConfig.subdomainScope,
     folderScope: config.folderScope ?? defaultConfig.folderScope,
+    requestHeaders: (config.requestHeaders ?? defaultConfig.requestHeaders).map((header) => ({ name: header.name.trim(), value: header.value })),
     followNofollow: config.followNofollow ?? defaultConfig.followNofollow,
+    followInternalNofollow: config.followInternalNofollow ?? config.followNofollow ?? defaultConfig.followInternalNofollow,
+    followExternalNofollow: config.followExternalNofollow ?? config.followNofollow ?? defaultConfig.followExternalNofollow,
     resourceTypes: {
       ...defaultConfig.resourceTypes,
       ...(config.resourceTypes ?? {}),
@@ -917,9 +997,7 @@ function normalizeCrawlConfig(config: Partial<CrawlConfig>): CrawlConfig {
     querySettings: {
       ...defaultConfig.querySettings,
       ...(config.querySettings ?? {}),
-      stripParameterPatterns: [
-        ...(config.querySettings?.stripParameterPatterns ?? []),
-      ],
+      stripParameterPatterns: cleanPatterns(config.querySettings?.stripParameterPatterns),
     },
     customExtractors: [...(config.customExtractors ?? [])],
     customSearches: [...(config.customSearches ?? [])],
@@ -930,8 +1008,8 @@ function normalizeCrawlConfig(config: Partial<CrawlConfig>): CrawlConfig {
   };
 }
 
-function getInitialSettings(): Pick<AppState, "config" | "storageMode" | "resumeCrawl" | "settingsError"> {
-  const defaults = { config: defaultConfig, storageMode: "memory" as StorageMode, resumeCrawl: false };
+function getInitialSettings(): Pick<AppState, "config" | "modeStartUrls" | "storageMode" | "resumeCrawl" | "settingsError"> {
+  const defaults = { config: defaultConfig, modeStartUrls: { spider: defaultConfig.startUrl, list: "" }, storageMode: "database" as StorageMode, resumeCrawl: false };
   try {
     const raw = window.localStorage.getItem(settingsStorageKey);
     if (!raw) return defaults;
@@ -941,7 +1019,9 @@ function getInitialSettings(): Pick<AppState, "config" | "storageMode" | "resume
     }
     // Older snapshots can omit new fields; malformed values must never reach the controls.
     for (const [value, template] of [[saved.config, defaultConfig], [saved.config.resourceTypes ?? {}, defaultConfig.resourceTypes],
-      [saved.config.querySettings ?? {}, defaultConfig.querySettings], [saved.config.rendering ?? {}, defaultConfig.rendering]]) {
+      [saved.config.querySettings ?? {}, defaultConfig.querySettings], [saved.config.rendering ?? {}, defaultConfig.rendering],
+      [saved.config.sitemap ?? {}, defaultConfig.sitemap], [saved.config.content ?? {}, defaultConfig.content],
+      [saved.config.referenceLinks ?? {}, defaultConfig.referenceLinks]]) {
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid settings section");
       for (const [key, fallback] of Object.entries(template)) {
         const entry = (value as Record<string, unknown>)[key];
@@ -951,18 +1031,23 @@ function getInitialSettings(): Pick<AppState, "config" | "storageMode" | "resume
       }
     }
     const config = normalizeCrawlConfig(saved.config);
-    if (![config.listUrls, config.listSitemapUrls, config.includeUrlPatterns, config.excludeUrlPatterns,
-      config.querySettings.stripParameterPatterns].every((list) => list.every((value) => typeof value === "string")) ||
+    if (![config.listUrls, config.listSitemapUrls, config.sitemap.urls, config.includeUrlPatterns, config.excludeUrlPatterns,
+      config.querySettings.stripParameterPatterns, config.content.includeSelectors, config.content.excludeSelectors].every((list) => list.every((value) => typeof value === "string")) ||
+      !config.requestHeaders.every((header) => typeof header.name === "string" && typeof header.value === "string") ||
       !config.customExtractors.every((item) => item && typeof item.name === "string" && typeof item.pattern === "string" &&
         ["cssText", "cssAttribute", "xpath", "regex"].includes(item.kind) && typeof item.allMatches === "boolean" &&
         (item.attribute == null || typeof item.attribute === "string")) ||
       !config.customSearches.every((item) => item && typeof item.name === "string" && typeof item.pattern === "string" &&
         typeof item.regex === "boolean" && typeof item.caseSensitive === "boolean" && Number.isFinite(item.maxSnippets)) ||
-      !["spider", "list"].includes(config.mode) || !["includeSubdomains", "exactHost"].includes(config.subdomainScope) ||
-      !["anywhere", "startFolder", "exactFolder"].includes(config.folderScope) || config.rendering.backend !== "chromeCdp") {
+      !["spider", "list"].includes(config.mode) || !["includeSubdomains", "exactHost", "allSubdomains"].includes(config.subdomainScope) ||
+      !["anywhere", "startFolder", "exactFolder", "exactUrl"].includes(config.folderScope) || config.rendering.backend !== "chromeCdp") {
       throw new Error("Invalid crawl configuration");
     }
-    return { config, storageMode: saved.storageMode === "database" ? "database" : "memory", resumeCrawl: saved.resumeCrawl === true };
+    const remembered = saved.modeStartUrls ?? {};
+    if (typeof remembered !== "object" || Array.isArray(remembered) ||
+      [remembered.spider, remembered.list].some((value) => value !== undefined && typeof value !== "string")) throw new Error("Invalid mode inputs");
+    const modeStartUrls = { spider: remembered.spider ?? defaultConfig.startUrl, list: remembered.list ?? "", [config.mode]: config.startUrl };
+    return { config, modeStartUrls, storageMode: "database", resumeCrawl: false };
   } catch {
     return { ...defaults, settingsError: "Saved settings could not be read. Default settings are in use; your next change will save a new copy." };
   }
@@ -984,7 +1069,7 @@ const useAppStore = create<AppState>((set, get) => ({
   running: false,
   paused: false,
   setConfig: (config) =>
-    set((state) => ({ config: { ...state.config, ...config } })),
+    set((state) => patchCrawlConfig(state, config)),
   setRows: (response) =>
     set((state) => ({
       rows: response.rows,
@@ -1008,7 +1093,7 @@ const useAppStore = create<AppState>((set, get) => ({
   setProgress: (progress) =>
     set({
       progress,
-      summary: progress?.summary ?? get().summary,
+      summary: progress ? { ...progress.summary, ...Object.fromEntries(querySummaryKeys.map((key) => [key, get().summary[key]])) } : get().summary,
     }),
   setRunning: (running) => set({ running }),
   setPaused: (paused) => set({ paused }),
@@ -1026,9 +1111,7 @@ const useAppStore = create<AppState>((set, get) => ({
 
 useAppStore.subscribe((state, previous) => {
   if (state.config === previous.config && state.storageMode === previous.storageMode && state.resumeCrawl === previous.resumeCrawl) return;
-  const saved = savePreference(settingsStorageKey, JSON.stringify({
-    version: 1, config: state.config, storageMode: state.storageMode, resumeCrawl: state.resumeCrawl,
-  }));
+  const saved = saveCrawlPreferences(state);
   if (saved && state.settingsError) useAppStore.setState({ settingsError: undefined });
 });
 
@@ -1043,6 +1126,7 @@ const views: Array<{ id: IssueView; label: string }> = [
   { id: "noResponse", label: "No Response" },
   { id: "titleMissing", label: "Missing Titles" },
   { id: "titleDuplicate", label: "Duplicate Titles" },
+  { id: "titleMultiple", label: "Multiple Titles" },
   { id: "titleTooShort", label: "Short Titles" },
   { id: "titleTooLong", label: "Long Titles" },
   { id: "titlePixelTooNarrow", label: "Narrow Title px" },
@@ -1050,6 +1134,7 @@ const views: Array<{ id: IssueView; label: string }> = [
   { id: "titleSameAsH1", label: "Title = H1" },
   { id: "metaMissing", label: "Missing Meta" },
   { id: "metaDuplicate", label: "Duplicate Meta" },
+  { id: "metaMultiple", label: "Multiple Descriptions" },
   { id: "metaTooShort", label: "Short Meta" },
   { id: "metaTooLong", label: "Long Meta" },
   { id: "metaPixelTooNarrow", label: "Narrow Meta px" },
@@ -1062,6 +1147,19 @@ const views: Array<{ id: IssueView; label: string }> = [
   { id: "h2TooLong", label: "Long H2" },
   { id: "canonicalMissing", label: "Missing Canonical" },
   { id: "canonicalMultiple", label: "Multiple Canonicals" },
+  { id: "canonicalUncrawled", label: "Canonical Target Not Crawled" },
+  { id: "canonicalToRedirect", label: "Canonical to Redirect" },
+  { id: "canonicalToError", label: "Canonical to Error" },
+  { id: "canonicalNonIndexable", label: "Canonical to Non-Indexable" },
+  { id: "canonicalChain", label: "Canonical Chains" },
+  { id: "canonicalLoop", label: "Canonical Loops" },
+  { id: "paginationNextToError", label: "Next URL to Error" },
+  { id: "paginationPrevToError", label: "Previous URL to Error" },
+  { id: "paginationNextLoop", label: "Next URL Loops" },
+  { id: "paginationPrevLoop", label: "Previous URL Loops" },
+  { id: "paginationNextNonReciprocal", label: "Next URL Non-Reciprocal" },
+  { id: "paginationPrevNonReciprocal", label: "Previous URL Non-Reciprocal" },
+  { id: "ampToError", label: "AMP URL to Error" },
   { id: "directivesNoindex", label: "Noindex" },
   { id: "imagesMissingAlt", label: "Missing Alt" },
   { id: "imagesAltTooLong", label: "Long Alt" },
@@ -1082,6 +1180,7 @@ const views: Array<{ id: IssueView; label: string }> = [
   { id: "htmlDuplicateIds", label: "Duplicate IDs" },
   { id: "renderedDomChanged", label: "Rendered Changes" },
   { id: "nearDuplicate", label: "Near Duplicates" },
+  { id: "exactDuplicate", label: "Exact Response Duplicates" },
   { id: "brokenLinks", label: "Broken Links" },
   { id: "sitemapOrphan", label: "Sitemap Orphans" },
 ];
@@ -1089,29 +1188,39 @@ const views: Array<{ id: IssueView; label: string }> = [
 const issueGroups: Array<{ label: string; tabLabel?: string; views: IssueView[]; columns: Array<keyof CrawlRecord> }> = [
   { label: "Crawl overview", tabLabel: "URLs", views: ["all", "internal", "external"], columns: ["title", "contentType", "indexability", "depth", "inlinkCount", "outlinkCount", "responseTimeMs"] },
   { label: "Response codes", tabLabel: "Responses", views: ["brokenLinks", "status2xx", "status3xx", "status4xx", "status5xx", "noResponse"], columns: ["finalUrl", "firstInlinkSourceUrl", "redirectTarget", "responseTimeMs", "depth", "inlinkCount"] },
-  { label: "Page titles", tabLabel: "Titles", views: ["titleMissing", "titleDuplicate", "titleTooShort", "titleTooLong", "titlePixelTooNarrow", "titlePixelTooWide", "titleSameAsH1"], columns: ["title", "titleLen", "titlePixelWidth", "h1", "indexability"] },
-  { label: "Meta descriptions", tabLabel: "Descriptions", views: ["metaMissing", "metaDuplicate", "metaTooShort", "metaTooLong", "metaPixelTooNarrow", "metaPixelTooWide"], columns: ["metaDescription", "metaDescriptionLen", "metaDescriptionPixelWidth", "indexability"] },
+  { label: "Page titles", tabLabel: "Titles", views: ["titleMissing", "titleDuplicate", "titleMultiple", "titleTooShort", "titleTooLong", "titlePixelTooNarrow", "titlePixelTooWide", "titleSameAsH1"], columns: ["title", "titleCount", "titleLen", "titlePixelWidth", "h1", "indexability"] },
+  { label: "Meta descriptions", tabLabel: "Descriptions", views: ["metaMissing", "metaDuplicate", "metaMultiple", "metaTooShort", "metaTooLong", "metaPixelTooNarrow", "metaPixelTooWide"], columns: ["metaDescription", "metaDescriptionCount", "metaDescriptionLen", "metaDescriptionPixelWidth", "indexability"] },
   { label: "Headings", views: ["h1Missing", "h1Duplicate", "h1TooLong", "h2Missing", "h2Duplicate", "h2TooLong"], columns: ["h1", "h1Count", "h2", "h2Count", "indexability"] },
-  { label: "Canonicals & directives", tabLabel: "Indexing", views: ["canonicalMissing", "canonicalMultiple", "directivesNoindex"], columns: ["canonical", "canonicalCount", "metaRobots", "xRobotsTag", "indexability", "indexabilityStatus"] },
+  { label: "Canonicals & directives", tabLabel: "Indexing", views: ["canonicalMissing", "canonicalMultiple", "canonicalUncrawled", "canonicalToRedirect", "canonicalToError", "canonicalNonIndexable", "canonicalChain", "canonicalLoop", "directivesNoindex"], columns: ["canonical", "canonicalCount", "metaRobots", "xRobotsTag", "indexability", "indexabilityStatus"] },
   { label: "Images", views: ["imagesMissingAlt", "imagesAltTooLong"], columns: ["imageCount", "imagesMissingAlt", "imagesAltTooLong", "outlinkCount"] },
+  { label: "Pagination", views: ["paginationNextToError", "paginationPrevToError", "paginationNextLoop", "paginationPrevLoop", "paginationNextNonReciprocal", "paginationPrevNonReciprocal"], columns: ["finalUrl", "relNext", "relPrev", "indexability"] },
+  { label: "AMP", views: ["ampToError"], columns: ["finalUrl", "amphtml", "indexability"] },
   { label: "Security", views: ["securityMixedContent", "securityInsecureForms", "securityMissingHsts", "securityMissingCsp", "securityMissingXFrameOptions", "securityMissingContentTypeOptions"], columns: ["mixedContentCount", "insecureFormCount", "hstsHeader", "contentSecurityPolicyHeader", "xFrameOptionsHeader", "xContentTypeOptionsHeader"] },
   { label: "International", tabLabel: "Hreflang", views: ["hreflangInvalid", "hreflangMissingSelfReference", "hreflangMissingReturnLink", "hreflangNonCanonicalTarget"], columns: ["hreflangCount", "hreflangInvalidCount", "canonical", "indexability"] },
   { label: "Structured data & HTML", tabLabel: "Markup", views: ["structuredDataInvalid", "structuredDataWarning", "htmlDeprecatedTags", "htmlDuplicateIds"], columns: ["jsonLdInvalidCount", "structuredDataErrorCount", "structuredDataWarningCount", "deprecatedHtmlTagCount", "duplicateIdCount"] },
-  { label: "Content & rendering", tabLabel: "Content", views: ["nearDuplicate", "renderedDomChanged", "mobileMissingViewport"], columns: ["wordCount", "nearDuplicateClusterId", "jsRendered", "renderedWordCountDelta", "renderedLinkCountDelta", "viewport"] },
+  { label: "Content & rendering", tabLabel: "Content", views: ["exactDuplicate", "nearDuplicate", "renderedDomChanged", "mobileMissingViewport"], columns: ["wordCount", "responseHash", "sizeBytes", "nearDuplicateClusterId", "jsRendered", "renderedWordCountDelta", "renderedLinkCountDelta", "viewport"] },
   { label: "Sitemaps", views: ["sitemapOrphan"], columns: ["inSitemap", "canonical", "indexability", "inlinkCount"] },
 ];
 
+const canonicalSummaryKeys = ["canonicalUncrawled", "canonicalToRedirect", "canonicalToError", "canonicalNonIndexable", "canonicalChain", "canonicalLoop"] as const;
+const querySummaryKeys = [...canonicalSummaryKeys, "exactDuplicates", "paginationNextToError", "paginationPrevToError", "paginationNextLoop", "paginationPrevLoop", "paginationNextNonReciprocal", "paginationPrevNonReciprocal", "ampToError"] as const;
 const viewSummaryKeys: Partial<Record<IssueView, keyof CrawlSummary>> = {
+  ...Object.fromEntries(canonicalSummaryKeys.map((key) => [key, key])),
+  paginationNextToError: "paginationNextToError", paginationPrevToError: "paginationPrevToError",
+  paginationNextLoop: "paginationNextLoop", paginationPrevLoop: "paginationPrevLoop",
+  paginationNextNonReciprocal: "paginationNextNonReciprocal", paginationPrevNonReciprocal: "paginationPrevNonReciprocal",
+  ampToError: "ampToError",
   all: "total", internal: "internal", external: "external", status2xx: "success", status3xx: "redirects",
   status4xx: "clientErrors", status5xx: "serverErrors", noResponse: "noResponse", brokenLinks: "broken",
   titleMissing: "titleMissing", titleDuplicate: "titleDuplicate", metaMissing: "metaMissing", metaDuplicate: "metaDuplicate",
+  titleMultiple: "titleMultiple", metaMultiple: "metaMultiple",
   h1Missing: "h1Missing", h1Duplicate: "h1Duplicate", h2Missing: "h2Missing", h2Duplicate: "h2Duplicate",
   canonicalMissing: "canonicalMissing", canonicalMultiple: "canonicalMultiple", directivesNoindex: "noindex",
   imagesMissingAlt: "imagesMissingAlt", imagesAltTooLong: "imagesAltTooLong", securityMixedContent: "mixedContent",
   securityInsecureForms: "insecureForms", securityMissingHsts: "missingHsts", mobileMissingViewport: "missingViewport",
   hreflangInvalid: "hreflangInvalid", structuredDataInvalid: "structuredDataInvalid", structuredDataWarning: "structuredDataWarnings",
   htmlDeprecatedTags: "deprecatedHtmlTags", htmlDuplicateIds: "duplicateIds", renderedDomChanged: "renderedDomChanged",
-  nearDuplicate: "nearDuplicates", sitemapOrphan: "sitemapOrphans",
+  nearDuplicate: "nearDuplicates", exactDuplicate: "exactDuplicates", sitemapOrphan: "sitemapOrphans",
 };
 
 type GridColumn =
@@ -1144,6 +1253,9 @@ type GridColumn =
 
 const nativeColumns: GridColumn[] = [
   { kind: "native", key: "url", label: "URL", width: 360, sortable: true },
+  { kind: "native", key: "relNext", label: "Next URL", width: 300, sortable: true },
+  { kind: "native", key: "relPrev", label: "Previous URL", width: 300, sortable: true },
+  { kind: "native", key: "amphtml", label: "AMP URL", width: 300, sortable: true },
   {
     kind: "native",
     key: "listPosition",
@@ -1415,6 +1527,7 @@ const nativeColumns: GridColumn[] = [
     width: 82,
     sortable: true,
   },
+  { kind: "native", key: "responseHash", label: "Response hash", width: 300, sortable: false },
   { kind: "native", key: "depth", label: "Depth", width: 70, sortable: true },
   {
     kind: "native",
@@ -1432,6 +1545,8 @@ const nativeColumns: GridColumn[] = [
   },
   { kind: "native", key: "titleLen", label: "Title length", width: 100, sortable: true },
   { kind: "native", key: "metaDescriptionLen", label: "Meta length", width: 100, sortable: true },
+  { kind: "native", key: "titleCount", label: "Title tags", width: 88, sortable: true },
+  { kind: "native", key: "metaDescriptionCount", label: "Meta tags", width: 88, sortable: true },
   { kind: "native", key: "h1Count", label: "H1 count", width: 90, sortable: true },
   { kind: "native", key: "h2Count", label: "H2 count", width: 90, sortable: true },
   { kind: "native", key: "canonical", label: "Canonical URL", width: 320, sortable: false },
@@ -1456,57 +1571,105 @@ const extractorKinds: Array<{ value: ExtractorKind; label: string }> = [
   { value: "regex", label: "Regex" },
 ];
 
+const settingsGroups = ["Spider", "Analysis", "Workspace"];
 const settingsTabs: Array<{
   id: SettingsTab;
   label: string;
   description: string;
+  group: string;
+  keywords: string;
 }> = [
   {
     id: "crawl",
     label: "Crawl",
     description: "Limits, robots.txt, and crawl throughput.",
+    group: "Spider",
+    keywords: "max URLs crawl depth concurrency speed requests delay timeout retries backoff robots override tester download response body bytes MiB size near duplicate threshold",
   },
   {
     id: "scope",
     label: "Scope",
     description: "List sources and URL include or exclude rules.",
+    group: "Spider",
+    keywords: "subdomain host folder nofollow include exclude regex list sitemap file upload duplicates input order",
+  },
+  {
+    id: "sitemaps",
+    label: "Sitemaps",
+    description: "Choose XML sitemap sources for Spider crawls.",
+    group: "Spider",
+    keywords: "XML sitemap index sources robots.txt discovery linked probe explicit URLs",
+  },
+  {
+    id: "requests",
+    label: "HTTP headers",
+    description: "Browser defaults, User-Agent and request header overrides.",
+    group: "Spider",
+    keywords: "custom HTTP request headers user-agent Chrome browser desktop preset defaults Accept Accept-Language origin environment name value",
   },
   {
     id: "resources",
     label: "Resources",
     description: "Choose which asset and URL types can enter the crawl.",
+    group: "Spider",
+    keywords: "HTML images CSS JavaScript external other files canonical hreflang pagination AMP reference link discovery",
   },
   {
     id: "query",
     label: "Query",
     description: "Normalize, strip, or limit query-string parameters.",
+    group: "Spider",
+    keywords: "URL rewriting sorting strip remove parameters regex maximum retained",
   },
   {
     id: "storage",
     label: "Storage",
-    description: "Memory mode, database mode, and crawl sessions.",
+    description: "Automatically saved SQLite crawls, recovery and portable archives.",
+    group: "Workspace",
+    keywords: "SQLite path location directory memory budget capacity recovery resume reopen delete sessions archive import export",
   },
   {
     id: "profiles",
     label: "Profiles",
     description: "Save and reuse named crawl configurations.",
+    group: "Workspace",
+    keywords: "save load default configuration preset delete profile",
   },
   {
     id: "integrations",
     label: "Integrations",
     description: "External metrics and credential status.",
+    group: "Workspace",
+    keywords: "API Google Search Console GSC token credentials property site keyring test connection merge clicks impressions CTR position metrics PageSpeed Insights PSI Lighthouse mobile desktop performance LCP TBT CLS",
   },
   {
     id: "rendering",
     label: "Rendering",
     description: "Rendered DOM crawling through Chrome DevTools Protocol.",
+    group: "Spider",
+    keywords: "JavaScript browser Chrome Chromium Edge CDP DOM backend wait load availability check again",
+  },
+  {
+    id: "content",
+    label: "Content",
+    description: "Select page regions for text analysis.",
+    group: "Analysis",
+    keywords: "content area include exclude CSS selectors visible text word count ratio near duplicates preview HTML",
   },
   {
     id: "extraction",
     label: "Extraction",
     description: "Create custom CSS, XPath, and regex extraction columns.",
+    group: "Analysis",
+    keywords: "custom extraction search text CSS selector attribute XPath regex raw HTML rendered visible include exclude snippets",
   },
 ];
+
+function matchingSettingsTabs(search: string) {
+  const terms = search.trim().toLowerCase().split(/\s+/);
+  return settingsTabs.filter((tab) => terms.every((term) =>
+    `${tab.label} ${tab.description} ${tab.keywords}`.toLowerCase().includes(term)));
+}
 
 const linkReportViews: Array<{ id: LinkReportKind; label: string }> = [
   { id: "all", label: "All Links" },
@@ -1524,6 +1687,7 @@ const linkReportViews: Array<{ id: LinkReportKind; label: string }> = [
 export default function App() {
   const {
     config,
+    modeStartUrls,
     rows,
     selected,
     selectedView,
@@ -1557,9 +1721,42 @@ export default function App() {
     setResumeCrawl,
   } = useAppStore();
   const parentRef = useRef<HTMLDivElement>(null);
+  const [selectedRecordIds, setSelectedRecordIds] = useState<number[]>([]);
+  const selectionAnchor = useRef<number | undefined>(undefined);
+  const selectResultRow = (record: CrawlRecord, modifiers: { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean } = {}) => {
+    setSelected(record);
+    const toggle = modifiers.ctrlKey || modifiers.metaKey;
+    if (modifiers.shiftKey && selectionAnchor.current !== undefined) {
+      const from = rows.findIndex((row) => row.id === selectionAnchor.current);
+      const to = rows.findIndex((row) => row.id === record.id);
+      if (from >= 0 && to >= 0) {
+        const range = rows.slice(Math.min(from, to), Math.max(from, to) + 1).map((row) => row.id);
+        setSelectedRecordIds((previous) => toggle ? [...new Set([...previous, ...range])] : range);
+        return;
+      }
+    }
+    selectionAnchor.current = record.id;
+    setSelectedRecordIds((previous) => toggle ? previous.includes(record.id) ? previous.filter((id) => id !== record.id) : [...previous, record.id] : [record.id]);
+  };
   const rowsRequest = useRef(0);
+  const urlTreeRequest = useRef(0);
+  const graphRequest = useRef(0);
+  const crawlPathRequest = useRef(0);
+  const databaseLocationRequest = useRef(0);
+  const recoveryRequest = useRef(0);
   const [rowsLoading, setRowsLoading] = useState(false);
   const [startupReady, setStartupReady] = useState(false);
+  const [showHome, setShowHome] = useState(true);
+  const [modeMenuOpen, setModeMenuOpen] = useState(false);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [toolsMenuOpen, setToolsMenuOpen] = useState(false);
+  useLayoutEffect(() => {
+    if (!modeMenuOpen && !exportMenuOpen && !toolsMenuOpen) return;
+    const menu = document.querySelector<HTMLElement>('.dropdown-content[data-state="open"]');
+    if (menu && !menu.contains(document.activeElement)) menu.focus();
+  }, [modeMenuOpen, exportMenuOpen, toolsMenuOpen]);
+  const [workspaceAvailable, setWorkspaceAvailable] = useState(false);
+  const [workspaceRevision, setWorkspaceRevision] = useState(0);
   const [quitOpen, setQuitOpen] = useState(false);
   const [quitting, setQuitting] = useState(false);
   const [quitError, setQuitError] = useState<string>();
@@ -1570,9 +1767,30 @@ export default function App() {
     setQuitError(undefined);
     setQuitOpen(true);
   }, []);
-  const [showAllColumns, setShowAllColumns] = useState(false);
+  const [columnLayout, setColumnLayout] = useState<ColumnLayout>(getInitialColumnLayout);
+  const [advancedFilters, setAdvancedFilters] = useState<GridFilterGroup>();
+  const [columnsOpen, setColumnsOpen] = useState(false);
+  const [columnSearch, setColumnSearch] = useState("");
+  const [layoutName, setLayoutName] = useState("");
+  const [layoutError, setLayoutError] = useState<string>();
+  const saveColumnLayout = (next: ColumnLayout) => {
+    if (!savePreference(columnLayoutStorageKey, JSON.stringify({ version: 1, ...next }))) {
+      setLayoutError("Column layout could not be saved. Free some disk space and try again.");
+      return;
+    }
+    setLayoutError(undefined);
+    setColumnLayout(next);
+  };
   const [issuesOpen, setIssuesOpen] = useState(false);
   const [overviewOpen, setOverviewOpen] = useState(() => window.innerWidth > 1000);
+  const changeIssuesOpen = (open: boolean) => {
+    if (!open && document.activeElement?.closest('.issue-sidebar')) document.querySelector<HTMLButtonElement>('[aria-label="Toggle audit views"]')?.focus();
+    setIssuesOpen(open);
+  };
+  const changeOverviewOpen = (open: boolean) => {
+    if (!open && document.activeElement?.closest('.overview-panel, .overview-resizer')) document.querySelector<HTMLButtonElement>('[aria-label="Toggle overview"]')?.focus();
+    setOverviewOpen(open);
+  };
   const [activeIssueGroup, setActiveIssueGroup] = useState(issueGroups[0]);
   const desktopRuntime = isTauri();
   const [updateOpen, setUpdateOpen] = useState(false);
@@ -1630,7 +1848,7 @@ export default function App() {
     }
   };
 
-  const columns = useMemo<GridColumn[]>(() => {
+  const availableColumns = useMemo<GridColumn[]>(() => {
     const customColumns = config.customExtractors
       .filter((extractor) => extractor.name.trim().length > 0)
       .map<GridColumn>((extractor, index) => ({
@@ -1652,15 +1870,31 @@ export default function App() {
         sortable: true,
       }));
 
-    const relevantKeys = ["statusCode", "url", ...activeIssueGroup.columns];
-    const visibleColumns = showAllColumns
-      ? nativeColumns
-      : relevantKeys.flatMap((key) => nativeColumns.filter((column) => column.kind === "native" && column.key === key));
-    const listColumns = config.mode === "list" && !showAllColumns
-      ? nativeColumns.filter((column) => column.kind === "native" && column.key === "listPosition")
-      : [];
-    return [...listColumns, ...visibleColumns, ...customColumns, ...searchColumns];
-  }, [activeIssueGroup, showAllColumns, config.mode, config.customExtractors, config.customSearches]);
+    return [...nativeColumns, ...customColumns, ...searchColumns];
+  }, [config.customExtractors, config.customSearches]);
+  const columns = useMemo<GridColumn[]>(() => {
+    if (columnLayout.active === "all") return availableColumns;
+    const keys = columnLayout.active === "relevant"
+      ? [...(config.mode === "list" ? ["listPosition"] : []), "statusCode", "url", ...activeIssueGroup.columns,
+        ...availableColumns.filter((column) => column.kind !== "native").map(columnKey)]
+      : columnLayout.active === "custom" ? columnLayout.custom
+      : columnLayout.presets.find((preset) => `saved:${preset.name}` === columnLayout.active)?.columns ?? ["url"];
+    const visible = new Set(keys);
+    if (!visible.has("url")) visible.add("url");
+    const byId = new Map(availableColumns.map((column) => [columnKey(column), column]));
+    return [...visible].flatMap((key) => { const column = byId.get(key); return column ? [column] : []; });
+  }, [activeIssueGroup, columnLayout, config.mode, availableColumns]);
+  const changeVisibleColumns = (keys: string[]) => saveColumnLayout({ ...columnLayout, active: "custom", custom: keys });
+  const visibleColumnIds = columns.map(columnKey);
+  const orderedColumnChoices = [...columns, ...availableColumns.filter((column) => !visibleColumnIds.includes(columnKey(column)))];
+  const moveColumn = (key: string, direction: number) => {
+    const keys = [...visibleColumnIds];
+    const from = keys.indexOf(key);
+    const to = from + direction;
+    if (from < 0 || to < 0 || to >= keys.length) return;
+    [keys[from], keys[to]] = [keys[to], keys[from]];
+    changeVisibleColumns(keys);
+  };
 
   const tableColumns = useMemo<ColumnDef<typeof gridFeatures, CrawlRecord>[]>(
     () =>
@@ -1680,13 +1914,106 @@ export default function App() {
     [columns],
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsDraft, setSettingsDraft] = useState<CrawlPreferences | null>(null);
+  const [settingsApplying, setSettingsApplying] = useState(false);
+  const [workspaceBusy, setWorkspaceBusy] = useState(false);
+  const workspaceOperation = useRef(false);
+  const [settingsValidationError, setSettingsValidationError] = useState<string>();
+  const settingsBaseline = useRef("");
+  const settingsRevision = useRef(0);
+  const settingsConfig = settingsDraft?.config ?? config;
+  const sitemapUnavailable = settingsConfig.mode === "list" || settingsConfig.folderScope === "exactUrl";
+  const sitemapSourcesDisabled = sitemapUnavailable || !settingsConfig.sitemap.enabled;
+  const settingsStorageMode = settingsDraft?.storageMode ?? storageMode;
+  const settingsResumeCrawl = settingsDraft?.resumeCrawl ?? resumeCrawl;
+  const settingsHasChanges = settingsDraft !== null && JSON.stringify(settingsDraft) !== settingsBaseline.current;
+  const settingsDirty = settingsOpen && settingsHasChanges;
+  const changeSettingsOpen = (open: boolean) => {
+    settingsRevision.current += 1;
+    setSettingsApplying(false);
+    if (open) {
+      setSettingsValidationError(undefined); setSettingsSearch("");
+      setCollapsedSettingsGroups(settingsGroups);
+      const draft = { config: normalizeCrawlConfig(config), modeStartUrls: { ...modeStartUrls }, storageMode, resumeCrawl };
+      settingsBaseline.current = JSON.stringify(draft);
+      setSettingsDraft(draft);
+    }
+    setSettingsOpen(open);
+  };
+  const setSettingsConfig = (patch: Partial<CrawlConfig>) => {
+    if (workspaceOperation.current) return;
+    settingsRevision.current += 1;
+    setSettingsValidationError(undefined);
+    setSettingsDraft((draft) => draft ? { ...draft, ...patchCrawlConfig(draft, patch) } : null);
+  };
+  const setSettingsResumeCrawl = (value: boolean) => {
+    if (workspaceOperation.current) return;
+    settingsRevision.current += 1;
+    setSettingsDraft((draft) => draft ? { ...draft, resumeCrawl: value } : null);
+  };
+  useEffect(() => {
+    // Explicit session/archive actions update the workspace and its clean draft together.
+    if (!settingsOpen || !settingsDraft || JSON.stringify(settingsDraft) !== settingsBaseline.current) return;
+    const next = { config, modeStartUrls, storageMode, resumeCrawl };
+    settingsBaseline.current = JSON.stringify(next);
+    setSettingsDraft(next);
+  }, [settingsOpen, config, modeStartUrls, storageMode, resumeCrawl]);
+  const applySettings = async (close = false) => {
+    if (!settingsDraft || settingsApplying || running || workspaceOperation.current) return;
+    if (!settingsDirty) { if (close) changeSettingsOpen(false); return; }
+    const invalid = document.querySelector<HTMLInputElement>('.settings-content input:invalid');
+    if (invalid) {
+      const tab = invalid.closest<HTMLElement>('[data-settings-section]')?.dataset.settingsSection as SettingsTab ?? "crawl";
+      setSettingsSearch("");
+      setCollapsedSettingsGroups(settingsGroups.filter((group) => group !== settingsTabs.find((item) => item.id === tab)?.group));
+      setSettingsTab(tab);
+      requestAnimationFrame(() => { invalid.focus(); invalid.reportValidity(); });
+      setSettingsValidationError("Correct the highlighted value before applying settings.");
+      return;
+    }
+    const revision = ++settingsRevision.current;
+    setSettingsApplying(true); setSettingsValidationError(undefined);
+    try {
+      const preferences = { ...settingsDraft, config: normalizeCrawlConfig(settingsDraft.config) };
+      if (desktopRuntime) await invoke("validate_crawl_configuration", { config: preferences.config });
+      if (revision !== settingsRevision.current) return;
+      if (!saveCrawlPreferences(preferences)) {
+        useAppStore.setState({ settingsError: "Settings could not be saved. The previous configuration is still active; retry Apply after checking available storage." });
+        return;
+      }
+      useAppStore.setState({ ...preferences, settingsError: undefined });
+      settingsBaseline.current = JSON.stringify(preferences);
+      setSettingsDraft(preferences);
+      if (close) changeSettingsOpen(false);
+    } catch (caught) {
+      if (revision === settingsRevision.current) setSettingsValidationError(errorMessage(caught));
+    } finally {
+      if (revision === settingsRevision.current) setSettingsApplying(false);
+    }
+  };
+  const [renderingStatus, setRenderingStatus] = useState<RenderingStatus>();
+  const [renderingStatusLoading, setRenderingStatusLoading] = useState(false);
+  const [renderingStatusError, setRenderingStatusError] = useState<string>();
+  const renderingStatusRequest = useRef(0);
   const [detailTab, setDetailTab] = useState<(typeof detailTabs)[number]["id"]>("page");
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("crawl");
+  const settingsContentRef = useRef<HTMLFieldSetElement>(null);
+  useEffect(() => {
+    if (!settingsOpen) return;
+    settingsContentRef.current?.scrollTo({ top: 0 });
+    document.querySelector('.settings-tab-button[aria-current="page"]')?.scrollIntoView({ block: "nearest" });
+  }, [settingsTab, settingsOpen]);
+  const [settingsSearch, setSettingsSearch] = useState("");
+  const [collapsedSettingsGroups, setCollapsedSettingsGroups] = useState<string[]>(settingsGroups);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [comparisonOpen, setComparisonOpen] = useState(false);
+  const [serpOpen, setSerpOpen] = useState(false);
+  const [serpVisited, setSerpVisited] = useState(false);
   const [comparisonArchivePath, setComparisonArchivePath] = useState("");
   const [comparisonLoading, setComparisonLoading] = useState(false);
   const [comparisonResult, setComparisonResult] = useState<CrawlComparisonResponse>();
+  const [comparisonSessions, setComparisonSessions] = useState<[SavedCrawl, SavedCrawl]>();
+  const comparisonRequest = useRef(0);
   const [linkReportsOpen, setLinkReportsOpen] = useState(false);
   const [linkReportPage, setLinkReportPage] = useState(0);
   const linkReportRequest = useRef(0);
@@ -1713,17 +2040,27 @@ export default function App() {
   const [sitemapValidationSortDir, setSitemapValidationSortDir] =
     useState<SortDirection>("desc");
   const [graphOpen, setGraphOpen] = useState(false);
+  const [graphVisited, setGraphVisited] = useState(false);
   const [graph, setGraph] = useState<CrawlGraph>();
   const [graphLoading, setGraphLoading] = useState(false);
+  const [graphError, setGraphError] = useState<string>();
   const [graphUpdatedAt, setGraphUpdatedAt] = useState<number>();
   const [graphInternalOnly, setGraphInternalOnly] = useState(false);
   const [graphStatusFilter, setGraphStatusFilter] = useState<GraphStatusFilter>("all");
   const [graphDepthFilter, setGraphDepthFilter] = useState("all");
-  const [graphLayoutMode, setGraphLayoutMode] = useState<GraphLayoutMode>("depth");
+  const [graphLayoutMode, setGraphLayoutMode] = useState<GraphLayoutMode>("clusters");
   const [progressHistory, setProgressHistory] = useState<ProgressSample[]>([]);
   const [crawlSessions, setCrawlSessions] = useState<CrawlSession[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(true);
+  const [sessionsError, setSessionsError] = useState<string>();
+  const sessionsRequest = useRef(0);
+  const [comparisonSelection, setComparisonSelection] = useState<string[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState("");
-  const [newSessionName, setNewSessionName] = useState("");
+  const [sessionToDelete, setSessionToDelete] = useState<CrawlSession>();
+  const [sessionDeleteOpen, setSessionDeleteOpen] = useState(false);
+  const [sessionDeleteError, setSessionDeleteError] = useState<string>();
+  const cancelSessionDeleteRef = useRef<HTMLButtonElement>(null);
+  const sessionDeleteOriginRef = useRef<HTMLElement | null>(null);
   const [configProfiles, setConfigProfiles] = useState<ConfigProfile[]>([]);
   const [selectedProfileId, setSelectedProfileId] = useState("");
   const [newProfileName, setNewProfileName] = useState("");
@@ -1747,6 +2084,11 @@ export default function App() {
     useState<SearchConsoleTestResult>();
   const [searchConsoleMergeResult, setSearchConsoleMergeResult] =
     useState<SearchConsoleMergeResult>();
+  const pageSpeedCredentials = usePageSpeedCredentials(settingsOpen, desktopRuntime);
+  const [pageSpeedStrategy, setPageSpeedStrategy] = useState<PageSpeedStrategy>("mobile");
+  const [pageSpeedActive, setPageSpeedActive] = useState<{ requestId: string; url: string }>();
+  const pageSpeedRequest = useRef<string | undefined>(undefined);
+  const [pageSpeedCancelling, setPageSpeedCancelling] = useState(false);
   const [databasePath, setDatabasePath] = useState("");
   const [customDatabasePath, setCustomDatabasePath] = useState("");
   const [archiveImportPath, setArchiveImportPath] = useState("");
@@ -1757,6 +2099,31 @@ export default function App() {
     crawled: 0,
   });
   const [robotsTestUrl, setRobotsTestUrl] = useState("");
+  const [contentPreviewHtml, setContentPreviewHtml] = useState("");
+  const [contentPreview, setContentPreview] = useState<{ text: string; wordCount: number; textToCodeRatio: number; textTruncated: boolean }>();
+  const [contentPreviewLoading, setContentPreviewLoading] = useState(false);
+  const [contentPreviewError, setContentPreviewError] = useState<string>();
+  const contentPreviewRequest = useRef(0);
+  const contentPreviewBusy = useRef(false);
+  const extractionPreviewBusy = useRef(false);
+  const [extractionPreviewLoading, setExtractionPreviewLoading] = useState(false);
+  useEffect(() => {
+    contentPreviewRequest.current += 1;
+    if (settingsOpen) { setContentPreview(undefined); setContentPreviewError(undefined); }
+  }, [settingsOpen, settingsConfig.content, contentPreviewHtml]);
+  const previewContent = async () => {
+    if (!desktopRuntime || !contentPreviewHtml.trim() || contentPreviewBusy.current) return;
+    contentPreviewBusy.current = true;
+    const request = ++contentPreviewRequest.current;
+    setContentPreviewLoading(true); setContentPreviewError(undefined); setContentPreview(undefined);
+    try {
+      const result = await invoke<NonNullable<typeof contentPreview>>("preview_content_area", {
+        request: { html: contentPreviewHtml, content: normalizeCrawlConfig(settingsConfig).content },
+      });
+      if (request === contentPreviewRequest.current) setContentPreview(result);
+    } catch (caught) { if (request === contentPreviewRequest.current) setContentPreviewError(errorMessage(caught)); }
+    finally { contentPreviewBusy.current = false; setContentPreviewLoading(false); }
+  };
   const [robotsTestResult, setRobotsTestResult] = useState<string>();
   const [robotsBatchUrls, setRobotsBatchUrls] = useState("");
   const [robotsBatchResult, setRobotsBatchResult] =
@@ -1773,7 +2140,9 @@ export default function App() {
     capped: false,
   });
   const [urlTreeLoading, setUrlTreeLoading] = useState(false);
-  const exportDisabled = summary.total === 0 || !desktopRuntime;
+  const exportDisabled = showHome || summary.total === 0 || !desktopRuntime || workspaceBusy;
+  const queuedExportAvailable = running || recoveryState.queued > 0;
+  const exportMenuDisabled = showHome || !desktopRuntime || workspaceBusy || (summary.total === 0 && !queuedExportAvailable);
   const filteredExportDisabled = exportDisabled || total === 0;
   const crawlStateLabel = !desktopRuntime
     ? "Desktop required"
@@ -1794,22 +2163,25 @@ export default function App() {
     (config.listUrls?.length ?? 0) + (config.listSitemapUrls?.length ?? 0);
   const hasCrawlTarget = Boolean(config.startUrl.trim()) || (config.mode === "list" &&
     [...config.listUrls, ...config.listSitemapUrls].some((url) => url.trim()));
+  const activeCrawlScope = crawlScopePreset(config);
+  const settingsCrawlScope = crawlScopePreset(settingsConfig);
   const activeSettingsTab =
     settingsTabs.find((tab) => tab.id === settingsTab) ?? settingsTabs[0];
+  const visibleSettingsTabs = matchingSettingsTabs(settingsSearch);
   const crawlTargetLabel =
     config.mode === "list"
       ? `${listSourceCount || 1} list source${listSourceCount === 1 ? "" : "s"}`
       : config.startUrl;
   const capacityEstimate = useMemo(
-    () => estimateCrawlCapacity(config, storageMode),
+    () => estimateCrawlCapacity(settingsConfig, settingsStorageMode),
     [
-      config.maxUrls,
-      config.resourceTypes.css,
-      config.resourceTypes.external,
-      config.resourceTypes.images,
-      config.resourceTypes.javascript,
-      config.resourceTypes.other,
-      storageMode,
+      settingsConfig.maxUrls,
+      settingsConfig.resourceTypes.css,
+      settingsConfig.resourceTypes.external,
+      settingsConfig.resourceTypes.images,
+      settingsConfig.resourceTypes.javascript,
+      settingsConfig.resourceTypes.other,
+      settingsStorageMode,
     ],
   );
   const selectedUrl = selected?.finalUrl;
@@ -1867,6 +2239,7 @@ export default function App() {
           limit: resultsPageSize,
           globalSearch,
           ...segmentQuery(activeSegment),
+          ...(advancedFilters ? { filters: advancedFilters } : {}),
           sortBy,
           sortDir,
           view: selectedView,
@@ -1884,12 +2257,12 @@ export default function App() {
     } finally {
       if (requestId === rowsRequest.current) {
         setRowsLoading(false);
-        setStartupReady(true);
       }
     }
   }, [
     desktopRuntime,
     activeSegment,
+    advancedFilters,
     globalSearch,
     pageIndex,
     selectedView,
@@ -1906,6 +2279,7 @@ export default function App() {
         return;
       }
 
+      const request = ++urlTreeRequest.current;
       if (!silent) {
         setUrlTreeLoading(true);
       }
@@ -1916,35 +2290,46 @@ export default function App() {
             limit: 10_000,
             globalSearch,
             ...segmentQuery(activeSegment),
+            ...(advancedFilters ? { filters: advancedFilters } : {}),
             sortBy,
             sortDir,
             view: selectedView,
           },
         });
-        setUrlTree(response);
+        if (request === urlTreeRequest.current) setUrlTree(response);
       } catch (caught) {
-        setError(errorMessage(caught));
+        if (request === urlTreeRequest.current) setError(errorMessage(caught));
       } finally {
-        if (!silent) {
-          setUrlTreeLoading(false);
-        }
+        if (request === urlTreeRequest.current) setUrlTreeLoading(false);
       }
     },
-    [desktopRuntime, activeSegment, globalSearch, selectedView, setError, sortBy, sortDir],
+    [desktopRuntime, activeSegment, advancedFilters, globalSearch, selectedView, setError, sortBy, sortDir],
   );
 
   const loadSessions = useCallback(async () => {
+    const request = ++sessionsRequest.current;
     if (!desktopRuntime) {
+      setSessionsLoading(false);
+      setStartupReady(true);
       return;
     }
+    setSessionsLoading(true);
+    setSessionsError(undefined);
     try {
       const sessions = await invoke<CrawlSession[]>("list_crawl_sessions");
+      if (request !== sessionsRequest.current) return;
       setCrawlSessions(sessions);
       setSelectedSessionId(sessions.find((session) => session.isCurrent)?.id ?? "");
+      setComparisonSelection((selected) => selected.filter((id) => sessions.some((session) => session.id === id)));
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (request === sessionsRequest.current) setSessionsError(errorMessage(caught));
+    } finally {
+      if (request === sessionsRequest.current) {
+        setSessionsLoading(false);
+        setStartupReady(true);
+      }
     }
-  }, [desktopRuntime, setError]);
+  }, [desktopRuntime]);
 
   const loadProfiles = useCallback(async () => {
     if (!desktopRuntime) {
@@ -1960,6 +2345,23 @@ export default function App() {
       setError(errorMessage(caught));
     }
   }, [desktopRuntime, selectedProfileId, setError]);
+
+  const loadRenderingStatus = useCallback(async () => {
+    const request = ++renderingStatusRequest.current;
+    setRenderingStatus(undefined);
+    setRenderingStatusError(undefined);
+    setRenderingStatusLoading(true);
+    try {
+      const status = desktopRuntime
+        ? await invoke<RenderingStatus>("get_rendering_status")
+        : { available: false, browserPath: null, message: "Browser rendering is available only in the desktop app." };
+      if (request === renderingStatusRequest.current) setRenderingStatus(status);
+    } catch (caught) {
+      if (request === renderingStatusRequest.current) setRenderingStatusError(errorMessage(caught));
+    } finally {
+      if (request === renderingStatusRequest.current) setRenderingStatusLoading(false);
+    }
+  }, [desktopRuntime]);
 
   const loadSearchConsoleStatus = useCallback(async () => {
     if (!desktopRuntime) {
@@ -1980,12 +2382,14 @@ export default function App() {
     if (!desktopRuntime) {
       return;
     }
+    const request = ++databaseLocationRequest.current;
     try {
       const location = await invoke<DatabaseLocation>("get_database_location");
+      if (request !== databaseLocationRequest.current) return;
       setDatabasePath(location.path);
       setCustomDatabasePath((current) => current || location.path);
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (request === databaseLocationRequest.current) setError(errorMessage(caught));
     }
   }, [desktopRuntime, setError]);
 
@@ -1993,18 +2397,17 @@ export default function App() {
     if (!desktopRuntime) {
       return undefined;
     }
+    const request = ++recoveryRequest.current;
     try {
       const state = await invoke<CrawlRecoveryState>("get_recovery_state");
+      if (request !== recoveryRequest.current) return undefined;
       setRecoveryState(state);
-      if (storageMode === "database" && state.recoverable) {
-        setResumeCrawl(true);
-      }
       return state;
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (request === recoveryRequest.current) setError(errorMessage(caught));
       return undefined;
     }
-  }, [desktopRuntime, setError, setResumeCrawl, storageMode]);
+  }, [desktopRuntime, setError]);
 
   const loadLinkReport = useCallback(
     async (report: LinkReportKind) => {
@@ -2155,6 +2558,8 @@ export default function App() {
       return;
     }
 
+    const request = ++graphRequest.current;
+    setGraphError(undefined);
     if (!silent) {
       setGraphLoading(true);
     }
@@ -2166,21 +2571,22 @@ export default function App() {
           internalOnly: graphInternalOnly,
         },
       });
+      if (request !== graphRequest.current) return;
       setGraph(response);
       setGraphUpdatedAt(Date.now());
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (request === graphRequest.current) setGraphError(errorMessage(caught));
     } finally {
-      if (!silent) {
-        setGraphLoading(false);
-      }
+      if (request === graphRequest.current) setGraphLoading(false);
     }
-  }, [desktopRuntime, graphInternalOnly, setError]);
+  }, [desktopRuntime, graphInternalOnly]);
 
   const loadSelectedCrawlPath = useCallback(
     async (silent = false) => {
+      const request = ++crawlPathRequest.current;
       if (!desktopRuntime || !selectedUrl) {
         setSelectedCrawlPath(undefined);
+        setCrawlPathLoading(false);
         return;
       }
 
@@ -2195,13 +2601,11 @@ export default function App() {
             internalOnly: true,
           },
         });
-        setSelectedCrawlPath(response);
+        if (request === crawlPathRequest.current) setSelectedCrawlPath(response);
       } catch (caught) {
-        setError(errorMessage(caught));
+        if (request === crawlPathRequest.current) setError(errorMessage(caught));
       } finally {
-        if (!silent) {
-          setCrawlPathLoading(false);
-        }
+        if (request === crawlPathRequest.current) setCrawlPathLoading(false);
       }
     },
     [desktopRuntime, selectedUrl, setError],
@@ -2220,9 +2624,13 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    void loadRows();
+    if (!showHome && workspaceAvailable && !workspaceBusy) void loadRows();
     return () => { rowsRequest.current += 1; };
-  }, [loadRows]);
+  }, [loadRows, showHome, workspaceAvailable, workspaceBusy, workspaceRevision]);
+
+  useEffect(() => {
+    if (showHome) void loadSessions();
+  }, [showHome, loadSessions]);
 
   useEffect(() => {
     if (!desktopRuntime || !startupReady) return;
@@ -2247,7 +2655,7 @@ export default function App() {
   }, [desktopRuntime, startupReady, checkForUpdates]);
 
   useEffect(() => {
-    if (!running || !desktopRuntime) return;
+    if (!running || !desktopRuntime || showHome || workspaceBusy) return;
     let disposed = false;
     let timer: number;
     const refresh = async () => {
@@ -2256,29 +2664,33 @@ export default function App() {
     };
     timer = window.setTimeout(refresh, 750);
     return () => { disposed = true; window.clearTimeout(timer); };
-  }, [desktopRuntime, running, loadRows]);
+  }, [desktopRuntime, running, showHome, workspaceBusy, loadRows]);
 
   useEffect(() => {
     parentRef.current?.scrollTo({ top: 0 });
-  }, [pageIndex, selectedView, globalSearch, sortBy, sortDir, activeSegment]);
+    setSelectedRecordIds([]);
+    selectionAnchor.current = undefined;
+  }, [pageIndex, selectedView, globalSearch, sortBy, sortDir, activeSegment, advancedFilters]);
 
   useEffect(() => {
-    if (resultsViewMode === "tree") {
-      void loadUrlTree();
-    }
-  }, [loadUrlTree, resultsViewMode]);
+    const available = new Set(rows.map((row) => row.id));
+    setSelectedRecordIds((previous) => {
+      const next = previous.filter((id) => available.has(id));
+      return next.length === previous.length ? previous : next;
+    });
+  }, [rows]);
 
   useEffect(() => {
-    if (resultsViewMode !== "tree" || !running) {
-      return;
-    }
-
-    const intervalId = window.setInterval(() => {
-      void loadUrlTree(true);
-    }, 1_500);
-
-    return () => window.clearInterval(intervalId);
-  }, [loadUrlTree, resultsViewMode, running]);
+    if (showHome || workspaceBusy || resultsViewMode !== "tree") return;
+    let disposed = false;
+    let timer: number;
+    const refresh = async (silent = false) => {
+      await loadUrlTree(silent);
+      if (!disposed && running) timer = window.setTimeout(() => void refresh(true), 1_500);
+    };
+    void refresh();
+    return () => { disposed = true; window.clearTimeout(timer); urlTreeRequest.current++; };
+  }, [loadUrlTree, resultsViewMode, running, showHome, workspaceBusy]);
 
   useEffect(() => {
     if (settingsOpen) {
@@ -2287,11 +2699,13 @@ export default function App() {
       void loadSearchConsoleStatus();
       void loadDatabaseLocation();
       void loadRecoveryState();
+      void loadRenderingStatus();
     }
   }, [
     loadDatabaseLocation,
     loadProfiles,
     loadRecoveryState,
+    loadRenderingStatus,
     loadSearchConsoleStatus,
     loadSessions,
     settingsOpen,
@@ -2362,11 +2776,14 @@ export default function App() {
       return;
     }
 
-    const intervalId = window.setInterval(() => {
-      void loadGraph(true);
-    }, 1_500);
-
-    return () => window.clearInterval(intervalId);
+    let disposed = false;
+    let timer: number;
+    const refresh = async () => {
+      await loadGraph(true);
+      if (!disposed) timer = window.setTimeout(refresh, 1_500);
+    };
+    timer = window.setTimeout(refresh, 1_500);
+    return () => { disposed = true; window.clearTimeout(timer); };
   }, [graphOpen, loadGraph, running]);
 
   useEffect(() => {
@@ -2407,7 +2824,9 @@ export default function App() {
     if (terminal) {
       setRunning(false);
       setPaused(false);
+      setNotice(undefined);
     }
+    if (payload.kind === "notice") setNotice(payload.message ?? undefined);
     if (payload.kind === "error" || payload.kind === "failed") {
       setError(payload.message ?? "Crawler error");
     }
@@ -2417,7 +2836,8 @@ export default function App() {
     }
     if (payload.record && selected?.id === payload.record.id) setSelected(payload.record);
     if (terminal) {
-      void loadRows();
+      if (!showHome) void loadRows();
+      void loadSessions();
       void loadRecoveryState();
       if (resultsViewMode === "tree") void loadUrlTree(true);
       if (graphOpen) void loadGraph(true);
@@ -2437,7 +2857,8 @@ export default function App() {
     return () => { disposed = true; unlisten?.(); };
   }, [desktopRuntime, setError]);
 
-  const startCrawl = async () => {
+  const startCrawl = async (fresh = false) => {
+    if (workspaceOperation.current || running) return;
     if (!desktopRuntime) {
       setError("Open the desktop app with make dev to run crawls.");
       return;
@@ -2445,20 +2866,36 @@ export default function App() {
 
     setError(undefined);
     setNotice(undefined);
+    workspaceOperation.current = true;
+    setWorkspaceBusy(true);
     setRunning(true);
     setPaused(false);
-    setProgressHistory([]);
-    setProgress(undefined);
-    setSelected(undefined);
     try {
-      await invoke("start_crawl", { config, storageMode, resume: resumeCrawl });
-      setPage(0);
-      await loadRows();
+      if (config.rendering.enabled) {
+        const status = await invoke<RenderingStatus>("get_rendering_status");
+        if (!status.available) throw new Error(`${status.message} Turn off Render DOM in Settings to crawl HTML.`);
+      }
+      const session = await invoke<CrawlSession>("start_crawl", {
+        config: normalizeCrawlConfig(config),
+        resume: !fresh && resumeCrawl && recoveryState.recoverable,
+      });
+      setSelectedSessionId(session.id);
+      setDatabasePath(session.databasePath);
+      setCustomDatabasePath(session.databasePath);
+      setStorageMode("database");
+      setResumeCrawl(false);
+      resetCrawlResults();
+      setWorkspaceAvailable(true);
+      setShowHome(false);
+      await loadSessions();
       await loadRecoveryState();
     } catch (caught) {
       setRunning(false);
       setPaused(false);
       setError(errorMessage(caught));
+    } finally {
+      workspaceOperation.current = false;
+      setWorkspaceBusy(false);
     }
   };
 
@@ -2486,7 +2923,9 @@ export default function App() {
       setRunning(false);
       setPaused(false);
       await loadRows();
-      await loadRecoveryState();
+      const recovery = await loadRecoveryState();
+      setResumeCrawl(recovery?.recoverable === true);
+      await loadSessions();
     } catch (caught) {
       setError(errorMessage(caught));
     }
@@ -2555,6 +2994,8 @@ export default function App() {
   };
 
   const resetFilters = () => {
+    setAdvancedFilters(undefined);
+    setPage(0);
     setView("all");
     setActiveIssueGroup(issueGroups[0]);
     setSearch("");
@@ -2564,8 +3005,8 @@ export default function App() {
   const selectAuditView = (view: IssueView) => {
     setView(view);
     setActiveIssueGroup(issueGroups.find((group) => group.views.includes(view)) ?? issueGroups[0]);
-    if (window.innerWidth <= 1200) setIssuesOpen(false);
-    if (window.innerWidth <= 1000) setOverviewOpen(false);
+    if (window.innerWidth <= 1200) changeIssuesOpen(false);
+    if (window.innerWidth <= 1000) changeOverviewOpen(false);
   };
 
   const addUrlSegment = () => {
@@ -2595,11 +3036,11 @@ export default function App() {
   };
 
   const addExtractor = () => {
-    setConfig({
+    setSettingsConfig({
       customExtractors: [
-        ...config.customExtractors,
+        ...settingsConfig.customExtractors,
         {
-          name: `extractor_${config.customExtractors.length + 1}`,
+          name: `extractor_${settingsConfig.customExtractors.length + 1}`,
           kind: "cssText",
           pattern: "h1",
           attribute: null,
@@ -2610,27 +3051,27 @@ export default function App() {
   };
 
   const updateExtractor = (index: number, patch: Partial<CustomExtractor>) => {
-    setConfig({
-      customExtractors: config.customExtractors.map((extractor, currentIndex) =>
+    setSettingsConfig({
+      customExtractors: settingsConfig.customExtractors.map((extractor, currentIndex) =>
         currentIndex === index ? { ...extractor, ...patch } : extractor,
       ),
     });
   };
 
   const removeExtractor = (index: number) => {
-    setConfig({
-      customExtractors: config.customExtractors.filter(
+    setSettingsConfig({
+      customExtractors: settingsConfig.customExtractors.filter(
         (_, currentIndex) => currentIndex !== index,
       ),
     });
   };
 
   const addCustomSearch = () => {
-    setConfig({
+    setSettingsConfig({
       customSearches: [
-        ...config.customSearches,
+        ...settingsConfig.customSearches,
         {
-          name: `search_${config.customSearches.length + 1}`,
+          name: `search_${settingsConfig.customSearches.length + 1}`,
           pattern: "analytics",
           regex: false,
           caseSensitive: false,
@@ -2641,35 +3082,37 @@ export default function App() {
   };
 
   const updateCustomSearch = (index: number, patch: Partial<CustomSearch>) => {
-    setConfig({
-      customSearches: config.customSearches.map((customSearch, currentIndex) =>
+    setSettingsConfig({
+      customSearches: settingsConfig.customSearches.map((customSearch, currentIndex) =>
         currentIndex === index ? { ...customSearch, ...patch } : customSearch,
       ),
     });
   };
 
   const removeCustomSearch = (index: number) => {
-    setConfig({
-      customSearches: config.customSearches.filter(
+    setSettingsConfig({
+      customSearches: settingsConfig.customSearches.filter(
         (_, currentIndex) => currentIndex !== index,
       ),
     });
   };
 
   const importListUrlsFromFile = async (file?: File | null) => {
-    if (!file) {
+    if (!file || workspaceOperation.current) {
       return;
     }
+    const revision = ++settingsRevision.current;
     try {
       const text = await file.text();
+      if (revision !== settingsRevision.current) return;
       const importedUrls = extractUrlsFromText(text);
       if (importedUrls.length === 0) {
         setNotice(`No URLs found in ${file.name}`);
         return;
       }
-      setConfig({
+      setSettingsConfig({
         mode: "list",
-        listUrls: mergeUniqueValues(config.listUrls, importedUrls),
+        listUrls: cleanPatterns([...settingsConfig.listUrls, ...importedUrls]),
       });
       setNotice(
         `Imported ${importedUrls.length.toLocaleString()} URL${
@@ -2677,54 +3120,60 @@ export default function App() {
         } from ${file.name}`,
       );
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (revision === settingsRevision.current) setError(errorMessage(caught));
     }
   };
 
   const updateResourceType = (key: keyof ResourceTypeConfig, checked: boolean) => {
-    setConfig({
+    setSettingsConfig({
       resourceTypes: {
-        ...config.resourceTypes,
+        ...settingsConfig.resourceTypes,
         [key]: checked,
       },
     });
   };
 
   const updateQuerySettings = (patch: Partial<QuerySettingsConfig>) => {
-    setConfig({
+    setSettingsConfig({
       querySettings: {
-        ...config.querySettings,
+        ...settingsConfig.querySettings,
         ...patch,
       },
     });
+  };
+
+  const updateSitemapSettings = (patch: Partial<SitemapConfig>) => {
+    setSettingsConfig({ sitemap: { ...settingsConfig.sitemap, ...patch } });
   };
 
   const updateRendering = (patch: Partial<JsRenderingConfig>) => {
-    setConfig({
+    setSettingsConfig({
       rendering: {
-        ...config.rendering,
+        ...settingsConfig.rendering,
         ...patch,
       },
     });
   };
 
-  const applySafePreset = () => {
-    setConfig({
-      concurrency: 4,
-      requestsPerSecond: 2,
-      requestDelayMs: 250,
+  const applyDefaultPreset = () => {
+    setSettingsConfig({
+      concurrency: defaultConfig.concurrency,
+      requestsPerSecond: defaultConfig.requestsPerSecond,
+      requestDelayMs: defaultConfig.requestDelayMs,
       retryAttempts: 1,
       retryBackoffMs: 250,
       respectRobots: true,
       useRobotsTxtOverride: false,
       followNofollow: true,
+      followInternalNofollow: true,
+      followExternalNofollow: true,
     });
   };
 
   const applyBenchmarkPreset = () => {
-    setConfig({
-      maxUrls: Math.max(config.maxUrls, 50_000),
-      maxDepth: Math.max(config.maxDepth, 10),
+    setSettingsConfig({
+      maxUrls: Math.max(settingsConfig.maxUrls, 50_000),
+      maxDepth: Math.max(settingsConfig.maxDepth, 10),
       concurrency: 64,
       requestsPerSecond: 0,
       requestDelayMs: 0,
@@ -2733,18 +3182,20 @@ export default function App() {
       respectRobots: false,
       useRobotsTxtOverride: false,
       followNofollow: true,
+      followInternalNofollow: true,
+      followExternalNofollow: true,
     });
   };
 
   const testRobotsTxt = async () => {
-    if (!desktopRuntime || !robotsTestUrl.trim() || !config.robotsTxtOverride.trim()) {
+    if (!desktopRuntime || !robotsTestUrl.trim() || !settingsConfig.robotsTxtOverride.trim()) {
       return;
     }
     try {
       const result = await invoke<RobotsTxtTestResult>("test_robots_txt", {
         request: {
-          userAgent: config.userAgent,
-          robotsTxt: config.robotsTxtOverride,
+          userAgent: settingsConfig.userAgent,
+          robotsTxt: settingsConfig.robotsTxtOverride,
           url: robotsTestUrl,
         },
       });
@@ -2761,14 +3212,14 @@ export default function App() {
 
   const testRobotsTxtBatch = async () => {
     const urls = textToPatterns(robotsBatchUrls);
-    if (!desktopRuntime || urls.length === 0 || !config.robotsTxtOverride.trim()) {
+    if (!desktopRuntime || urls.length === 0 || !settingsConfig.robotsTxtOverride.trim()) {
       return;
     }
     try {
       const result = await invoke<RobotsTxtBatchTestResult>("test_robots_txt_batch", {
         request: {
-          userAgent: config.userAgent,
-          robotsTxt: config.robotsTxtOverride,
+          userAgent: settingsConfig.userAgent,
+          robotsTxt: settingsConfig.robotsTxtOverride,
           urls,
         },
       });
@@ -2780,18 +3231,21 @@ export default function App() {
   };
 
   const downloadRobotsTxt = async () => {
-    if (!desktopRuntime || !config.startUrl.trim()) {
+    if (!desktopRuntime || !settingsConfig.startUrl.trim() || workspaceOperation.current) {
       return;
     }
+    const revision = ++settingsRevision.current;
     try {
       const result = await invoke<RobotsTxtDownloadResult>("download_robots_txt", {
         request: {
-          url: config.startUrl,
-          userAgent: config.userAgent,
-          timeoutSecs: config.timeoutSecs,
+          url: settingsConfig.startUrl,
+          userAgent: settingsConfig.userAgent,
+          timeoutSecs: settingsConfig.timeoutSecs,
+          requestHeaders: settingsConfig.requestHeaders,
         },
       });
-      setConfig({
+      if (revision !== settingsRevision.current) return;
+      setSettingsConfig({
         respectRobots: true,
         useRobotsTxtOverride: true,
         robotsTxtOverride: result.robotsTxt,
@@ -2800,91 +3254,194 @@ export default function App() {
         `Downloaded ${result.statusCode} from ${new URL(result.robotsUrl).pathname}`,
       );
     } catch (caught) {
+      if (revision !== settingsRevision.current) return;
       setRobotsTestResult(undefined);
       setError(errorMessage(caught));
     }
   };
 
-  const createSession = async () => {
-    if (!desktopRuntime) {
-      return;
-    }
+  const runWorkspaceAction = async (action: () => Promise<void>) => {
+    if (!desktopRuntime || running || settingsDirty || settingsApplying || workspaceOperation.current) return;
+    workspaceOperation.current = true;
+    setWorkspaceBusy(true);
+    rowsRequest.current += 1;
+    setError(undefined);
+    settingsRevision.current += 1;
     try {
-      const session = await invoke<CrawlSession>("create_crawl_session", {
-        request: {
-          name: newSessionName.trim() || sessionNameFromUrl(config.startUrl),
-          startUrl: config.startUrl,
-        },
-      });
-      setStorageMode("database");
-      setResumeCrawl(true);
-      setSelectedSessionId(session.id);
-      setDatabasePath(session.databasePath);
-      setCustomDatabasePath(session.databasePath);
-      setNewSessionName("");
-      await loadSessions();
+      await action();
     } catch (caught) {
       setError(errorMessage(caught));
+    } finally {
+      workspaceOperation.current = false;
+      setWorkspaceBusy(false);
     }
   };
 
-  const resetCrawlResults = async () => {
+  const pageSpeedDisabledReason = !desktopRuntime ? "Open the desktop app to run PageSpeed."
+    : running ? "Stop the crawl before running PageSpeed."
+    : workspaceBusy ? "Wait for the current operation to finish."
+    : !selected || selected.statusCode == null || selected.statusCode < 200 || selected.statusCode >= 300 ||
+      !selected.contentType?.toLowerCase().includes("text/html") || selected.indexabilityStatus === "Response body incomplete" ||
+      selected.error != null || selected.statusText === "Blocked by robots.txt"
+      ? "Select a successfully crawled HTML page to measure." : undefined;
+  const runPageSpeed = async () => {
+    if (!selected || pageSpeedDisabledReason) return;
+    const recordId = selected.id;
+    const requestId = crypto.randomUUID();
+    await runWorkspaceAction(async () => {
+      pageSpeedRequest.current = requestId;
+      setPageSpeedActive({ requestId, url: selected.finalUrl });
+      setPageSpeedCancelling(false); setNotice(undefined);
+      try {
+        const snapshot = await invoke<PageSpeedSnapshot>("run_page_speed", { request: { requestId, recordId, strategy: pageSpeedStrategy } });
+        // Selection and filters can change while Google is measuring; update only the original row.
+        useAppStore.setState((current) => ({
+          rows: current.rows.map((row) => row.id === recordId ? { ...row, pageSpeed: snapshot } : row),
+          selected: current.selected?.id === recordId ? { ...current.selected, pageSpeed: snapshot } : current.selected,
+        }));
+        setNotice("PageSpeed measurement saved.");
+      } catch (caught) {
+        if (errorMessage(caught) === "PageSpeed measurement cancelled") setNotice("PageSpeed measurement cancelled.");
+        else throw caught;
+      } finally {
+        pageSpeedRequest.current = undefined;
+        setPageSpeedActive(undefined); setPageSpeedCancelling(false);
+      }
+    });
+  };
+  const cancelPageSpeed = async () => {
+    const requestId = pageSpeedRequest.current;
+    if (!requestId || pageSpeedCancelling) return;
+    setPageSpeedCancelling(true);
+    try { await invoke("cancel_page_speed", { requestId }); }
+    catch (caught) { if (pageSpeedRequest.current === requestId) setError(errorMessage(caught)); }
+    finally { if (pageSpeedRequest.current === requestId) setPageSpeedCancelling(false); }
+  };
+  useEffect(() => () => {
+    const requestId = pageSpeedRequest.current;
+    if (requestId) void invoke("cancel_page_speed", { requestId }).catch(() => {});
+  }, []);
+
+  const resetCrawlResults = () => {
+    setAdvancedFilters(undefined);
+    setSelectedRecordIds([]);
+    selectionAnchor.current = undefined;
+    rowsRequest.current += 1;
+    urlTreeRequest.current += 1;
+    graphRequest.current += 1;
+    crawlPathRequest.current += 1;
+    databaseLocationRequest.current += 1;
+    recoveryRequest.current += 1;
+    linkReportRequest.current += 1;
     setSelected(undefined);
     setProgress(undefined);
     setProgressHistory([]);
     setPage(0);
-    await loadRows();
-    if (resultsViewMode === "tree") await loadUrlTree();
+    setSearch("");
+    setView("all");
+    setActiveSegmentId("all");
+    setActiveIssueGroup(issueGroups[0]);
+    setResultsViewMode("table");
+    setRows({ rows: [], total: 0, summary: emptySummary });
+    setUrlTree({ nodes: [], totalUrls: 0, renderedUrls: 0, capped: false });
+    setGraph(undefined);
+    setGraphUpdatedAt(undefined);
+    setGraphOpen(false);
+    setGraphLoading(false);
+    setGraphError(undefined);
+    setUrlTreeLoading(false);
+    setSelectedCrawlPath(undefined);
+    setCrawlPathLoading(false);
+    setSelectedImages([]);
+    setSelectedImageTotal(0);
+    setLinkReportsOpen(false);
+    setLinkReportLoading(false);
+    setLinkReportPage(0);
+    setLinkEdges([]);
+    setLinkEdgeTotal(0);
+    setAnchorTextRows([]);
+    setAnchorTextTotal(0);
+    setRedirectReportRows([]);
+    setRedirectReportTotal(0);
+    setSitemapValidationRows([]);
+    setSitemapValidationTotal(0);
+    setRecoveryState({ recoverable: false, queued: 0, seen: 0, crawled: 0 });
+    setWorkspaceRevision((revision) => revision + 1);
+  };
+
+  const restoreSession = (session: CrawlSession) => {
+    setStorageMode("database");
+    setSelectedSessionId(session.id);
+    setDatabasePath(session.databasePath);
+    setCustomDatabasePath(session.databasePath);
+    setConfig(session.config ? normalizeCrawlConfig(session.config) : {
+      mode: session.mode ?? "spider", startUrl: session.startUrl,
+      listUrls: [], listSitemapUrls: [],
+    });
   };
 
   const openSession = async (sessionId: string) => {
-    if (!desktopRuntime || !sessionId || running) {
-      return;
-    }
-    try {
+    if (!sessionId) return;
+    await runWorkspaceAction(async () => {
       const session = await invoke<CrawlSession>("open_crawl_session", { sessionId });
-      setStorageMode("database");
-      setResumeCrawl(true);
-      setSelectedSessionId(session.id);
-      setDatabasePath(session.databasePath);
-      setCustomDatabasePath(session.databasePath);
-      if (session.startUrl.trim()) {
-        setConfig({ startUrl: session.startUrl });
-      }
+      restoreSession(session);
+      resetCrawlResults();
       await loadSessions();
-      await resetCrawlResults();
       const recovery = await loadRecoveryState();
+      setResumeCrawl(recovery?.recoverable === true);
+      setWorkspaceAvailable(true);
+      setShowHome(false);
+      changeSettingsOpen(false);
       if (recovery?.recoverable) {
         setNotice(
           `Opened recoverable crawl state with ${recovery.queued.toLocaleString()} queued URLs.`,
         );
       }
-    } catch (caught) {
-      setError(errorMessage(caught));
-    }
+    });
+  };
+
+  const requestDeleteSession = (sessionId: string, origin: HTMLButtonElement) => {
+    if (!desktopRuntime || running || settingsDirty || settingsApplying || workspaceOperation.current) return;
+    const session = crawlSessions.find((item) => item.id === sessionId);
+    if (!session) return;
+    sessionDeleteOriginRef.current = origin;
+    setSessionDeleteError(undefined);
+    setSessionToDelete(session);
+    setSessionDeleteOpen(true);
   };
 
   const deleteSession = async () => {
-    if (!desktopRuntime || !selectedSessionId || running) {
-      return;
-    }
-    try {
-      await invoke("delete_crawl_session", { sessionId: selectedSessionId });
-      setSelectedSessionId("");
+    if (!sessionDeleteOpen || !sessionToDelete) return;
+    const sessionId = sessionToDelete.id;
+    await runWorkspaceAction(async () => {
+      setSessionDeleteError(undefined);
+      try {
+        await invoke("delete_crawl_session", { sessionId });
+      } catch (caught) {
+        setSessionDeleteError(errorMessage(caught));
+        return;
+      }
+      if (sessionId === selectedSessionId) {
+        setSelectedSessionId("");
+        setDatabasePath("");
+        setCustomDatabasePath("");
+        setResumeCrawl(false);
+        resetCrawlResults();
+        setWorkspaceAvailable(false);
+        setShowHome(true);
+        changeSettingsOpen(false);
+      }
+      setCrawlSessions((sessions) => sessions.filter((session) => session.id !== sessionId));
+      setComparisonSelection((selected) => selected.filter((id) => id !== sessionId));
+      setSessionDeleteOpen(false);
+      setNotice(undefined);
       await loadSessions();
-      await loadDatabaseLocation();
-      await resetCrawlResults();
-      await loadRecoveryState();
-    } catch (caught) {
-      setError(errorMessage(caught));
-    }
+    });
   };
 
   const openCustomDatabasePath = async () => {
-    if (!desktopRuntime || !customDatabasePath.trim() || running) {
-      return;
-    }
-    try {
+    if (!customDatabasePath.trim()) return;
+    await runWorkspaceAction(async () => {
       const location = await invoke<DatabaseLocation>("open_database_path", {
         path: customDatabasePath.trim(),
       });
@@ -2892,27 +3449,31 @@ export default function App() {
       setSelectedSessionId("");
       setDatabasePath(location.path);
       setCustomDatabasePath(location.path);
+      if (location.session) restoreSession(location.session);
       await resetCrawlResults();
       const recovery = await loadRecoveryState();
+      setResumeCrawl(recovery?.recoverable === true);
+      setWorkspaceAvailable(true);
+      setShowHome(false);
       setNotice(
         recovery?.recoverable
           ? `Opened database ${location.path}. Recoverable crawl state has ${recovery.queued.toLocaleString()} queued URLs.`
           : `Opened database ${location.path}`,
       );
-    } catch (caught) {
-      setError(errorMessage(caught));
-    }
+    });
   };
 
   const saveProfile = async () => {
-    if (!desktopRuntime) {
+    if (!desktopRuntime || running) {
       return;
     }
     try {
+      const profileConfig = normalizeCrawlConfig(settingsConfig);
+      await invoke("validate_crawl_configuration", { config: profileConfig });
       const profile = await invoke<ConfigProfile>("save_config_profile", {
         request: {
-          name: newProfileName.trim() || `${sessionNameFromUrl(config.startUrl)} profile`,
-          config,
+          name: newProfileName.trim() || `${sessionNameFromUrl(settingsConfig.startUrl)} profile`,
+          config: profileConfig,
         },
       });
       setSelectedProfileId(profile.id);
@@ -2924,15 +3485,19 @@ export default function App() {
   };
 
   const loadProfile = async (profileId: string) => {
-    if (!desktopRuntime || !profileId) {
+    if (!desktopRuntime || running || workspaceOperation.current) {
       return;
     }
+    const revision = ++settingsRevision.current;
+    setSelectedProfileId(profileId);
+    if (!profileId) return;
     try {
       const profile = await invoke<ConfigProfile>("load_config_profile", { profileId });
-      setConfig(normalizeCrawlConfig(profile.config));
-      setSelectedProfileId(profile.id);
-      await loadProfiles();
+      if (revision !== settingsRevision.current) return;
+      setSettingsConfig(normalizeCrawlConfig(profile.config));
     } catch (caught) {
+      if (revision !== settingsRevision.current) return;
+      setSelectedProfileId("");
       setError(errorMessage(caught));
     }
   };
@@ -3060,6 +3625,7 @@ export default function App() {
     limit: 1_000_000,
     globalSearch,
     ...segmentQuery(activeSegment),
+    ...(advancedFilters ? { filters: advancedFilters } : {}),
     sortBy,
     sortDir,
     view: selectedView,
@@ -3070,11 +3636,19 @@ export default function App() {
       setError("Open the desktop app with make dev to export files.");
       return;
     }
+    const scoped = ["auditWorkbook", "selectedCsv", "queuedUrlsCsv", "xlsx", "imageAltCsv", "crawlArchive"].includes(kind);
+    if (workspaceOperation.current || (["auditWorkbook", "xlsx", "imageAltCsv", "crawlArchive"].includes(kind) && running) || (kind === "selectedCsv" && selectedRecordIds.length === 0)) return;
+    if (scoped) {
+      workspaceOperation.current = true;
+      setWorkspaceBusy(true);
+    }
     try {
       setError(undefined);
+      if (scoped) setNotice(kind === "auditWorkbook" ? "Creating audit workbook…" : kind === "crawlArchive" ? "Creating crawl archive…" : "Creating export…");
       const result = await invoke<ExportFileResult>("export_file", {
         request: {
           kind,
+          ...(kind === "selectedCsv" ? { recordIds: selectedRecordIds } : {}),
           query:
             kind === "csv" || kind === "xlsx" || kind === "sitemap"
               ? currentGridExportQuery()
@@ -3091,32 +3665,36 @@ export default function App() {
         } to ${result.path}`,
       );
     } catch (caught) {
+      if (scoped) setNotice(undefined);
       setError(errorMessage(caught));
+    } finally {
+      if (scoped) {
+        workspaceOperation.current = false;
+        setWorkspaceBusy(false);
+      }
     }
   };
 
   const importCrawlArchive = async () => {
-    if (!desktopRuntime || !archiveImportPath.trim() || running) {
-      return;
-    }
-    try {
+    if (!archiveImportPath.trim()) return;
+    await runWorkspaceAction(async () => {
       const result = await invoke<CrawlArchiveImportResult>("import_crawl_archive", {
         request: {
           path: archiveImportPath.trim(),
           storageMode,
         },
       });
+      restoreSession(result.session);
       setNotice(
         `Imported ${result.records.toLocaleString()} URLs, ${result.linkEdges.toLocaleString()} links, ${result.imageAssets.toLocaleString()} images, and ${result.frontierItems.toLocaleString()} frontier items.`,
       );
       await resetCrawlResults();
       const recovery = await loadRecoveryState();
-      if (storageMode === "database" && recovery?.recoverable) {
-        setResumeCrawl(true);
-      }
-    } catch (caught) {
-      setError(errorMessage(caught));
-    }
+      setResumeCrawl(recovery?.recoverable === true);
+      setWorkspaceAvailable(true);
+      setShowHome(false);
+      await loadSessions();
+    });
   };
 
   const compareCrawlArchive = async () => {
@@ -3125,15 +3703,44 @@ export default function App() {
     }
     setComparisonLoading(true);
     setComparisonResult(undefined);
+    const request = ++comparisonRequest.current;
     try {
       const result = await invoke<CrawlComparisonResponse>("compare_crawl_archive", {
         request: { path: comparisonArchivePath.trim() },
       });
-      setComparisonResult(result);
+      if (request === comparisonRequest.current) setComparisonResult(result);
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (request === comparisonRequest.current) setError(errorMessage(caught));
     } finally {
-      setComparisonLoading(false);
+      if (request === comparisonRequest.current) setComparisonLoading(false);
+    }
+  };
+
+  const changeComparisonOpen = (open: boolean) => {
+    if (!open) { comparisonRequest.current += 1; setComparisonLoading(false); }
+    setComparisonOpen(open);
+  };
+
+  const compareSavedCrawls = async () => {
+    if (running || workspaceOperation.current || comparisonLoading || comparisonSelection.length !== 2) return;
+    const sessions = comparisonSelection.map((id) => crawlSessions.find((session) => session.id === id));
+    if (!sessions[0] || !sessions[1]) return;
+    const pair = (sessions as [CrawlSession, CrawlSession]).sort((a, b) => a.createdAtMs - b.createdAtMs || a.id.localeCompare(b.id));
+    const request = ++comparisonRequest.current;
+    setComparisonSessions(pair);
+    setComparisonResult(undefined);
+    setComparisonLoading(true);
+    setComparisonOpen(true);
+    setError(undefined);
+    try {
+      const result = await invoke<CrawlComparisonResponse>("compare_crawl_sessions", {
+        baselineSessionId: pair[0].id, currentSessionId: pair[1].id,
+      });
+      if (request === comparisonRequest.current) setComparisonResult(result);
+    } catch (caught) {
+      if (request === comparisonRequest.current) setError(errorMessage(caught));
+    } finally {
+      if (request === comparisonRequest.current) setComparisonLoading(false);
     }
   };
 
@@ -3160,10 +3767,12 @@ export default function App() {
   };
 
   const copyText = async (value: string, label: string) => {
+    setNotice(undefined);
     try {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(value);
       } else {
+        const origin = document.activeElement as HTMLElement | null;
         const textArea = document.createElement("textarea");
         textArea.value = value;
         textArea.style.position = "fixed";
@@ -3171,8 +3780,9 @@ export default function App() {
         document.body.appendChild(textArea);
         textArea.focus();
         textArea.select();
-        document.execCommand("copy");
-        document.body.removeChild(textArea);
+        try {
+          if (!document.execCommand("copy")) throw new Error("Clipboard access was denied. Use CSV export instead.");
+        } finally { document.body.removeChild(textArea); if (origin?.isConnected) origin.focus(); }
       }
       setNotice(`${label} copied.`);
     } catch (caught) {
@@ -3184,6 +3794,18 @@ export default function App() {
     if (selected?.finalUrl) {
       await copyText(selected.finalUrl, "URL");
     }
+  };
+
+  const copySelectedRecords = async () => {
+    if (!desktopRuntime || !selectedRecordIds.length || workspaceOperation.current) return;
+    workspaceOperation.current = true;
+    setWorkspaceBusy(true);
+    setError(undefined);
+    try {
+      const text = await invoke<string>("export_selected_csv", { recordIds: selectedRecordIds });
+      await copyText(text, `${selectedRecordIds.length.toLocaleString()} selected row${selectedRecordIds.length === 1 ? "" : "s"}`);
+    } catch (caught) { setError(errorMessage(caught)); }
+    finally { workspaceOperation.current = false; setWorkspaceBusy(false); }
   };
 
   const copySourceUrl = async () => {
@@ -3203,40 +3825,64 @@ export default function App() {
       setQuitting(false);
     }
   };
+  const updateDialogOpen = updateOpen && !quitOpen && !settingsOpen && !aboutOpen && !comparisonOpen && !serpOpen && !linkReportsOpen && !graphOpen;
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell${showHome ? " home-screen" : ""}`}>
       <header className="toolbar">
-        <div className="brand">
+        <button className="brand" aria-label="Crawl library" title="Crawl library" disabled={workspaceBusy}
+          onClick={() => { setShowHome(true); setError(undefined); }}>
           <img className="brand-mark" src="/brand/ferrous-frog.png" width="28" height="28" alt="" />
           <div>
             <h1>Ferrous Frog</h1>
             <p>SEO Spider</p>
           </div>
-        </div>
-        <form id="crawl-target" className="url-control" noValidate={config.mode === "list"} onSubmit={(event) => {
+        </button>
+        <form id="crawl-target" className="url-control" hidden={showHome} noValidate={config.mode === "list"} onSubmit={(event) => {
           event.preventDefault();
           if (!running && desktopRuntime && hasCrawlTarget) void startCrawl();
         }}>
-          <select
-            className="mode-select"
-            aria-label="Crawl mode"
-            value={config.mode}
-            disabled={running}
-            onChange={(event) => setConfig({ mode: event.target.value as CrawlMode })}
-            title={running ? "Stop the crawl before changing mode" : "Crawl mode"}
-          >
-            <option value="spider">Spider</option>
-            <option value="list">List</option>
-          </select>
+          <DropdownMenu.Root open={modeMenuOpen} onOpenChange={setModeMenuOpen}>
+            <DropdownMenu.Trigger asChild>
+              <button type="button" className="mode-select" aria-label="Crawl mode" data-mode={config.mode} title="Mode" disabled={workspaceBusy}>
+                <span>{config.mode === "spider" ? "Spider" : "List"}</span><ChevronDown size={14} />
+              </button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content className="dropdown-content toolbar-menu" align="start" sideOffset={6} inert={!modeMenuOpen} onKeyDownCapture={preventClosedMenuKeys}
+                onClickCapture={prepareDialogMenu} onCloseAutoFocus={focusOpenedDialog}>
+                <DropdownMenu.Label className="dropdown-label">Mode</DropdownMenu.Label>
+                <DropdownMenu.RadioGroup value={config.mode} onValueChange={(mode) => setConfig({ mode: mode as CrawlMode })} aria-label="Operating mode">
+                  {(["spider", "list"] as const).map((mode) => <DropdownMenu.RadioItem key={mode} data-mode={mode} value={mode} disabled={running} className="dropdown-item toolbar-menu-item">
+                    {mode === "spider" ? <Network size={15} /> : <ListTree size={15} />}<span>{mode === "spider" ? "Spider" : "List"}</span>
+                    <DropdownMenu.ItemIndicator className="theme-check"><Check size={15} /></DropdownMenu.ItemIndicator>
+                  </DropdownMenu.RadioItem>)}
+                </DropdownMenu.RadioGroup>
+                <DropdownMenu.Separator className="dropdown-separator" />
+                <DropdownMenu.Item className="dropdown-item toolbar-menu-item" data-action="compare-crawls"
+                  disabled={!desktopRuntime || running || summary.total === 0} onSelect={() => {
+                    setComparisonSessions(undefined); setComparisonResult(undefined); setComparisonOpen(true);
+                  }}>
+                  <FileText size={15} /><span>Compare crawls</span>
+                </DropdownMenu.Item>
+                <DropdownMenu.Item className="dropdown-item toolbar-menu-item" data-action="serp-preview" disabled={!desktopRuntime}
+                  onSelect={() => { setSerpVisited(true); setSerpOpen(true); }}>
+                  <Search size={15} /><span>SERP preview</span>
+                </DropdownMenu.Item>
+                <p className="mode-menu-help">{running ? "Stop the crawl to change mode or compare results." :
+                  !desktopRuntime ? "Open the desktop app to crawl and compare." : summary.total === 0 ? "Crawl or open a saved session to compare it with an archive." :
+                  "Spider follows links. List checks only your supplied URLs."}</p>
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
           <input
             type="url"
             required={config.mode === "spider"}
             aria-label={config.mode === "list" ? "Root URL" : "Seed URL"}
             value={config.startUrl}
             onChange={(event) => setConfig({ startUrl: event.target.value })}
-            readOnly={running}
-            aria-readonly={running}
+            readOnly={running || workspaceBusy}
+            aria-readonly={running || workspaceBusy}
             title={
               running
                 ? "Stop the crawl before changing the URL"
@@ -3246,14 +3892,31 @@ export default function App() {
             }
             placeholder="https://example.com/"
           />
+          <select
+            className="scope-select"
+            aria-label="Crawl scope"
+            value={config.mode === "list" ? "list" : activeCrawlScope?.id ?? "custom"}
+            disabled={running || workspaceBusy || config.mode === "list"}
+            title={config.mode === "list" ? "List mode crawls the supplied URLs without expanding links." :
+              running ? "Stop the crawl before changing scope" : activeCrawlScope?.description ?? "Custom host and folder rules from Settings > Scope."}
+            onChange={(event) => {
+              const scope = crawlScopePresets.find((item) => item.id === event.target.value);
+              if (scope) setConfig({ subdomainScope: scope.subdomainScope, folderScope: scope.folderScope });
+            }}
+          >
+            {config.mode === "list" ? <option value="list">URL list</option> : null}
+            {!activeCrawlScope ? <option value="custom" disabled>Custom scope</option> : null}
+            {crawlScopePresets.map((scope) => <option key={scope.id} value={scope.id}>{scope.label}</option>)}
+          </select>
         </form>
         <div className="crawl-controls">
           <button
             className="primary"
+            hidden={showHome}
             type={running ? "button" : "submit"}
             form="crawl-target"
             onClick={running ? primaryCrawlAction : undefined}
-            disabled={!desktopRuntime || (!running && !hasCrawlTarget)}
+            disabled={!desktopRuntime || workspaceBusy || (!running && !hasCrawlTarget)}
             title={!running ? "Start crawl" : paused ? "Resume crawl" : "Pause crawl"}
           >
             {!running || paused ? <Play size={16} /> : <Pause size={16} />}
@@ -3261,6 +3924,7 @@ export default function App() {
           </button>
           <button
             className="destructive"
+            hidden={showHome}
             onClick={stopCrawl}
             disabled={!running || !desktopRuntime}
             title="Stop crawl"
@@ -3268,16 +3932,16 @@ export default function App() {
             <Square size={16} />
             <span>Stop</span>
           </button>
-          <DropdownMenu.Root>
+          <DropdownMenu.Root open={exportMenuOpen} onOpenChange={setExportMenuOpen}>
             <DropdownMenu.Trigger asChild>
-              <button className="export-trigger" aria-label="Export crawl data" title="Export crawl data" disabled={exportDisabled}>
+              <button className="export-trigger" hidden={showHome} aria-label="Export crawl data" title="Export crawl data" disabled={exportMenuDisabled}>
                 <Download size={16} />
                 <span>Export</span>
                 <ChevronDown size={14} />
               </button>
             </DropdownMenu.Trigger>
             <DropdownMenu.Portal>
-              <DropdownMenu.Content className="dropdown-content" align="end" sideOffset={8}>
+              <DropdownMenu.Content className="dropdown-content" align="end" sideOffset={8} inert={!exportMenuOpen} onKeyDownCapture={preventClosedMenuKeys}>
                 <DropdownMenu.Item
                   className="dropdown-item"
                   disabled={filteredExportDisabled}
@@ -3285,12 +3949,30 @@ export default function App() {
                 >
                   CSV
                 </DropdownMenu.Item>
+                <DropdownMenu.Item className="dropdown-item" disabled={exportDisabled || selectedRecordIds.length === 0}
+                  onSelect={() => void exportFile("selectedCsv")}>Selected Rows CSV</DropdownMenu.Item>
+                <DropdownMenu.Item className="dropdown-item" disabled={exportDisabled || selectedRecordIds.length === 0}
+                  onSelect={() => void copySelectedRecords()}>Copy Selected Rows</DropdownMenu.Item>
+                <DropdownMenu.Item className="dropdown-item" disabled={exportMenuDisabled || !queuedExportAvailable}
+                  onSelect={() => void exportFile("queuedUrlsCsv")}>Queued URLs CSV</DropdownMenu.Item>
+                <DropdownMenu.Item className="dropdown-item" disabled={exportDisabled || running}
+                  title={running ? "Stop the crawl to export image occurrences" : "Export images and alt text from all pages"}
+                  onSelect={() => void exportFile("imageAltCsv")}>Image Alt Text CSV</DropdownMenu.Item>
                 <DropdownMenu.Item
                   className="dropdown-item"
-                  disabled={filteredExportDisabled}
+                  disabled={filteredExportDisabled || running}
+                  title={running ? "Stop the crawl to create an XLSX export" : "Export the current filtered view"}
                   onSelect={() => void exportFile("xlsx")}
                 >
                   XLSX
+                </DropdownMenu.Item>
+                <DropdownMenu.Item
+                  className="dropdown-item"
+                  disabled={exportDisabled || running}
+                  title={running ? "Stop the crawl to create an audit workbook" : "Export all crawl URLs and audit sheets"}
+                  onSelect={() => void exportFile("auditWorkbook")}
+                >
+                  Audit Workbook (XLSX)
                 </DropdownMenu.Item>
                 <DropdownMenu.Item
                   className="dropdown-item"
@@ -3350,7 +4032,7 @@ export default function App() {
                 </DropdownMenu.Item>
                 <DropdownMenu.Item
                   className="dropdown-item"
-                  disabled={exportDisabled}
+                  disabled={exportDisabled || running}
                   onSelect={() => void exportFile("crawlArchive")}
                 >
                   Crawl Archive
@@ -3358,10 +4040,10 @@ export default function App() {
               </DropdownMenu.Content>
             </DropdownMenu.Portal>
           </DropdownMenu.Root>
-          <button className="settings-trigger" aria-label="Crawl settings" title="Crawl settings" onClick={() => setSettingsOpen(true)}>
+          <button className="settings-trigger" aria-label="Crawl settings" title="Crawl settings" onClick={() => changeSettingsOpen(true)}>
             <Settings size={16} /><span>Settings</span>
           </button>
-          <DropdownMenu.Root>
+          <DropdownMenu.Root open={toolsMenuOpen} onOpenChange={setToolsMenuOpen}>
             <DropdownMenu.Trigger asChild>
               <button className="compact-menu-trigger" title="More tools" aria-label="More tools">
                 <MoreHorizontal size={16} />
@@ -3369,11 +4051,12 @@ export default function App() {
               </button>
             </DropdownMenu.Trigger>
             <DropdownMenu.Portal>
-              <DropdownMenu.Content className="dropdown-content toolbar-menu" align="end" sideOffset={8}
-                onCloseAutoFocus={(event) => { if (cancelQuitRef.current) event.preventDefault(); }}>
+              <DropdownMenu.Content className="dropdown-content toolbar-menu" align="end" sideOffset={8} inert={!toolsMenuOpen} onKeyDownCapture={preventClosedMenuKeys}
+                onClickCapture={prepareDialogMenu}
+                onCloseAutoFocus={focusOpenedDialog}>
                 <DropdownMenu.Item
                   className="dropdown-item toolbar-menu-item"
-                  disabled={!desktopRuntime}
+                  disabled={!desktopRuntime || showHome}
                   onSelect={() => setLinkReportsOpen(true)}
                 >
                   <Network size={15} />
@@ -3381,16 +4064,8 @@ export default function App() {
                 </DropdownMenu.Item>
                 <DropdownMenu.Item
                   className="dropdown-item toolbar-menu-item"
-                  disabled={!desktopRuntime}
-                  onSelect={() => setComparisonOpen(true)}
-                >
-                  <FileText size={15} />
-                  <span>Crawl Comparison</span>
-                </DropdownMenu.Item>
-                <DropdownMenu.Item
-                  className="dropdown-item toolbar-menu-item"
-                  disabled={!desktopRuntime}
-                  onSelect={() => setGraphOpen(true)}
+                  disabled={!desktopRuntime || showHome}
+                  onSelect={() => { setGraphVisited(true); setGraphOpen(true); }}
                 >
                   <GitFork size={15} />
                   <span>Crawl Graph</span>
@@ -3440,11 +4115,12 @@ export default function App() {
         </div>
       </header>
 
-      <Dialog.Root open={quitOpen} onOpenChange={(open) => { if (!quitting) { setQuitOpen(open); setQuitError(undefined); } }}>
+      <Dialog.Root open={quitOpen} onOpenChange={(open) => { if (!quitting) { setQuitOpen(open); if (open) setQuitError(undefined); } }}>
         <Dialog.Portal>
           <Dialog.Overlay className="modal-backdrop quit-backdrop" />
           <Dialog.Content
             className="quit-modal"
+            inert={!quitOpen}
             role="alertdialog"
             onOpenAutoFocus={(event) => { event.preventDefault(); cancelQuitRef.current?.focus(); }}
             onCloseAutoFocus={(event) => {
@@ -3458,7 +4134,7 @@ export default function App() {
             <Dialog.Title>Quit Ferrous Frog?</Dialog.Title>
             <Dialog.Description>
               {running ? "A crawl is running. Quitting will stop it." : "Are you sure you want to quit?"}
-              {storageMode === "memory" && (summary.total > 0 || running) ? " In-memory results will be lost. Export any results you need before quitting." : ""}
+              {summary.total > 0 ? " Crawl results are saved automatically." : ""}
             </Dialog.Description>
             {quitError ? <p className="error-bar" role="alert">{quitError}</p> : null}
             {quitting ? <p role="status">Stopping the crawl and closing…</p> : null}
@@ -3471,17 +4147,18 @@ export default function App() {
       </Dialog.Root>
 
       <Dialog.Root
-        open={updateOpen && !quitOpen && !settingsOpen && !aboutOpen && !comparisonOpen && !linkReportsOpen && !graphOpen}
+        open={updateDialogOpen}
         onOpenChange={(open) => { if (!open) dismissUpdate(); }}
       >
         <Dialog.Portal>
           <Dialog.Overlay className="modal-backdrop" />
           <Dialog.Content
             className="about-modal update-modal"
+            inert={!updateDialogOpen}
             onOpenAutoFocus={(event) => { event.preventDefault(); updateDismissRef.current?.focus(); }}
             onCloseAutoFocus={(event) => {
               event.preventDefault();
-              if (quitOpen || settingsOpen || aboutOpen || comparisonOpen || linkReportsOpen || graphOpen) return;
+              if (quitOpen || settingsOpen || aboutOpen || comparisonOpen || serpOpen || linkReportsOpen || graphOpen) return;
               const origin = updateOriginRef.current;
               (origin?.isConnected ? origin : document.querySelector<HTMLButtonElement>('[aria-label="More tools"]'))?.focus();
             }}
@@ -3523,7 +4200,7 @@ export default function App() {
       <Dialog.Root open={aboutOpen} onOpenChange={setAboutOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="modal-backdrop" />
-          <Dialog.Content className="about-modal">
+          <Dialog.Content className="about-modal" inert={!aboutOpen}>
             <div className="modal-header about-modal-header">
               <Dialog.Title asChild>
                 <h2 id="about-title">About Ferrous Frog</h2>
@@ -3582,16 +4259,23 @@ export default function App() {
         </Dialog.Portal>
       </Dialog.Root>
 
-      <Dialog.Root open={settingsOpen} onOpenChange={setSettingsOpen}>
+      <Dialog.Root open={settingsOpen} onOpenChange={changeSettingsOpen}>
         <Dialog.Portal>
           <Dialog.Overlay className="modal-backdrop" />
-          <Dialog.Content className="settings-modal">
+          <Dialog.Content className="settings-modal" inert={!settingsOpen} onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            if (settingsOpen) return;
+            setSettingsDraft(null);
+            if (document.activeElement === document.body || document.activeElement?.closest('[data-state="closed"]')) {
+              document.querySelector<HTMLButtonElement>('[aria-label="Crawl settings"]')?.focus();
+            }
+          }}>
             <div className="modal-header">
               <div>
                 <Dialog.Title asChild>
                   <h2 id="settings-title">Crawl Settings</h2>
                 </Dialog.Title>
-                <Dialog.Description className="settings-save-note">Crawl options are saved automatically on this device.</Dialog.Description>
+                <Dialog.Description className="settings-save-note">Apply saves crawl options on this device. Cancel discards pending edits. Session, archive, profile-save and credential actions take effect when clicked.</Dialog.Description>
               </div>
               <Dialog.Close asChild>
                 <button title="Close settings">
@@ -3601,43 +4285,83 @@ export default function App() {
               <FeedbackMessages />
             </div>
 
+            {settingsValidationError ? <p className="settings-validation-error" role="alert">{settingsValidationError}</p> : null}
             <div className="settings-layout">
               <aside className="settings-sidebar">
-                <span className="settings-sidebar-label">Sections</span>
+                <input type="search" aria-label="Search settings" placeholder="Search settings…"
+                  value={settingsSearch} onChange={(event) => {
+                    const search = event.target.value;
+                    setSettingsSearch(search);
+                    const matches = matchingSettingsTabs(search);
+                    setCollapsedSettingsGroups(search.trim() ? settingsGroups.filter((group) => !matches.some((tab) => tab.group === group)) : settingsGroups);
+                    if (matches.length && !matches.some((tab) => tab.id === settingsTab)) setSettingsTab(matches[0].id);
+                  }} />
                 <nav className="settings-tabs" aria-label="Settings sections">
-                  {settingsTabs.map((tab) => (
-                    <button
-                      key={tab.id}
-                      className={`settings-tab-button ${
-                        settingsTab === tab.id ? "active" : ""
-                      }`}
-                      onClick={() => setSettingsTab(tab.id)}
-                      aria-current={settingsTab === tab.id ? "page" : undefined}
-                    >
-                      <span>{tab.label}</span>
-                    </button>
-                  ))}
+                  {settingsGroups.map((group) => {
+                    const tabs = visibleSettingsTabs.filter((tab) => tab.group === group);
+                    if (!tabs.length) return null;
+                    return (
+                      <details key={group} open={!collapsedSettingsGroups.includes(group)}>
+                        <summary onClick={(event) => {
+                          event.preventDefault();
+                          setCollapsedSettingsGroups((previous) => previous.includes(group)
+                            ? previous.filter((value) => value !== group) : [...previous, group]);
+                        }}><ChevronRight className="settings-group-chevron" size={13} aria-hidden="true" />
+                          {group === "Spider" ? <Settings size={15} aria-hidden="true" /> : group === "Analysis" ? <FileText size={15} aria-hidden="true" /> : <Folder size={15} aria-hidden="true" />}
+                          <span>{group}</span></summary>
+                        <div className="settings-group-items">
+                        {tabs.map((tab) => (
+                          <button
+                            key={tab.id}
+                            className={`settings-tab-button ${settingsTab === tab.id ? "active" : ""}`}
+                            onClick={() => setSettingsTab(tab.id)}
+                            aria-current={settingsTab === tab.id ? "page" : undefined}
+                          >
+                            <span>{tab.label}</span>
+                          </button>
+                        ))}
+                        </div>
+                      </details>
+                    );
+                  })}
                 </nav>
+                <select className="settings-section-picker" aria-label="Settings section" value={visibleSettingsTabs.length ? settingsTab : ""}
+                  disabled={!visibleSettingsTabs.length} onChange={(event) => setSettingsTab(event.target.value as SettingsTab)}>
+                  {!visibleSettingsTabs.length ? <option value="">No matching sections</option> : null}
+                  {settingsGroups.map((group) => {
+                    const tabs = visibleSettingsTabs.filter((tab) => tab.group === group);
+                    return tabs.length ? <optgroup key={group} label={group}>
+                      {tabs.map((tab) => <option key={tab.id} value={tab.id}>{tab.label}</option>)}
+                    </optgroup> : null;
+                  })}
+                </select>
+                {!visibleSettingsTabs.length ? <div className="settings-search-empty" role="status">
+                    <p>No settings found.</p><button onClick={() => {
+                      setSettingsSearch("");
+                      setCollapsedSettingsGroups(settingsGroups);
+                    }}>Clear search</button>
+                  </div> : null}
               </aside>
 
-              <div className="settings-content">
+              <fieldset ref={settingsContentRef} className="settings-content" disabled={running || settingsApplying || workspaceBusy}>
+                <legend className="sr-only">Crawl configuration</legend>
                 <div className="settings-panel-heading">
                   <div>
-                    <p>Settings</p>
+                    <p>{activeSettingsTab.group} / {activeSettingsTab.label}</p>
                     <h3>{activeSettingsTab.label}</h3>
                     <span>{activeSettingsTab.description}</span>
                   </div>
                 </div>
-            <section className="settings-section" hidden={settingsTab !== "crawl"}>
+            <section className="settings-section" data-settings-section="crawl" hidden={settingsTab !== "crawl"}>
               <h3>Limits and Throughput</h3>
               <div className="settings-grid">
                 <div className="settings-preset-row settings-wide">
                   <button
                     className="settings-action-button secondary"
-                    onClick={applySafePreset}
+                    onClick={applyDefaultPreset}
                     type="button"
                   >
-                    Safe preset
+                    Default preset
                   </button>
                   <button
                     className="settings-action-button warning"
@@ -3652,8 +4376,8 @@ export default function App() {
                   <input
                     type="number"
                     min={1}
-                    value={config.maxUrls}
-                    onChange={(event) => setConfig({ maxUrls: Number(event.target.value) })}
+                    value={settingsConfig.maxUrls}
+                    onChange={(event) => setSettingsConfig({ maxUrls: Number(event.target.value) })}
                   />
                 </label>
                 <label>
@@ -3661,8 +4385,8 @@ export default function App() {
                   <input
                     type="number"
                     min={0}
-                    value={config.maxDepth}
-                    onChange={(event) => setConfig({ maxDepth: Number(event.target.value) })}
+                    value={settingsConfig.maxDepth}
+                    onChange={(event) => setSettingsConfig({ maxDepth: Number(event.target.value) })}
                   />
                 </label>
                 <label>
@@ -3670,8 +4394,8 @@ export default function App() {
                   <input
                     type="number"
                     min={1}
-                    value={config.concurrency}
-                    onChange={(event) => setConfig({ concurrency: Number(event.target.value) })}
+                    value={settingsConfig.concurrency}
+                    onChange={(event) => setSettingsConfig({ concurrency: Number(event.target.value) })}
                   />
                 </label>
                 <label>
@@ -3679,9 +4403,9 @@ export default function App() {
                   <input
                     type="number"
                     min={0}
-                    value={config.requestsPerSecond}
+                    value={settingsConfig.requestsPerSecond}
                     onChange={(event) =>
-                      setConfig({ requestsPerSecond: Number(event.target.value) })
+                      setSettingsConfig({ requestsPerSecond: Number(event.target.value) })
                     }
                   />
                 </label>
@@ -3690,9 +4414,9 @@ export default function App() {
                   <input
                     type="number"
                     min={0}
-                    value={config.requestDelayMs}
+                    value={settingsConfig.requestDelayMs}
                     onChange={(event) =>
-                      setConfig({ requestDelayMs: Number(event.target.value) })
+                      setSettingsConfig({ requestDelayMs: Number(event.target.value) })
                     }
                   />
                 </label>
@@ -3702,8 +4426,8 @@ export default function App() {
                     type="number"
                     min={0}
                     max={5}
-                    value={config.retryAttempts}
-                    onChange={(event) => setConfig({ retryAttempts: Number(event.target.value) })}
+                    value={settingsConfig.retryAttempts}
+                    onChange={(event) => setSettingsConfig({ retryAttempts: Number(event.target.value) })}
                   />
                 </label>
                 <label>
@@ -3712,8 +4436,8 @@ export default function App() {
                     type="number"
                     min={0}
                     max={30000}
-                    value={config.retryBackoffMs}
-                    onChange={(event) => setConfig({ retryBackoffMs: Number(event.target.value) })}
+                    value={settingsConfig.retryBackoffMs}
+                    onChange={(event) => setSettingsConfig({ retryBackoffMs: Number(event.target.value) })}
                   />
                 </label>
                 <label>
@@ -3722,35 +4446,52 @@ export default function App() {
                     type="number"
                     min={0}
                     max={64}
-                    value={config.nearDuplicateThreshold}
+                    value={settingsConfig.nearDuplicateThreshold}
                     onChange={(event) =>
-                      setConfig({ nearDuplicateThreshold: Number(event.target.value) })
+                      setSettingsConfig({ nearDuplicateThreshold: Number(event.target.value) })
                     }
                   />
                 </label>
                 <CheckboxField
-                  checked={config.respectRobots}
-                  onCheckedChange={(checked) => setConfig({ respectRobots: checked })}
+                  checked={settingsConfig.respectRobots}
+                  onCheckedChange={(checked) => setSettingsConfig({ respectRobots: checked })}
                 >
                   Respect robots.txt
                 </CheckboxField>
                 <CheckboxField
-                  checked={config.useRobotsTxtOverride}
-                  disabled={!config.respectRobots}
+                  checked={settingsConfig.useRobotsTxtOverride}
+                  disabled={!settingsConfig.respectRobots}
                   onCheckedChange={(checked) =>
-                    setConfig({ useRobotsTxtOverride: checked })
+                    setSettingsConfig({ useRobotsTxtOverride: checked })
                   }
                 >
                   Override robots.txt
                 </CheckboxField>
+                <label>
+                  Timeout seconds
+                  <input type="number" min={1} value={settingsConfig.timeoutSecs}
+                    onChange={(event) => setSettingsConfig({ timeoutSecs: Number(event.target.value) })} />
+                </label>
+                <label>
+                  Redirect limit
+                  <input type="number" min={1} value={settingsConfig.maxRedirects}
+                    onChange={(event) => setSettingsConfig({ maxRedirects: Number(event.target.value) })} />
+                </label>
+                <label>
+                  Max response MiB
+                  <input type="number" min={1 / (1024 * 1024)} max={1024} step="any" required
+                    value={settingsConfig.maxResponseBytes / (1024 * 1024)}
+                    onChange={(event) => setSettingsConfig({ maxResponseBytes: Math.round(Number(event.target.value) * 1024 * 1024) })} />
+                </label>
+                <p className="settings-wide settings-save-note">Caps each HTTP response, including robots.txt and sitemaps. Oversized responses are recorded without parsing. Browser rendering downloads are outside this limit.</p>
                 <label className="settings-wide">
                   robots.txt override
                   <textarea
                     rows={4}
-                    disabled={!config.respectRobots || !config.useRobotsTxtOverride}
-                    value={config.robotsTxtOverride}
+                    disabled={!settingsConfig.respectRobots || !settingsConfig.useRobotsTxtOverride}
+                    value={settingsConfig.robotsTxtOverride}
                     onChange={(event) =>
-                      setConfig({ robotsTxtOverride: event.target.value })
+                      setSettingsConfig({ robotsTxtOverride: event.target.value })
                     }
                   />
                 </label>
@@ -3758,7 +4499,7 @@ export default function App() {
                   <label>
                     Robots test URL
                     <input
-                      disabled={!config.respectRobots || !config.useRobotsTxtOverride}
+                      disabled={!settingsConfig.respectRobots || !settingsConfig.useRobotsTxtOverride}
                       value={robotsTestUrl}
                       placeholder="https://example.com/path"
                       onChange={(event) => {
@@ -3770,7 +4511,7 @@ export default function App() {
                   <button
                     className="settings-action-button secondary"
                     onClick={() => void downloadRobotsTxt()}
-                    disabled={!desktopRuntime || !config.startUrl.trim()}
+                    disabled={!desktopRuntime || !settingsConfig.startUrl.trim()}
                   >
                     <Download size={15} />
                     <span>Download</span>
@@ -3780,10 +4521,10 @@ export default function App() {
                     onClick={() => void testRobotsTxt()}
                     disabled={
                       !desktopRuntime ||
-                      !config.respectRobots ||
-                      !config.useRobotsTxtOverride ||
+                      !settingsConfig.respectRobots ||
+                      !settingsConfig.useRobotsTxtOverride ||
                       !robotsTestUrl.trim() ||
-                      !config.robotsTxtOverride.trim()
+                      !settingsConfig.robotsTxtOverride.trim()
                     }
                   >
                     <Search size={15} />
@@ -3795,7 +4536,7 @@ export default function App() {
                   Batch robots test URLs
                   <textarea
                     rows={4}
-                    disabled={!config.respectRobots || !config.useRobotsTxtOverride}
+                    disabled={!settingsConfig.respectRobots || !settingsConfig.useRobotsTxtOverride}
                     value={robotsBatchUrls}
                     placeholder="https://example.com/path-one&#10;https://example.com/private/path"
                     onChange={(event) => {
@@ -3810,10 +4551,10 @@ export default function App() {
                     onClick={() => void testRobotsTxtBatch()}
                     disabled={
                       !desktopRuntime ||
-                      !config.respectRobots ||
-                      !config.useRobotsTxtOverride ||
+                      !settingsConfig.respectRobots ||
+                      !settingsConfig.useRobotsTxtOverride ||
                       !robotsBatchUrls.trim() ||
-                      !config.robotsTxtOverride.trim()
+                      !settingsConfig.robotsTxtOverride.trim()
                     }
                   >
                     <Search size={15} />
@@ -3848,56 +4589,80 @@ export default function App() {
               </div>
             </section>
 
-            <section className="settings-section" hidden={settingsTab !== "scope"}>
+            <section className="settings-section" data-settings-section="scope" hidden={settingsTab !== "scope"}>
               <h3>Scope</h3>
+              <p className="muted">{settingsConfig.mode === "list" ? "List mode fetches each supplied URL and does not follow discovered links. Spider scope is remembered for your next Spider crawl." : settingsCrawlScope?.description ?? "Custom host and folder rules are shown as Custom scope in the toolbar."}</p>
               <div className="settings-grid">
                 <label>
                   Subdomains
                   <select
-                    value={config.subdomainScope}
+                    aria-label="Subdomain scope"
+                    disabled={running || settingsConfig.mode === "list"}
+                    value={settingsConfig.subdomainScope}
                     onChange={(event) =>
-                      setConfig({ subdomainScope: event.target.value as SubdomainScope })
+                      setSettingsConfig({ subdomainScope: event.target.value as SubdomainScope })
                     }
                   >
-                    <option value="includeSubdomains">Include subdomains</option>
+                    <option value="includeSubdomains">Starting host and descendants</option>
                     <option value="exactHost">Exact host only</option>
+                    <option value="allSubdomains">Registered domain and all subdomains</option>
                   </select>
                 </label>
                 <label>
                   Folder scope
                   <select
-                    value={config.folderScope}
+                    aria-label="Folder scope"
+                    disabled={running || settingsConfig.mode === "list"}
+                    value={settingsConfig.folderScope}
                     onChange={(event) =>
-                      setConfig({ folderScope: event.target.value as FolderScope })
+                      setSettingsConfig({ folderScope: event.target.value as FolderScope })
                     }
                   >
                     <option value="anywhere">Anywhere on host</option>
                     <option value="startFolder">Start folder and children</option>
                     <option value="exactFolder">Exact start folder</option>
+                    <option value="exactUrl">Exact URL only</option>
                   </select>
                 </label>
                 <CheckboxField
-                  checked={config.folderScope === "anywhere"}
+                  checked={settingsConfig.folderScope === "anywhere"}
+                  disabled={running || settingsConfig.mode === "list"}
                   onCheckedChange={(checked) =>
-                    setConfig({ folderScope: checked ? "anywhere" : "startFolder" })
+                    setSettingsConfig({ folderScope: checked ? "anywhere" : "startFolder" })
                   }
                 >
                   Crawl outside start folder
                 </CheckboxField>
                 <CheckboxField
-                  checked={config.followNofollow}
-                  onCheckedChange={(checked) => setConfig({ followNofollow: checked })}
+                  checked={settingsConfig.checkLinksOutsideStartFolder}
+                  disabled={running || settingsConfig.mode === "list" || settingsConfig.folderScope !== "startFolder"}
+                  onCheckedChange={(checked) => setSettingsConfig({ checkLinksOutsideStartFolder: checked })}
                 >
-                  Follow nofollow links
+                  Check links outside start folder
                 </CheckboxField>
+                <CheckboxField
+                  checked={settingsConfig.followInternalNofollow}
+                  disabled={settingsConfig.mode === "list"}
+                  onCheckedChange={(checked) => setSettingsConfig({ followInternalNofollow: checked })}
+                >
+                  Follow internal nofollow links
+                </CheckboxField>
+                <CheckboxField
+                  checked={settingsConfig.followExternalNofollow}
+                  disabled={settingsConfig.mode === "list"}
+                  onCheckedChange={(checked) => setSettingsConfig({ followExternalNofollow: checked })}
+                >
+                  Follow external nofollow links
+                </CheckboxField>
+                <p className="settings-wide settings-save-note">Nofollow choices control newly discovered links and page-level directives. External links also require Resources → External. Link evidence is retained; List inputs and already queued resume URLs are unchanged.</p>
                 <label className="settings-wide">
                   List URLs
                   <textarea
                     aria-label="List URLs"
                     rows={4}
-                    value={patternsToText(config.listUrls)}
+                    value={patternsToText(settingsConfig.listUrls)}
                     onChange={(event) =>
-                      setConfig({ listUrls: textToPatterns(event.target.value) })
+                      setSettingsConfig({ listUrls: event.target.value.split(/\r?\n/) })
                     }
                   />
                 </label>
@@ -3905,6 +4670,7 @@ export default function App() {
                   Import URL file
                   <input
                     type="file"
+                    aria-label="Import URL file"
                     accept=".txt,.csv,.xml,.html,.log,text/plain,text/csv,application/xml,text/xml"
                     onChange={(event) => {
                       const file = event.currentTarget.files?.[0] ?? null;
@@ -3917,9 +4683,9 @@ export default function App() {
                   List sitemap URLs
                   <textarea
                     rows={3}
-                    value={patternsToText(config.listSitemapUrls)}
+                    value={patternsToText(settingsConfig.listSitemapUrls)}
                     onChange={(event) =>
-                      setConfig({ listSitemapUrls: textToPatterns(event.target.value) })
+                      setSettingsConfig({ listSitemapUrls: event.target.value.split(/\r?\n/) })
                     }
                   />
                 </label>
@@ -3927,9 +4693,9 @@ export default function App() {
                   Include regex
                   <textarea
                     rows={3}
-                    value={patternsToText(config.includeUrlPatterns)}
+                    value={patternsToText(settingsConfig.includeUrlPatterns)}
                     onChange={(event) =>
-                      setConfig({ includeUrlPatterns: textToPatterns(event.target.value) })
+                      setSettingsConfig({ includeUrlPatterns: event.target.value.split(/\r?\n/) })
                     }
                   />
                 </label>
@@ -3937,9 +4703,9 @@ export default function App() {
                   Exclude regex
                   <textarea
                     rows={3}
-                    value={patternsToText(config.excludeUrlPatterns)}
+                    value={patternsToText(settingsConfig.excludeUrlPatterns)}
                     onChange={(event) =>
-                      setConfig({ excludeUrlPatterns: textToPatterns(event.target.value) })
+                      setSettingsConfig({ excludeUrlPatterns: event.target.value.split(/\r?\n/) })
                     }
                   />
                 </label>
@@ -4005,53 +4771,148 @@ export default function App() {
               </div>
             </section>
 
-            <section className="settings-section" hidden={settingsTab !== "resources"}>
+            <section className="settings-section" data-settings-section="sitemaps" hidden={settingsTab !== "sitemaps"}>
+              <h3>XML sitemaps</h3>
+              {sitemapUnavailable ? <p className="muted">{settingsConfig.mode === "list"
+                ? "List mode uses the List sitemap URLs in Scope."
+                : "Exact URL scope skips sitemap discovery."}</p> : null}
+              <div className="settings-grid">
+                <div className="settings-wide">
+                  <CheckboxField checked={settingsConfig.sitemap.enabled} disabled={sitemapUnavailable}
+                    onCheckedChange={(enabled) => updateSitemapSettings({ enabled })}>
+                    Crawl XML sitemaps
+                  </CheckboxField>
+                </div>
+                <CheckboxField checked={settingsConfig.sitemap.discoverFromRobots} disabled={sitemapSourcesDisabled}
+                  onCheckedChange={(discoverFromRobots) => updateSitemapSettings({ discoverFromRobots })}>
+                  Use sitemaps from robots.txt
+                </CheckboxField>
+                <CheckboxField checked={settingsConfig.sitemap.probeDefault} disabled={sitemapSourcesDisabled}
+                  onCheckedChange={(probeDefault) => updateSitemapSettings({ probeDefault })}>
+                  Probe /sitemap.xml
+                </CheckboxField>
+                <CheckboxField checked={settingsConfig.sitemap.followLinked} disabled={sitemapSourcesDisabled}
+                  onCheckedChange={(followLinked) => updateSitemapSettings({ followLinked })}>
+                  Follow linked sitemaps
+                </CheckboxField>
+                <label className="settings-wide">
+                  Spider sitemap URLs
+                  <textarea aria-label="Spider sitemap URLs" rows={5} disabled={sitemapSourcesDisabled}
+                    placeholder="https://example.com/sitemap.xml"
+                    value={patternsToText(settingsConfig.sitemap.urls)}
+                    onChange={(event) => updateSitemapSettings({ urls: event.target.value.split(/\r?\n/) })} />
+                </label>
+                <p className="settings-wide settings-save-note">One sitemap URL per line. Sitemap indexes expand recursively; discovered page URLs follow the crawl scope and URL limits.</p>
+              </div>
+            </section>
+            <section className="settings-section" data-settings-section="content" hidden={settingsTab !== "content"}>
+              <h3>Content</h3>
+              <p className="muted">Choose the text used for word counts and near-duplicate checks. Metadata and discovered links use the whole page.</p>
+              <div className="settings-grid">
+                <label className="settings-wide">Include CSS selectors
+                  <textarea aria-label="Content include selectors" rows={3} placeholder="main&#10;article" value={patternsToText(settingsConfig.content.includeSelectors)}
+                    onChange={(event) => setSettingsConfig({ content: { ...settingsConfig.content, includeSelectors: event.target.value.split(/\r?\n/) } })} />
+                </label>
+                <label className="settings-wide">Exclude CSS selectors
+                  <textarea aria-label="Content exclude selectors" rows={3} placeholder="nav&#10;footer&#10;.related-articles" value={patternsToText(settingsConfig.content.excludeSelectors)}
+                    onChange={(event) => setSettingsConfig({ content: { ...settingsConfig.content, excludeSelectors: event.target.value.split(/\r?\n/) } })} />
+                </label>
+                <p className="settings-wide settings-save-note">One selector per line, up to 100 per list and 2,000 characters each.</p>
+                <label className="settings-wide">Preview HTML
+                  <textarea aria-label="Content preview HTML" rows={5} maxLength={524288} placeholder="Paste a sample page's HTML" value={contentPreviewHtml}
+                    onChange={(event) => setContentPreviewHtml(event.target.value)} />
+                </label>
+                <div className="settings-wide"><button aria-label="Preview content text" onClick={() => void previewContent()} disabled={!desktopRuntime || !contentPreviewHtml.trim() || contentPreviewLoading}>
+                  {contentPreviewLoading ? "Analyzing…" : "Preview text"}</button></div>
+                {contentPreviewError ? <p className="settings-wide settings-validation-error" role="alert">{contentPreviewError}</p> : null}
+                {contentPreview ? <div className="settings-wide content-preview-result" role="status">
+                  <strong>{contentPreview.wordCount.toLocaleString()} words · {(contentPreview.textToCodeRatio * 100).toFixed(1)}% text/code</strong>
+                  <pre>{contentPreview.text || "No matching text"}</pre>
+                  {contentPreview.textTruncated ? <span>Preview limited to 8,000 characters.</span> : null}
+                </div> : null}
+              </div>
+            </section>
+
+            <section className="settings-section" data-settings-section="requests" hidden={settingsTab !== "requests"}>
+              <div className="settings-grid">
+                <label className="settings-wide">
+                  User-Agent
+                  <input aria-label="Request User-Agent" required value={settingsConfig.userAgent}
+                    onChange={(event) => setSettingsConfig({ userAgent: event.target.value })} />
+                </label>
+                <div className="settings-actions">
+                  <button aria-label="Use Chrome request defaults" onClick={() => setSettingsConfig({ userAgent: chromeDesktopUserAgent, requestHeaders: chromeRequestHeaders.map((header) => ({ ...header })) })}>Use Chrome defaults</button>
+                  <button aria-label="Use Ferrous Frog request defaults" onClick={() => setSettingsConfig({ userAgent: ferrousFrogUserAgent, requestHeaders: [] })}>Use Ferrous Frog defaults</button>
+                </div>
+                <p className="settings-wide muted">Headers below are sent only to the starting origin.</p>
+              </div>
+              <div className="request-headers">
+                {settingsConfig.requestHeaders.map((header, index) => <div className="request-header" key={index}>
+                  <label>Name<input aria-label={`Header ${index + 1} name`} required value={header.name} placeholder="Accept-Language"
+                    onChange={(event) => setSettingsConfig({ requestHeaders: settingsConfig.requestHeaders.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item) })} /></label>
+                  <label>Value<input aria-label={`Header ${index + 1} value`} value={header.value} placeholder="en-GB"
+                    onChange={(event) => setSettingsConfig({ requestHeaders: settingsConfig.requestHeaders.map((item, itemIndex) => itemIndex === index ? { ...item, value: event.target.value } : item) })} /></label>
+                  <button aria-label={`Remove header ${index + 1}`} title="Remove header" onClick={() => setSettingsConfig({ requestHeaders: settingsConfig.requestHeaders.filter((_, itemIndex) => itemIndex !== index) })}><Trash2 size={16} /></button>
+                </div>)}
+                <button onClick={() => setSettingsConfig({ requestHeaders: [...settingsConfig.requestHeaders, { name: "", value: "" }] })}><Plus size={15} />Add header</button>
+              </div>
+            </section>
+
+            <section className="settings-section" data-settings-section="resources" hidden={settingsTab !== "resources"}>
               <h3>Resource Types</h3>
               <div className="settings-grid">
                 <CheckboxField
-                  checked={config.resourceTypes.html}
+                  checked={settingsConfig.resourceTypes.html}
                   onCheckedChange={(checked) => updateResourceType("html", checked)}
                 >
                   HTML pages
                 </CheckboxField>
                 <CheckboxField
-                  checked={config.resourceTypes.images}
+                  checked={settingsConfig.resourceTypes.images}
                   onCheckedChange={(checked) => updateResourceType("images", checked)}
                 >
                   Images
                 </CheckboxField>
                 <CheckboxField
-                  checked={config.resourceTypes.css}
+                  checked={settingsConfig.resourceTypes.css}
                   onCheckedChange={(checked) => updateResourceType("css", checked)}
                 >
                   CSS
                 </CheckboxField>
                 <CheckboxField
-                  checked={config.resourceTypes.javascript}
+                  checked={settingsConfig.resourceTypes.javascript}
                   onCheckedChange={(checked) => updateResourceType("javascript", checked)}
                 >
                   JavaScript
                 </CheckboxField>
                 <CheckboxField
-                  checked={config.resourceTypes.external}
+                  checked={settingsConfig.resourceTypes.external}
                   onCheckedChange={(checked) => updateResourceType("external", checked)}
                 >
                   External URLs
                 </CheckboxField>
                 <CheckboxField
-                  checked={config.resourceTypes.other}
+                  checked={settingsConfig.resourceTypes.other}
                   onCheckedChange={(checked) => updateResourceType("other", checked)}
                 >
                   Other files
                 </CheckboxField>
               </div>
+              <h3>Reference discovery</h3>
+              <p className="settings-save-note">Add referenced URLs to Spider crawls. Existing scope, resource permissions and robots rules apply; page metadata stays captured.</p>
+              <div className="settings-grid reference-discovery">
+                {([['canonical', 'Canonical targets'], ['hreflang', 'Hreflang targets'], ['pagination', 'Pagination (next / previous)'], ['amp', 'AMP targets']] as const).map(([key, label]) =>
+                  <CheckboxField key={key} checked={settingsConfig.referenceLinks[key]} disabled={settingsConfig.mode === "list" || settingsConfig.folderScope === "exactUrl"}
+                    onCheckedChange={(checked) => setSettingsConfig({ referenceLinks: { ...settingsConfig.referenceLinks, [key]: checked } })}>{label}</CheckboxField>)}
+              </div>
+              {settingsConfig.mode === "list" || settingsConfig.folderScope === "exactUrl" ? <p className="settings-save-note">Reference discovery requires Spider mode with a wider scope than Exact URL.</p> : null}
             </section>
 
-            <section className="settings-section" hidden={settingsTab !== "query"}>
+            <section className="settings-section" data-settings-section="query" hidden={settingsTab !== "query"}>
               <h3>Query Strings</h3>
               <div className="settings-grid">
                 <CheckboxField
-                  checked={config.querySettings.sortParameters}
+                  checked={settingsConfig.querySettings.sortParameters}
                   onCheckedChange={(checked) =>
                     updateQuerySettings({ sortParameters: checked })
                   }
@@ -4059,7 +4920,7 @@ export default function App() {
                   Sort parameters
                 </CheckboxField>
                 <CheckboxField
-                  checked={config.querySettings.stripAll}
+                  checked={settingsConfig.querySettings.stripAll}
                   onCheckedChange={(checked) => updateQuerySettings({ stripAll: checked })}
                 >
                   Strip all query
@@ -4069,7 +4930,7 @@ export default function App() {
                   <input
                     type="number"
                     min={0}
-                    value={config.querySettings.maxParameters}
+                    value={settingsConfig.querySettings.maxParameters}
                     onChange={(event) =>
                       updateQuerySettings({ maxParameters: Number(event.target.value) })
                     }
@@ -4079,10 +4940,10 @@ export default function App() {
                   Strip parameter regex
                   <textarea
                     rows={3}
-                    value={patternsToText(config.querySettings.stripParameterPatterns)}
+                    value={patternsToText(settingsConfig.querySettings.stripParameterPatterns)}
                     onChange={(event) =>
                       updateQuerySettings({
-                        stripParameterPatterns: textToPatterns(event.target.value),
+                        stripParameterPatterns: event.target.value.split(/\r?\n/),
                       })
                     }
                   />
@@ -4090,23 +4951,18 @@ export default function App() {
               </div>
             </section>
 
-            <section className="settings-section" hidden={settingsTab !== "storage"}>
+            <section className="settings-section" data-settings-section="storage" hidden={settingsTab !== "storage"}>
               <h3>Storage</h3>
+              {settingsDirty ? <p className="settings-save-note">Apply or cancel pending changes before opening or deleting sessions and importing archives.</p> : null}
               <div className="settings-grid compact">
                 <label>
-                  Mode
-                  <select
-                    value={storageMode}
-                    onChange={(event) => setStorageMode(event.target.value as StorageMode)}
-                  >
-                    <option value="memory">Memory</option>
-                    <option value="database">Database</option>
-                  </select>
+                  Storage engine
+                  <input value="SQLite" readOnly />
                 </label>
                 <CheckboxField
-                  checked={resumeCrawl}
-                  disabled={storageMode !== "database"}
-                  onCheckedChange={setResumeCrawl}
+                  checked={settingsResumeCrawl}
+                  disabled={!recoveryState.recoverable}
+                  onCheckedChange={setSettingsResumeCrawl}
                 >
                   Resume database
                 </CheckboxField>
@@ -4114,7 +4970,7 @@ export default function App() {
                   Session
                   <select
                     value={selectedSessionId}
-                    disabled={storageMode !== "database" || running}
+                    disabled={settingsStorageMode !== "database" || running || settingsDirty}
                     onChange={(event) => void openSession(event.target.value)}
                   >
                     <option value="">Current database</option>
@@ -4124,15 +4980,6 @@ export default function App() {
                       </option>
                     ))}
                   </select>
-                </label>
-                <label>
-                  New session
-                  <input
-                    value={newSessionName}
-                    disabled={storageMode !== "database"}
-                    placeholder={sessionNameFromUrl(config.startUrl)}
-                    onChange={(event) => setNewSessionName(event.target.value)}
-                  />
                 </label>
                 <label className="settings-wide">
                   Current database path
@@ -4149,17 +4996,9 @@ export default function App() {
                 </label>
                 <div className="settings-actions">
                   <button
-                    className="settings-action-button primary"
-                    onClick={() => void createSession()}
-                    disabled={storageMode !== "database"}
-                  >
-                    <Check size={15} />
-                    <span>Save Session</span>
-                  </button>
-                  <button
                     className="settings-action-button danger"
-                    onClick={() => void deleteSession()}
-                    disabled={storageMode !== "database" || !selectedSessionId || running}
+                    onClick={(event) => requestDeleteSession(selectedSessionId, event.currentTarget)}
+                    disabled={settingsStorageMode !== "database" || !selectedSessionId || running || settingsDirty}
                   >
                     <Trash2 size={15} />
                     <span>Delete</span>
@@ -4167,7 +5006,7 @@ export default function App() {
                   <button
                     className="settings-action-button"
                     onClick={() => void openCustomDatabasePath()}
-                    disabled={!desktopRuntime || running || !customDatabasePath.trim()}
+                    disabled={!desktopRuntime || running || settingsDirty || !customDatabasePath.trim()}
                   >
                     <Folder size={15} />
                     <span>Open Database</span>
@@ -4186,7 +5025,7 @@ export default function App() {
                   <button
                     className="settings-action-button"
                     onClick={() => void importCrawlArchive()}
-                    disabled={!desktopRuntime || running || !archiveImportPath.trim()}
+                    disabled={!desktopRuntime || running || settingsDirty || !archiveImportPath.trim()}
                   >
                     <FileText size={15} />
                     <span>Import Archive</span>
@@ -4245,7 +5084,7 @@ export default function App() {
               </div>
             </section>
 
-            <section className="settings-section" hidden={settingsTab !== "profiles"}>
+            <section className="settings-section" data-settings-section="profiles" hidden={settingsTab !== "profiles"}>
               <h3>Configuration Profiles</h3>
               <div className="settings-grid compact">
                 <label>
@@ -4268,7 +5107,7 @@ export default function App() {
                   <input
                     value={newProfileName}
                     disabled={running}
-                    placeholder={`${sessionNameFromUrl(config.startUrl)} profile`}
+                    placeholder={`${sessionNameFromUrl(settingsConfig.startUrl)} profile`}
                     onChange={(event) => setNewProfileName(event.target.value)}
                   />
                 </label>
@@ -4293,7 +5132,8 @@ export default function App() {
               </div>
             </section>
 
-            <section className="settings-section" hidden={settingsTab !== "integrations"}>
+            <section className="settings-section" data-settings-section="integrations" hidden={settingsTab !== "integrations"}>
+              <PageSpeedSettings credentials={pageSpeedCredentials} desktop={desktopRuntime} />
               <h3>Google Search Console</h3>
               <div className="settings-grid compact">
                 <label className="settings-wide">
@@ -4456,12 +5296,24 @@ export default function App() {
               </div>
             </section>
 
-            <section className="settings-section" hidden={settingsTab !== "rendering"}>
-              <h3>JavaScript Rendering</h3>
+            <section className="settings-section" data-settings-section="rendering" hidden={settingsTab !== "rendering"}>
+              <div className="section-heading">
+                <h3>JavaScript Rendering</h3>
+                <button className="settings-action-button" aria-label="Check rendering availability"
+                  disabled={!desktopRuntime || renderingStatusLoading} onClick={() => void loadRenderingStatus()}>
+                  <RefreshCw size={14} /> Check again
+                </button>
+              </div>
+              <div className="rendering-status" aria-live="polite" aria-busy={renderingStatusLoading}>
+                <strong>{renderingStatusLoading ? "Checking browser…" : renderingStatusError ? "Browser check failed" : renderingStatus?.available ? "Browser detected" : "Rendering unavailable"}</strong>
+                <p role={renderingStatusError ? "alert" : undefined}>{renderingStatusError ?? renderingStatus?.message}</p>
+                {renderingStatus?.browserPath ? <code>{renderingStatus.browserPath}</code> : null}
+                {!renderingStatusLoading && !renderingStatus?.available ? <p>Keep Render DOM turned off to crawl HTML. Your saved rendering preferences are preserved.</p> : null}
+              </div>
               <div className="settings-grid compact">
                 <CheckboxField
-                  checked={config.rendering.enabled}
-                  disabled={running}
+                  checked={settingsConfig.rendering.enabled}
+                  disabled={running || (!settingsConfig.rendering.enabled && (renderingStatusLoading || !renderingStatus?.available))}
                   onCheckedChange={(enabled) => updateRendering({ enabled })}
                 >
                   Render DOM
@@ -4469,8 +5321,8 @@ export default function App() {
                 <label>
                   Backend
                   <select
-                    value={config.rendering.backend}
-                    disabled={running || !config.rendering.enabled}
+                    value={settingsConfig.rendering.backend}
+                    disabled={running || !settingsConfig.rendering.enabled || renderingStatusLoading || !renderingStatus?.available}
                     onChange={(event) =>
                       updateRendering({
                         backend: event.target.value as JsRenderingBackend,
@@ -4486,8 +5338,8 @@ export default function App() {
                     type="number"
                     min={0}
                     step={100}
-                    value={config.rendering.waitAfterLoadMs}
-                    disabled={running || !config.rendering.enabled}
+                    value={settingsConfig.rendering.waitAfterLoadMs}
+                    disabled={running || !settingsConfig.rendering.enabled || renderingStatusLoading || !renderingStatus?.available}
                     onChange={(event) =>
                       updateRendering({
                         waitAfterLoadMs: Number(event.target.value),
@@ -4498,7 +5350,7 @@ export default function App() {
               </div>
             </section>
 
-            <section className="settings-section" hidden={settingsTab !== "extraction"}>
+            <section className="settings-section" data-settings-section="extraction" hidden={settingsTab !== "extraction"}>
               <div className="section-heading">
                 <h3>Custom Extraction</h3>
                 <button className="settings-action-button primary" onClick={addExtractor}>
@@ -4507,11 +5359,11 @@ export default function App() {
                 </button>
               </div>
               <div className="extractor-list">
-                {config.customExtractors.length === 0 ? (
+                {settingsConfig.customExtractors.length === 0 ? (
                   <span className="extractor-empty">No custom extractors</span>
                 ) : (
-                  config.customExtractors.map((extractor, index) => (
-                    <div className="extractor-row" key={`${extractor.name}-${index}`}>
+                  settingsConfig.customExtractors.map((extractor, index) => (
+                    <div className="extractor-row" key={index}>
                       <input
                         aria-label="Extractor name"
                         value={extractor.name}
@@ -4573,6 +5425,8 @@ export default function App() {
                   ))
                 )}
               </div>
+              <ExtractorPreview extractors={settingsConfig.customExtractors} enabled={desktopRuntime && settingsOpen && settingsTab === "extraction"}
+                busy={extractionPreviewBusy} loading={extractionPreviewLoading} onLoadingChange={setExtractionPreviewLoading} />
               <div className="section-heading">
                 <h3>Custom Search</h3>
                 <button className="settings-action-button primary" onClick={addCustomSearch}>
@@ -4581,11 +5435,11 @@ export default function App() {
                 </button>
               </div>
               <div className="extractor-list">
-                {config.customSearches.length === 0 ? (
+                {settingsConfig.customSearches.length === 0 ? (
                   <span className="extractor-empty">No custom searches</span>
                 ) : (
-                  config.customSearches.map((customSearch, index) => (
-                    <div className="extractor-row search-row" key={`${customSearch.name}-${index}`}>
+                  settingsConfig.customSearches.map((customSearch, index) => (
+                    <div className="extractor-row search-row" key={index}>
                       <input
                         aria-label="Search name"
                         value={customSearch.name}
@@ -4644,7 +5498,42 @@ export default function App() {
                 )}
               </div>
             </section>
-              </div>
+              </fieldset>
+            </div>
+            <div className="settings-footer">
+              <span role="status">{workspaceBusy ? "Updating workspace…" : running ? "Stop the crawl to edit settings." : settingsHasChanges ? "Unapplied changes" : "No pending changes"}</span>
+              <button data-action="cancel-settings" onClick={() => changeSettingsOpen(false)}>Cancel</button>
+              <button data-action="apply-settings" disabled={!settingsDirty || running || settingsApplying || workspaceBusy} onClick={() => void applySettings()}>{settingsApplying ? "Applying…" : "Apply"}</button>
+              <button className="primary" data-action="ok-settings" disabled={running || settingsApplying || workspaceBusy} onClick={() => void applySettings(true)}>OK</button>
+            </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      <Dialog.Root open={sessionDeleteOpen} onOpenChange={(open) => {
+        if (!open && !workspaceOperation.current) setSessionDeleteOpen(false);
+      }}>
+        <Dialog.Portal>
+          <Dialog.Overlay className="modal-backdrop quit-backdrop" />
+          <Dialog.Content className="quit-modal delete-crawl-modal" role="alertdialog" inert={!sessionDeleteOpen}
+            onOpenAutoFocus={(event) => { event.preventDefault(); cancelSessionDeleteRef.current?.focus(); }}
+            onCloseAutoFocus={(event) => {
+              event.preventDefault();
+              if (sessionDeleteOpen) return;
+              setSessionToDelete(undefined); setSessionDeleteError(undefined);
+              const origin = sessionDeleteOriginRef.current;
+              (origin?.isConnected ? origin : document.querySelector<HTMLElement>('[aria-label="Search saved crawls"], [aria-label="Crawl settings"]'))?.focus();
+            }}
+            onInteractOutside={(event) => event.preventDefault()}
+            onEscapeKeyDown={(event) => { if (workspaceOperation.current) event.preventDefault(); }}>
+            <Dialog.Title>Delete saved crawl?</Dialog.Title>
+            <Dialog.Description>“{sessionToDelete?.name}” and its crawl data will be permanently deleted.</Dialog.Description>
+            {sessionDeleteError ? <p className="error-bar" role="alert">{sessionDeleteError}</p> : null}
+            <div className="quit-actions">
+              <Dialog.Close asChild><button ref={cancelSessionDeleteRef} data-action="cancel-delete-crawl" disabled={workspaceBusy}>Cancel</button></Dialog.Close>
+              <button className="destructive" data-action="confirm-delete-crawl" disabled={workspaceBusy || running || settingsDirty || settingsApplying} onClick={() => void deleteSession()}>
+                {workspaceBusy ? "Deleting…" : "Delete"}
+              </button>
             </div>
           </Dialog.Content>
         </Dialog.Portal>
@@ -4696,11 +5585,13 @@ export default function App() {
         onRefresh={() => void loadLinkReport(selectedLinkReport)}
       />
 
-      <GraphDialog
+      {graphVisited ? <Suspense fallback={null}><GraphDialog
+        feedback={<FeedbackMessages />}
         open={graphOpen}
         onOpenChange={setGraphOpen}
         graph={graph}
         loading={graphLoading}
+        error={graphError}
         theme={resolvedTheme}
         live={running}
         updatedAt={graphUpdatedAt}
@@ -4715,29 +5606,59 @@ export default function App() {
         onOpenBrokenLinks={openBrokenLinkReport}
         onOpenRedirects={openRedirectReport}
         onRefresh={() => void loadGraph()}
-      />
+      /></Suspense> : null}
 
+      {serpVisited ? <Suspense fallback={null}><SerpPreviewDialog open={serpOpen} onOpenChange={setSerpOpen}
+        selected={selected ? { url: selected.url, title: selected.title ?? "", description: selected.metaDescription ?? "" } : undefined} /></Suspense> : null}
       <ComparisonDialog
         open={comparisonOpen}
-        onOpenChange={setComparisonOpen}
+        onOpenChange={changeComparisonOpen}
         archivePath={comparisonArchivePath}
         onArchivePathChange={setComparisonArchivePath}
         loading={comparisonLoading}
         result={comparisonResult}
-        onCompare={() => void compareCrawlArchive()}
+        sessions={comparisonSessions}
+        onCompare={() => void (comparisonSessions ? compareSavedCrawls() : compareCrawlArchive())}
       />
 
-      {!settingsOpen && !linkReportsOpen && !graphOpen && !comparisonOpen ? <FeedbackMessages /> : null}
+      {!settingsOpen && !linkReportsOpen && !graphOpen && !comparisonOpen && !sessionDeleteOpen ? <FeedbackMessages /> : null}
+      {pageSpeedActive ? <div className="notice-bar page-speed-running" role="status">
+        <RefreshCw size={15} aria-hidden="true" />
+        <span title={pageSpeedActive.url}>Measuring PageSpeed · {pageSpeedActive.url}</span>
+        <button data-action="cancel-pagespeed" disabled={pageSpeedCancelling} onClick={() => void cancelPageSpeed()}>
+          {pageSpeedCancelling ? "Cancelling…" : "Cancel measurement"}
+        </button>
+      </div> : null}
 
+      {showHome ? <CrawlHome
+        startUrl={config.startUrl} mode={config.mode} scope={activeCrawlScope?.id ?? "custom"}
+        scopes={!activeCrawlScope ? [{ id: "custom", label: "Custom scope" }, ...crawlScopePresets] : crawlScopePresets}
+        listUrls={config.listUrls} listSitemapCount={config.listSitemapUrls.filter((url) => url.trim()).length}
+        sessions={crawlSessions} loading={sessionsLoading} error={sessionsError}
+        busy={workspaceBusy || comparisonLoading} running={running} desktop={desktopRuntime}
+        workspaceAvailable={workspaceAvailable} selectedIds={comparisonSelection}
+        onStartUrlChange={(startUrl) => setConfig({ startUrl })}
+        onModeChange={(mode) => setConfig({ mode })}
+        onScopeChange={(id) => {
+          const scope = crawlScopePresets.find((item) => item.id === id);
+          if (scope) setConfig({ subdomainScope: scope.subdomainScope, folderScope: scope.folderScope });
+        }}
+        onListUrlsChange={(listUrls) => setConfig({ listUrls })}
+        onStart={() => void startCrawl(true)} onOpen={(id) => void openSession(id)}
+        onDelete={requestDeleteSession}
+        onSelect={(id) => setComparisonSelection((selected) => selected.includes(id)
+          ? selected.filter((value) => value !== id) : selected.length < 2 ? [...selected, id] : selected)}
+        onCompare={() => void compareSavedCrawls()} onRefresh={() => void loadSessions()}
+        onSettings={() => changeSettingsOpen(true)} onReturn={() => setShowHome(false)}
+      /> : <>
       <section
         className={`workspace${overviewResizing ? " resizing" : ""}${issuesOpen ? " with-issues" : ""}${overviewOpen ? " with-overview" : ""}`}
         style={{ "--overview-width": `${overviewWidth}px` } as CSSProperties}
       >
-        {issuesOpen ? (
-          <nav className="issue-sidebar" aria-label="Issue views">
+          <nav className="issue-sidebar" aria-label="Issue views" data-state={issuesOpen ? "open" : "closed"} inert={!issuesOpen} aria-hidden={!issuesOpen}>
             <div className="issue-sidebar-heading">
               <strong>Audit views</strong>
-              <button aria-label="Close audit views" onClick={() => setIssuesOpen(false)}><X size={15} /></button>
+              <button aria-label="Close audit views" onClick={() => changeIssuesOpen(false)}><X size={15} /></button>
             </div>
             <p>Counts across the full crawl</p>
             {issueGroups.map((group) => (
@@ -4757,7 +5678,6 @@ export default function App() {
               </details>
             ))}
           </nav>
-        ) : null}
         <section className="results-pane">
           <nav className="audit-categories" aria-label="Audit categories">
             <button className="audit-tree-toggle" aria-label="Toggle audit views" title="Browse all audit views" aria-expanded={issuesOpen} onClick={() => setIssuesOpen(!issuesOpen)}>
@@ -4777,6 +5697,9 @@ export default function App() {
               {activeIssueGroup.views.filter((id) => id !== "all").map((id) => <option key={id} value={id}>{views.find((view) => view.id === id)!.label}</option>)}
             </select>
             <div className="grid-status-left">
+              {selectedRecordIds.length > 0 ? <button className="selection-count" title="Clear selected rows" onClick={() => { setSelectedRecordIds([]); setSelected(undefined); }}>
+                {selectedRecordIds.length.toLocaleString()} selected <X size={12} />
+              </button> : null}
               <div className="view-toggle" aria-label="Result view mode">
                 <button
                   className={resultsViewMode === "table" ? "active" : ""}
@@ -4823,14 +5746,72 @@ export default function App() {
                 event.currentTarget.parentElement?.querySelector("input")?.focus();
               }}><X size={15} /></button> : null}
             </div>
-            {selectedView !== "all" || globalSearch || activeSegmentId !== "all" ? <button className="reset-filters" onClick={resetFilters}>Reset filters</button> : null}
-            <select aria-label="Visible columns" value={showAllColumns ? "all" : "relevant"} onChange={(event) => setShowAllColumns(event.target.value === "all")}>
+            <AdvancedFilters key={workspaceRevision} value={advancedFilters} disabled={workspaceBusy} onApply={(filters) => {
+              rowsRequest.current++; urlTreeRequest.current++;
+              setError(undefined); setPage(0); setAdvancedFilters(filters);
+            }} />
+            {selectedView !== "all" || globalSearch || activeSegmentId !== "all" || advancedFilters ? <button className="reset-filters" onClick={resetFilters}>Reset filters</button> : null}
+            <select aria-label="Visible columns" value={columnLayout.active} onChange={(event) => saveColumnLayout({ ...columnLayout, active: event.target.value })}>
               <option value="relevant">Relevant columns</option>
               <option value="all">All columns</option>
+              {columnLayout.custom.length > 0 ? <option value="custom">Custom columns</option> : null}
+              {columnLayout.presets.map((preset) => <option key={preset.name} value={`saved:${preset.name}`}>{preset.name}</option>)}
             </select>
+            <Dialog.Root open={columnsOpen} onOpenChange={(open) => { setColumnsOpen(open); if (open) { setColumnSearch(""); setLayoutError(undefined); } }}>
+              <Dialog.Trigger asChild><button aria-label="Configure columns" title="Configure columns"><Settings size={15} /></button></Dialog.Trigger>
+              <Dialog.Portal>
+                <Dialog.Overlay className="modal-backdrop" />
+                <Dialog.Content className="column-layout-modal" inert={!columnsOpen}>
+                  <div className="modal-header">
+                    <div><Dialog.Title>Columns</Dialog.Title><Dialog.Description>Choose columns and their order.</Dialog.Description></div>
+                    <Dialog.Close asChild><button aria-label="Close columns"><X size={18} /></button></Dialog.Close>
+                  </div>
+                  <div className="column-layout-tools">
+                    <input aria-label="Find columns" placeholder="Find a column" value={columnSearch} onChange={(event) => setColumnSearch(event.target.value)} />
+                    <button onClick={() => saveColumnLayout({ ...columnLayout, active: "relevant" })}>Use relevant columns</button>
+                    <button onClick={() => saveColumnLayout({ ...columnLayout, active: "all" })}>Show all</button>
+                  </div>
+                  <div className="column-choices">
+                    {orderedColumnChoices.filter((column) => column.label.toLowerCase().includes(columnSearch.toLowerCase())).map((column) => {
+                      const key = columnKey(column);
+                      const position = visibleColumnIds.indexOf(key);
+                      return <div className="column-choice" key={key}>
+                        <label><input type="checkbox" checked={position >= 0} disabled={key === "url"} onChange={(event) => changeVisibleColumns(event.target.checked
+                          ? [...visibleColumnIds, key] : visibleColumnIds.filter((id) => id !== key))} />{column.label}</label>
+                        {position >= 0 ? <div className="column-order">
+                          <span>{position + 1}</span>
+                          <button aria-label={`Move ${column.label} left`} title="Move left" disabled={position === 0} onClick={() => moveColumn(key, -1)}><ChevronUp size={15} /></button>
+                          <button aria-label={`Move ${column.label} right`} title="Move right" disabled={position === columns.length - 1} onClick={() => moveColumn(key, 1)}><ChevronDown size={15} /></button>
+                        </div> : null}
+                      </div>;
+                    })}
+                  </div>
+                  <form className="column-layout-save" onSubmit={(event) => {
+                    event.preventDefault();
+                    const name = layoutName.trim();
+                    if (!name || name.length > 60) { setLayoutError("Enter a layout name of 1–60 characters."); return; }
+                    if (columnLayout.presets.some((preset) => preset.name.toLowerCase() === name.toLowerCase())) { setLayoutError("A layout with that name already exists."); return; }
+                    if (columnLayout.presets.length >= 100) { setLayoutError("Remove a saved layout before adding another."); return; }
+                    saveColumnLayout({ ...columnLayout, active: `saved:${name}`, presets: [...columnLayout.presets, { name, columns: visibleColumnIds }] });
+                    setLayoutName("");
+                  }}>
+                    <input aria-label="Layout name" placeholder="Layout name" maxLength={60} value={layoutName} onChange={(event) => setLayoutName(event.target.value)} />
+                    <button type="submit" disabled={!layoutName.trim()}>Save layout</button>
+                    {columnLayout.active.startsWith("saved:") ? <button type="button" onClick={() => saveColumnLayout({ active: "custom", custom: visibleColumnIds,
+                      presets: columnLayout.presets.filter((preset) => `saved:${preset.name}` !== columnLayout.active) })}>Delete layout</button> : null}
+                  </form>
+                  {layoutError ? <p className="error-text" role="alert">{layoutError}</p> : null}
+                  <div className="modal-actions"><Dialog.Close asChild><button className="primary">Done</button></Dialog.Close></div>
+                </Dialog.Content>
+              </Dialog.Portal>
+            </Dialog.Root>
           </div>
           {resultsViewMode === "table" ? (
-            <div className="grid" ref={parentRef} aria-busy={rowsLoading}>
+            <div className="grid" ref={parentRef} aria-busy={rowsLoading} onKeyDown={(event) => {
+              if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a" && (event.target as HTMLElement).closest("tbody tr")) {
+                event.preventDefault(); setSelectedRecordIds(rows.map((row) => row.id));
+              }
+            }}>
               <table
                 className="data-table"
                 aria-label={`${views.find((view) => view.id === selectedView)?.label} results`}
@@ -4898,18 +5879,18 @@ export default function App() {
                       <tr
                         key={tableRow.id}
                         tabIndex={0}
-                        aria-selected={selected?.id === row.id}
+                        aria-selected={selectedRecordIds.includes(row.id)}
                         className={[
-                          selected?.id === row.id ? "selected" : "",
+                          selectedRecordIds.includes(row.id) ? "selected" : "",
                           statusRowClass(row),
                         ]
                           .filter(Boolean)
                           .join(" ")}
-                        onClick={() => setSelected(row)}
+                        onClick={(event) => selectResultRow(row, event)}
                         onKeyDown={(event) => {
                           if (event.key === "Enter" || event.key === " ") {
                             event.preventDefault();
-                            setSelected(row);
+                            selectResultRow(row, event);
                           }
                         }}
                       >
@@ -4960,7 +5941,7 @@ export default function App() {
               capped={urlTree.capped}
               loading={urlTreeLoading}
               onRefresh={() => void loadUrlTree()}
-              onSelectRecord={setSelected}
+              onSelectRecord={selectResultRow}
             />
           )}
 
@@ -4991,7 +5972,7 @@ export default function App() {
                   <button onClick={() => void copySelectedUrl()} title="Copy URL">
                     <Copy size={16} />
                   </button>
-                  <button onClick={() => setSelected(undefined)} title="Clear selection" aria-label="Clear URL selection">
+                  <button onClick={() => { setSelected(undefined); setSelectedRecordIds([]); }} title="Clear selection" aria-label="Clear URL selection">
                     <X size={16} />
                   </button>
                 </div>
@@ -5004,6 +5985,12 @@ export default function App() {
                       setLinkReportSearch(""); setLinkReportsOpen(true);
                     }} />
                 </div>
+              ) : detailTab === "pagespeed" ? (
+                <div className="detail-content">
+                  <PageSpeedPanel snapshot={selected.pageSpeed} strategy={pageSpeedStrategy} onStrategy={setPageSpeedStrategy}
+                    disabledReason={pageSpeedDisabledReason} onRun={() => void runPageSpeed()}
+                    onConfigure={() => { changeSettingsOpen(true); setSettingsTab("integrations"); }} />
+                </div>
               ) : (
               <div className="detail-content" key={`${selected.id}-${detailTab}`}>
                 {selected.error ? <p className="detail-error">{selected.error}</p> : null}
@@ -5014,7 +6001,7 @@ export default function App() {
                     <dd>
                       {selected.title || "Missing"}{" "}
                       <span className="detail-muted">
-                        ({selected.titleLen} chars, {selected.titlePixelWidth} px)
+                        ({selected.titleLen} chars, {selected.titlePixelWidth} px{selected.titleCount != null ? `, ${selected.titleCount} ${selected.titleCount === 1 ? "tag" : "tags"}` : ""})
                       </span>
                     </dd>
                     <dt>Meta Description</dt>
@@ -5022,7 +6009,7 @@ export default function App() {
                       {selected.metaDescription || "Missing"}{" "}
                       <span className="detail-muted">
                         ({selected.metaDescriptionLen} chars,{" "}
-                        {selected.metaDescriptionPixelWidth} px)
+                        {selected.metaDescriptionPixelWidth} px{selected.metaDescriptionCount != null ? `, ${selected.metaDescriptionCount} ${selected.metaDescriptionCount === 1 ? "tag" : "tags"}` : ""})
                       </span>
                     </dd>
                     <dt>H1</dt>
@@ -5306,8 +6293,11 @@ export default function App() {
             </div>}
           </aside>
         </section>
-        {overviewOpen ? <><div
+        <div
           className="overview-resizer"
+          data-state={overviewOpen ? "open" : "closed"}
+          inert={!overviewOpen}
+          aria-hidden={!overviewOpen}
           role="separator"
           aria-label="Resize overview panel"
           aria-orientation="vertical"
@@ -5322,15 +6312,15 @@ export default function App() {
           onKeyDown={handleOverviewResizeKey}
         />
         <OverviewPanel
+          open={overviewOpen}
           summary={summary}
           progress={progress}
           progressPercent={progressPercent}
           progressHistory={progressHistory}
           onViewSelect={selectAuditView}
           statusLabel={crawlStateLabel}
-          onClose={() => setOverviewOpen(false)}
+          onClose={() => changeOverviewOpen(false)}
         />
-        </> : null}
       </section>
       <footer className="status-bar">
         <div className="status-main">
@@ -5358,6 +6348,7 @@ export default function App() {
           <span>{(progress?.pagesPerSecond ?? 0).toFixed(2)} URL/s</span>
         </div>
       </footer>
+      </>}
     </main>
   );
 }
@@ -5685,6 +6676,74 @@ function treeNodeTone(node: UrlTreeNode) {
   return "";
 }
 
+function preventClosedMenuKeys(event: KeyboardEvent<HTMLElement>) {
+  if (event.currentTarget.inert) { event.preventDefault(); event.stopPropagation(); }
+}
+
+function prepareDialogMenu(event: MouseEvent<HTMLElement>) {
+  // These menus' non-radio items open dialogs. Remove the old keyboard layer before handing over focus.
+  if ((event.target as Element).closest('[role="menuitem"]:not([data-disabled])')) event.currentTarget.style.animation = "none";
+}
+
+function focusOpenedDialog(event: Event) {
+  const dialog = [...document.querySelectorAll<HTMLElement>('[role="dialog"][data-state="open"], [role="alertdialog"][data-state="open"]')].at(-1);
+  if (!dialog) return;
+  event.preventDefault();
+  if (!dialog.contains(document.activeElement)) dialog.focus();
+}
+
+function ExtractorPreview({ extractors, enabled, busy, loading, onLoadingChange }: {
+  extractors: CustomExtractor[]; enabled: boolean; busy: { current: boolean };
+  loading: boolean; onLoadingChange: (loading: boolean) => void;
+}) {
+  const [index, setIndex] = useState(0);
+  const [html, setHtml] = useState("");
+  const [result, setResult] = useState<{ values: string[]; valuesTruncated: boolean; textTruncated: boolean }>();
+  const [error, setError] = useState<string>();
+  const revision = useRef(0);
+  const selectedIndex = Math.min(index, Math.max(0, extractors.length - 1));
+  const extractor = extractors[selectedIndex];
+  useEffect(() => {
+    revision.current++;
+    if (enabled) { setResult(undefined); setError(undefined); }
+    return () => { revision.current++; };
+  }, [enabled, html, extractor]);
+  const preview = async () => {
+    if (!enabled || !extractor || !html.trim() || busy.current) return;
+    const request = ++revision.current;
+    busy.current = true;
+    onLoadingChange(true); setError(undefined); setResult(undefined);
+    try {
+      const response = await invoke<NonNullable<typeof result>>("preview_custom_extractor", { request: { html, extractor } });
+      if (request === revision.current) setResult(response);
+    } catch (caught) {
+      if (request === revision.current) setError(errorMessage(caught));
+    } finally { busy.current = false; onLoadingChange(false); }
+  };
+  return <div className="extractor-preview settings-grid">
+    <h4 className="settings-wide">Test extraction</h4>
+    <label className="settings-wide">Rule
+      <select aria-label="Preview extractor" value={selectedIndex} disabled={!extractors.length} onChange={(event) => setIndex(Number(event.target.value))}>
+        {!extractors.length ? <option value={0}>Add an extractor to test it</option> : extractors.map((rule, at) => <option key={at} value={at}>{rule.name || `Rule ${at + 1}`}</option>)}
+      </select>
+    </label>
+    <label className="settings-wide">Sample HTML
+      <textarea aria-label="Extraction preview HTML" rows={5} maxLength={524288} value={html}
+        placeholder="Paste a sample page's HTML" onChange={(event) => setHtml(event.target.value)} />
+    </label>
+    {extractor?.kind === "xpath" ? <p className="settings-wide settings-save-note">XPath requires XML-compatible HTML, including closed tags.</p> : null}
+    <div className="settings-wide"><button aria-label="Test custom extraction" disabled={!enabled || !extractor || !html.trim() || loading} onClick={() => void preview()}>
+      {loading ? "Testing…" : "Run test"}
+    </button></div>
+    {error ? <p className="settings-wide settings-validation-error" role="alert">{error}</p> : null}
+    {result ? <div className="settings-wide content-preview-result" role="status">
+      <strong>{result.values.length.toLocaleString()}{result.valuesTruncated ? "+" : ""} {result.values.length === 1 ? "match" : "matches"}</strong>
+      {result.values.length ? <ol>{result.values.map((value, at) => <li key={at}><pre>{value || "(empty value)"}</pre></li>)}</ol> : <pre>No matches</pre>}
+      {result.valuesTruncated || result.textTruncated ? <span>Preview limited to 100 values and 2,000 characters per value.</span> : null}
+    </div> : null}
+  </div>;
+}
+
 function FeedbackMessages() {
   const { error, notice, settingsError, setError, setNotice } = useAppStore();
   if (!error && !notice && !settingsError) return null;
@@ -5734,6 +6793,7 @@ function ComparisonDialog({
   loading,
   result,
   onCompare,
+  sessions,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -5742,12 +6802,13 @@ function ComparisonDialog({
   loading: boolean;
   result?: CrawlComparisonResponse;
   onCompare: () => void;
+  sessions?: [SavedCrawl, SavedCrawl];
 }) {
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="modal-backdrop" />
-        <Dialog.Content className="comparison-modal">
+        <Dialog.Content className="comparison-modal" inert={!open}>
           <div className="modal-header">
             <Dialog.Title asChild>
               <h2>Crawl Comparison</h2>
@@ -5761,18 +6822,21 @@ function ComparisonDialog({
           </div>
 
           <div className="comparison-controls">
-            <label>
+            {sessions ? <div className="comparison-sessions">
+              <span><small>Baseline</small><strong>{sessions[0].name}</strong><time>{new Date(sessions[0].createdAtMs).toLocaleString()}</time></span>
+              <span><small>Current</small><strong>{sessions[1].name}</strong><time>{new Date(sessions[1].createdAtMs).toLocaleString()}</time></span>
+            </div> : <label>
               Baseline crawl archive
               <input
                 value={archivePath}
                 placeholder="/path/to/ferrous-frog-crawl-archive.ffcrawl.json"
                 onChange={(event) => onArchivePathChange(event.target.value)}
               />
-            </label>
+            </label>}
             <button
               className="settings-action-button primary"
               onClick={onCompare}
-              disabled={loading || !archivePath.trim()}
+              disabled={loading || (!sessions && !archivePath.trim())}
             >
               <FileText size={15} />
               <span>{loading ? "Comparing" : "Compare"}</span>
@@ -5802,6 +6866,7 @@ function ComparisonDialog({
                 ))}
               </div>
               <div className="link-report-table-wrap comparison-table-wrap">
+                {result.added + result.removed + result.changed > result.rows.length ? <p className="comparison-limit">Showing the first {result.rows.length.toLocaleString()} changes. Summary counts include all URLs.</p> : null}
                 <table className="link-report-table comparison-table">
                   <thead>
                     <tr>
@@ -5845,7 +6910,7 @@ function ComparisonDialog({
             </>
           ) : (
             <p className="link-report-empty">
-              Compare the current crawl against a previously exported crawl archive.
+              {loading ? "Comparing saved crawl results…" : sessions ? "Compare these two saved crawls without changing the current workspace." : "Compare the current crawl against a previously exported crawl archive."}
             </p>
           )}
         </Dialog.Content>
@@ -5937,7 +7002,7 @@ function LinkReportsDialog({
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="modal-backdrop" />
-        <Dialog.Content className="link-report-modal">
+        <Dialog.Content className="link-report-modal" inert={!open}>
           <Dialog.Description className="sr-only">Inspect links, sources and redirect chains from the current crawl.</Dialog.Description>
           <div className="modal-header">
             <Dialog.Title asChild>
@@ -6136,8 +7201,8 @@ function SitemapValidationReportTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => (
-            <tr key={row.url} className={`sitemap-${row.severity}`}>
+          {rows.map((row, index) => (
+            <tr key={index} className={`sitemap-${row.severity}`}>
               <td>
                 <span className={`severity-pill ${row.severity}`}>{row.severity}</span>
               </td>
@@ -6331,548 +7396,8 @@ function RedirectReportTable({ rows }: { rows: CrawlRecord[] }) {
   );
 }
 
-function GraphDialog({
-  open,
-  onOpenChange,
-  graph,
-  loading,
-  theme,
-  live,
-  updatedAt,
-  internalOnly,
-  onInternalOnlyChange,
-  statusFilter,
-  onStatusFilterChange,
-  depthFilter,
-  onDepthFilterChange,
-  layoutMode,
-  onLayoutModeChange,
-  onOpenBrokenLinks,
-  onOpenRedirects,
-  onRefresh,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  graph?: CrawlGraph;
-  loading: boolean;
-  theme: Theme;
-  live: boolean;
-  updatedAt?: number;
-  internalOnly: boolean;
-  onInternalOnlyChange: (value: boolean) => void;
-  statusFilter: GraphStatusFilter;
-  onStatusFilterChange: (value: GraphStatusFilter) => void;
-  depthFilter: string;
-  onDepthFilterChange: (value: string) => void;
-  layoutMode: GraphLayoutMode;
-  onLayoutModeChange: (value: GraphLayoutMode) => void;
-  onOpenBrokenLinks: () => void;
-  onOpenRedirects: () => void;
-  onRefresh: () => void;
-}) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const rendererRef = useRef<Sigma<GraphNodeAttributes, GraphEdgeAttributes> | null>(
-    null,
-  );
-  const graphRef = useRef<
-    MultiDirectedGraph<GraphNodeAttributes, GraphEdgeAttributes> | null
-  >(null);
-  const [hoveredNode, setHoveredNode] = useState<GraphNodeAttributes | null>(null);
-  const [selectedNode, setSelectedNode] = useState<GraphNodeAttributes | null>(null);
-  const [graphRenderMode, setGraphRenderMode] = useState<"webgl" | "svg">("svg");
-  const visibleGraph = useMemo(
-    () => filterGraphSnapshot(graph, statusFilter, depthFilter),
-    [depthFilter, graph, statusFilter],
-  );
-  const graphReady = Boolean(visibleGraph && visibleGraph.nodes.length > 0);
-  const previewNode = selectedNode ?? hoveredNode;
-  const depthOptions = useMemo(() => graphDepthOptions(graph), [graph]);
-  const brokenTargets = useMemo(() => brokenGraphTargets(graph), [graph]);
-  const sourceBrokenLinkCount = graph?.edges.filter((edge) => isBrokenGraphEdge(edge, brokenTargets)).length ?? 0;
-  const sourceRedirectLinkCount = graph?.edges.filter(isRedirectGraphEdge).length ?? 0;
-  const visibleBrokenLinkCount =
-    visibleGraph?.edges.filter((edge) => isBrokenGraphEdge(edge, brokenTargets)).length ?? 0;
-  const visibleRedirectLinkCount =
-    visibleGraph?.edges.filter(isRedirectGraphEdge).length ?? 0;
-
-  useEffect(() => {
-    if (open) {
-      setGraphRenderMode("svg");
-    }
-  }, [open]);
-
-  useEffect(() => {
-    if (!open || !containerRef.current || graphRenderMode !== "webgl" || !graphReady) {
-      return;
-    }
-    if (!supportsWebGl()) {
-      setGraphRenderMode("svg");
-      return;
-    }
-
-    const graphology = new MultiDirectedGraph<
-      GraphNodeAttributes,
-      GraphEdgeAttributes
-    >();
-    const colors = graphPalette();
-    let renderer: Sigma<GraphNodeAttributes, GraphEdgeAttributes>;
-    try {
-      renderer = new Sigma<GraphNodeAttributes, GraphEdgeAttributes>(
-        graphology,
-        containerRef.current,
-        {
-          allowInvalidContainer: true,
-          defaultEdgeColor: colors.border,
-          defaultEdgeType: "arrow",
-          defaultNodeColor: colors.primary,
-          edgeProgramClasses: {
-            arrow: EdgeArrowProgram as unknown as EdgeProgramType<
-              GraphNodeAttributes,
-              GraphEdgeAttributes
-            >,
-          },
-          hideEdgesOnMove: true,
-          hideLabelsOnMove: true,
-          labelColor: { color: colors.text },
-          labelDensity: 0.08,
-          labelFont:
-            'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-          labelRenderedSizeThreshold: 8,
-          labelSize: 11,
-          minEdgeThickness: 0.5,
-          renderEdgeLabels: false,
-          renderLabels: true,
-          stagePadding: 28,
-          zIndex: true,
-        },
-      );
-    } catch {
-      graphology.clear();
-      setGraphRenderMode("svg");
-      return;
-    }
-
-    graphRef.current = graphology;
-    rendererRef.current = renderer;
-    renderer.on("enterNode", ({ node }) => {
-      setHoveredNode(graphology.getNodeAttributes(node));
-    });
-    renderer.on("leaveNode", () => {
-      setHoveredNode(null);
-    });
-    renderer.on("clickNode", ({ node }) => {
-      setSelectedNode(graphology.getNodeAttributes(node));
-    });
-    renderer.on("clickStage", () => {
-      setSelectedNode(null);
-    });
-
-    return () => {
-      renderer.kill();
-      graphology.clear();
-      rendererRef.current = null;
-      graphRef.current = null;
-      setHoveredNode(null);
-    };
-  }, [graphReady, graphRenderMode, open, theme]);
-
-  useEffect(() => {
-    setSelectedNode(null);
-  }, [depthFilter, statusFilter, graph]);
-
-  useEffect(() => {
-    const graphology = graphRef.current;
-    const renderer = rendererRef.current;
-    if (
-      !open ||
-      graphRenderMode !== "webgl" ||
-      !graphReady ||
-      !graphology ||
-      !renderer ||
-      !visibleGraph
-    ) {
-      return;
-    }
-
-    const colors = graphPalette();
-    const previousPositions = new Map<string, { x: number; y: number }>();
-    graphology.forEachNode((node, attributes) => {
-      previousPositions.set(node, { x: attributes.x, y: attributes.y });
-    });
-
-    graphology.clear();
-    const radius = Math.max(6, visibleGraph.nodes.length / 6);
-    visibleGraph.nodes.forEach((node, index) => {
-      const previous = previousPositions.get(node.url);
-      const position = graphInitialPosition(
-        node,
-        index,
-        visibleGraph.nodes,
-        layoutMode,
-        radius,
-      );
-      graphology.addNode(node.url, {
-        label: node.label || graphLabel(node.url),
-        url: node.url,
-        status: graphStatusLabel(node),
-        depth:
-          node.depth === null || node.depth === undefined ? "Unknown" : String(node.depth),
-        inlinks: node.inlinkCount,
-        outlinks: node.outlinkCount,
-        x: previous?.x ?? position.x,
-        y: previous?.y ?? position.y,
-        size: graphNodeSize(node),
-        color: graphNodeColor(node, colors),
-        forceLabel: graphForceLabel(node, visibleGraph.nodes.length),
-      });
-    });
-
-    const nodeIds = new Set(visibleGraph.nodes.map((node) => node.url));
-    visibleGraph.edges
-      .filter((edge) => nodeIds.has(edge.sourceUrl) && nodeIds.has(edge.targetUrl))
-      .forEach((edge) => {
-        graphology.addDirectedEdgeWithKey(
-          `edge-${edge.id}`,
-          edge.sourceUrl,
-          edge.targetUrl,
-          {
-            label: edge.anchorText || "",
-            status: graphEdgeStatusLabel(edge),
-            size: graphEdgeSize(edge),
-            color: graphEdgeColor(edge, colors),
-            type: "arrow",
-          },
-        );
-      });
-
-    if (graphology.order > 0) {
-      if (graphology.order > 1 && graphology.size > 0 && previousPositions.size > 0) {
-        forceAtlas2.assign(graphology, {
-          iterations: 35,
-          settings: {
-            ...forceAtlas2.inferSettings(graphology),
-            barnesHutOptimize: graphology.order > 120,
-            gravity: 0.6,
-            scalingRatio: graphology.order > 300 ? 28 : 18,
-            slowDown: 2,
-          },
-        });
-      }
-    }
-
-    renderer.setSetting("labelColor", { color: colors.text });
-    renderer.setSetting("defaultNodeColor", colors.primary);
-    renderer.setSetting("defaultEdgeColor", colors.border);
-    renderer.resize();
-    renderer.refresh({ skipIndexation: false });
-    if (previousPositions.size === 0) {
-      requestAnimationFrame(() => {
-        void renderer.getCamera().animatedReset({ duration: 180 });
-      });
-    }
-  }, [graphReady, graphRenderMode, layoutMode, open, theme, visibleGraph]);
-
-  const fitGraph = () => {
-    void rendererRef.current?.getCamera().animatedReset({ duration: 220 });
-  };
-
-  const toggleGraphRenderMode = () => {
-    setGraphRenderMode((mode) => (mode === "webgl" ? "svg" : "webgl"));
-  };
-
-  const exportVisibleGraph = () => {
-    if (!visibleGraph) {
-      return;
-    }
-    const blob = new Blob([JSON.stringify(visibleGraph, null, 2)], {
-      type: "application/json;charset=utf-8",
-    });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = "ferrous-frog-graph-filtered.json";
-    anchor.click();
-    URL.revokeObjectURL(url);
-  };
-
-  return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="modal-backdrop" />
-        <Dialog.Content className="graph-modal">
-          <Dialog.Description className="sr-only">Explore crawled pages and the links connecting them.</Dialog.Description>
-          <div className="modal-header">
-            <Dialog.Title asChild>
-              <h2>Crawl Graph</h2>
-            </Dialog.Title>
-            <Dialog.Close asChild>
-              <button title="Close graph">
-                <X size={16} />
-              </button>
-            </Dialog.Close>
-            <FeedbackMessages />
-          </div>
-          <div className="graph-toolbar">
-            <div>
-              <strong>
-                {loading
-                  ? "Loading graph"
-                  : `${(visibleGraph?.nodes.length ?? 0).toLocaleString()} nodes / ${(visibleGraph?.edges.length ?? 0).toLocaleString()} edges`}
-              </strong>
-              <span>
-                {live ? "Live updates are enabled while crawling." : "Graph is idle."}
-                {updatedAt ? ` Updated ${formatTime(updatedAt)}.` : ""}
-                {graph
-                  ? ` Source snapshot ${(graph.nodes.length).toLocaleString()} nodes / ${(graph.edges.length).toLocaleString()} edges.`
-                  : ""}
-              </span>
-            </div>
-            <div className="graph-actions">
-              <span className={live ? "graph-live on" : "graph-live"}>{live ? "Live" : "Idle"}</span>
-              <button onClick={fitGraph} disabled={!visibleGraph || visibleGraph.nodes.length === 0}>
-                Fit
-              </button>
-              <button
-                onClick={toggleGraphRenderMode}
-                disabled={!visibleGraph || visibleGraph.nodes.length === 0}
-              >
-                {graphRenderMode === "webgl" ? "Use SVG" : "Use WebGL"}
-              </button>
-              <button
-                onClick={exportVisibleGraph}
-                disabled={!visibleGraph || visibleGraph.nodes.length === 0}
-              >
-                Export JSON
-              </button>
-              <button
-                onClick={onOpenBrokenLinks}
-                disabled={sourceBrokenLinkCount === 0}
-                title="Open source-to-target rows for broken links"
-              >
-                Broken Report
-              </button>
-              <button
-                onClick={onOpenRedirects}
-                disabled={sourceRedirectLinkCount === 0}
-                title="Open redirect-chain rows"
-              >
-                Redirect Report
-              </button>
-              <button onClick={onRefresh} disabled={loading}>
-                Reload
-              </button>
-            </div>
-          </div>
-          <div className="graph-filters">
-            <button
-              className={internalOnly ? "active" : ""}
-              onClick={() => onInternalOnlyChange(!internalOnly)}
-            >
-              Internal Only
-            </button>
-            <button
-              className={statusFilter === "brokenLinks" ? "active" : ""}
-              onClick={() => {
-                onStatusFilterChange("brokenLinks");
-                onDepthFilterChange("all");
-              }}
-              disabled={sourceBrokenLinkCount === 0}
-              title="Show broken source-to-target edges with both endpoint nodes"
-            >
-              Broken Links
-              {sourceBrokenLinkCount > 0 ? ` (${sourceBrokenLinkCount})` : ""}
-            </button>
-            <button
-              className={statusFilter === "redirectLinks" ? "active" : ""}
-              onClick={() => {
-                onStatusFilterChange("redirectLinks");
-                onDepthFilterChange("all");
-              }}
-              disabled={sourceRedirectLinkCount === 0}
-              title="Show redirect source-to-target edges with both endpoint nodes"
-            >
-              Redirect Links
-              {sourceRedirectLinkCount > 0 ? ` (${sourceRedirectLinkCount})` : ""}
-            </button>
-            <label>
-              Status
-              <select
-                value={statusFilter}
-                onChange={(event) =>
-                  onStatusFilterChange(event.target.value as GraphStatusFilter)
-                }
-              >
-                <option value="all">All</option>
-                <option value="success">2xx</option>
-                <option value="redirect">Redirect</option>
-                <option value="broken">Broken</option>
-                <option value="brokenLinks">Broken Links</option>
-                <option value="redirectLinks">Redirect Links</option>
-                <option value="external">External</option>
-                <option value="uncrawled">Uncrawled</option>
-              </select>
-            </label>
-            <label>
-              Depth
-              <select
-                value={depthFilter}
-                onChange={(event) => onDepthFilterChange(event.target.value)}
-              >
-                <option value="all">All</option>
-                {depthOptions.map((depth) => (
-                  <option key={depth} value={String(depth)}>
-                    {depth}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Layout
-              <select
-                value={layoutMode}
-                onChange={(event) =>
-                  onLayoutModeChange(event.target.value as GraphLayoutMode)
-                }
-              >
-                <option value="depth">Depth</option>
-                <option value="radial">Radial</option>
-              </select>
-            </label>
-          </div>
-          <div className="graph-legend" aria-label="Graph legend">
-            <span className="success">2xx</span>
-            <span className="warning">Redirect</span>
-            <span className="warning-link">Redirect Link</span>
-            <span className="danger">Broken</span>
-            <span className="danger-link">Broken Link</span>
-            <span className="muted">External</span>
-            <span className="outline">Uncrawled</span>
-          </div>
-          <div className={previewNode ? "graph-node-preview" : "graph-node-preview empty"}>
-            {previewNode ? (
-              <>
-                <strong>{previewNode.label}</strong>
-                <span>{selectedNode ? "Selected" : "Hovered"}</span>
-                <span>{previewNode.status}</span>
-                <span>Depth {previewNode.depth}</span>
-                <span>
-                  {previewNode.inlinks.toLocaleString()} in /{" "}
-                  {previewNode.outlinks.toLocaleString()} out
-                </span>
-                {selectedNode ? (
-                  <button onClick={() => setSelectedNode(null)}>Clear</button>
-                ) : null}
-              </>
-            ) : (
-              <span>
-                Hover or select a node for details.
-                {visibleBrokenLinkCount > 0
-                  ? ` ${visibleBrokenLinkCount.toLocaleString()} broken link edges visible.`
-                  : ""}
-                {visibleRedirectLinkCount > 0
-                  ? ` ${visibleRedirectLinkCount.toLocaleString()} redirect link edges visible.`
-                  : ""}
-              </span>
-            )}
-          </div>
-          <div className="graph-canvas-shell">
-            <div
-              ref={containerRef}
-              className={
-                graphRenderMode === "webgl" ? "graph-canvas" : "graph-canvas is-hidden"
-              }
-            />
-            {visibleGraph && visibleGraph.nodes.length > 0 && graphRenderMode === "svg" ? (
-              <SvgGraph
-                graph={visibleGraph}
-                layoutMode={layoutMode}
-                theme={theme}
-                onNodeSelect={setSelectedNode}
-              />
-            ) : null}
-            {!visibleGraph || visibleGraph.nodes.length === 0 ? (
-              <p className="graph-empty-overlay">
-                {loading ? "Loading graph data" : "No graph data is available yet."}
-              </p>
-            ) : null}
-          </div>
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
-  );
-}
-
-function SvgGraph({
-  graph,
-  layoutMode,
-  theme,
-  onNodeSelect,
-}: {
-  graph: CrawlGraph;
-  layoutMode: GraphLayoutMode;
-  theme: Theme;
-  onNodeSelect: (node: GraphNodeAttributes) => void;
-}) {
-  const colors = graphPalette();
-  const layout = useMemo(() => svgGraphLayout(graph, layoutMode), [graph, layoutMode, theme]);
-
-  return (
-    <svg
-      className="graph-svg"
-      viewBox={`0 0 ${layout.width} ${layout.height}`}
-      role="img"
-      aria-label="Crawl graph fallback rendering"
-    >
-      <rect width={layout.width} height={layout.height} fill={colors.surface} />
-      <g className="graph-svg-edges">
-        {layout.edges.map((edge) => (
-          <line
-            key={edge.id}
-            x1={edge.source.x}
-            y1={edge.source.y}
-            x2={edge.target.x}
-            y2={edge.target.y}
-            stroke={edge.color}
-            strokeOpacity={edge.opacity}
-            strokeWidth={edge.width}
-          />
-        ))}
-      </g>
-      <g className="graph-svg-nodes">
-        {layout.nodes.map((node) => (
-          <g
-            key={node.url}
-            className="graph-svg-node"
-            onClick={() => onNodeSelect(graphNodePreviewAttributes(node))}
-          >
-            <circle
-              cx={node.x}
-              cy={node.y}
-              r={node.radius}
-              fill={node.color}
-              stroke={colors.surface}
-              strokeWidth="2"
-            >
-              <title>{node.url}</title>
-            </circle>
-            {node.forceLabel ? (
-              <text
-                x={node.x + node.radius + 5}
-                y={node.y + 4}
-                fill={colors.text}
-                fontSize="11"
-              >
-                {node.label}
-              </text>
-            ) : null}
-          </g>
-        ))}
-      </g>
-    </svg>
-  );
-}
-
 function OverviewPanel({
+  open,
   summary,
   progress,
   progressPercent,
@@ -6881,6 +7406,7 @@ function OverviewPanel({
   onClose,
   statusLabel,
 }: {
+  open: boolean;
   summary: CrawlSummary;
   progress?: CrawlProgress;
   progressPercent: number;
@@ -6904,6 +7430,7 @@ function OverviewPanel({
   ];
   const issueRows: OverviewRowModel[] = [
     { label: "Broken", value: summary.broken, tone: "danger" as const, view: "brokenLinks" },
+    { label: "Exact response duplicates", value: summary.exactDuplicates, tone: "muted" as const, view: "exactDuplicate" },
     {
       label: "Near duplicates",
       value: summary.nearDuplicates,
@@ -6920,8 +7447,10 @@ function OverviewPanel({
   const metadataRows: OverviewRowModel[] = [
     { label: "Missing titles", value: summary.titleMissing, tone: "warning" as const, view: "titleMissing" },
     { label: "Duplicate titles", value: summary.titleDuplicate, tone: "warning" as const, view: "titleDuplicate" },
+    { label: "Multiple titles", value: summary.titleMultiple, tone: "warning", view: "titleMultiple" },
     { label: "Missing meta", value: summary.metaMissing, tone: "warning" as const, view: "metaMissing" },
     { label: "Duplicate meta", value: summary.metaDuplicate, tone: "warning" as const, view: "metaDuplicate" },
+    { label: "Multiple descriptions", value: summary.metaMultiple, tone: "warning", view: "metaMultiple" },
   ];
   const headingRows: OverviewRowModel[] = [
     { label: "Missing H1", value: summary.h1Missing, tone: "warning" as const, view: "h1Missing" },
@@ -6932,6 +7461,12 @@ function OverviewPanel({
   const directiveRows: OverviewRowModel[] = [
     { label: "Missing canonical", value: summary.canonicalMissing, tone: "muted" as const, view: "canonicalMissing" },
     { label: "Multiple canonicals", value: summary.canonicalMultiple, tone: "warning" as const, view: "canonicalMultiple" },
+    { label: "Canonical target not crawled", value: summary.canonicalUncrawled, tone: "muted", view: "canonicalUncrawled" },
+    { label: "Canonical to redirect", value: summary.canonicalToRedirect, tone: "warning", view: "canonicalToRedirect" },
+    { label: "Canonical to error", value: summary.canonicalToError, tone: "danger", view: "canonicalToError" },
+    { label: "Canonical to non-indexable", value: summary.canonicalNonIndexable, tone: "warning", view: "canonicalNonIndexable" },
+    { label: "Canonical chains", value: summary.canonicalChain, tone: "warning", view: "canonicalChain" },
+    { label: "Canonical loops", value: summary.canonicalLoop, tone: "danger", view: "canonicalLoop" },
     { label: "Noindex", value: summary.noindex, tone: "muted" as const, view: "directivesNoindex" },
   ];
   const mediaRows: OverviewRowModel[] = [
@@ -6939,6 +7474,13 @@ function OverviewPanel({
     { label: "Long alt text", value: summary.imagesAltTooLong, tone: "muted" as const, view: "imagesAltTooLong" },
   ];
   const technicalRows: OverviewRowModel[] = [
+    { label: "AMP URL to error", value: summary.ampToError, tone: "danger", view: "ampToError" },
+    { label: "Next URL to error", value: summary.paginationNextToError, tone: "danger", view: "paginationNextToError" },
+    { label: "Previous URL to error", value: summary.paginationPrevToError, tone: "danger", view: "paginationPrevToError" },
+    { label: "Next URL loops", value: summary.paginationNextLoop, tone: "danger", view: "paginationNextLoop" },
+    { label: "Previous URL loops", value: summary.paginationPrevLoop, tone: "danger", view: "paginationPrevLoop" },
+    { label: "Next URL non-reciprocal", value: summary.paginationNextNonReciprocal, tone: "warning", view: "paginationNextNonReciprocal" },
+    { label: "Previous URL non-reciprocal", value: summary.paginationPrevNonReciprocal, tone: "warning", view: "paginationPrevNonReciprocal" },
     { label: "Invalid hreflang", value: summary.hreflangInvalid, tone: "warning" as const, view: "hreflangInvalid" },
     {
       label: "Structured data errors",
@@ -6982,7 +7524,7 @@ function OverviewPanel({
   );
 
   return (
-    <aside className="overview-panel" aria-label="Crawl overview">
+    <aside className="overview-panel" aria-label="Crawl overview" data-state={open ? "open" : "closed"} inert={!open} aria-hidden={!open}>
       <div className="inspector-heading">
         <div className="detail-tabs" role="tablist" aria-label="Crawl inspection" onKeyDown={handleTabKeys}>
           {(["overview", "issues"] as const).map((id) => <button key={id} id={`inspection-tab-${id}`} role="tab"
@@ -7665,495 +8207,6 @@ function compactHash(value?: string | null) {
   return value.length > 10 ? `${value.slice(0, 10)}...` : value;
 }
 
-function graphLabel(url: string) {
-  try {
-    const parsed = new URL(url);
-    const path = parsed.pathname === "/" ? parsed.hostname : parsed.pathname;
-    return path.length > 34 ? `${path.slice(0, 31)}...` : path;
-  } catch {
-    return url.length > 34 ? `${url.slice(0, 31)}...` : url;
-  }
-}
-
-function graphStatusLabel(node: GraphNode) {
-  if (!node.crawled) {
-    return "Uncrawled";
-  }
-  if (node.classification === "external") {
-    return "External";
-  }
-  if (node.statusCode === null || node.statusCode === undefined) {
-    return "Unknown";
-  }
-  if (node.statusCode >= 400) {
-    return `Broken ${node.statusCode}`;
-  }
-  if (node.statusCode >= 300) {
-    return `Redirect ${node.statusCode}`;
-  }
-  if (node.statusCode >= 200) {
-    return `Success ${node.statusCode}`;
-  }
-  return String(node.statusCode);
-}
-
-function filterGraphSnapshot(
-  graph: CrawlGraph | undefined,
-  statusFilter: GraphStatusFilter,
-  depthFilter: string,
-) {
-  if (!graph) {
-    return undefined;
-  }
-
-  const selectedDepth = depthFilter === "all" ? undefined : Number(depthFilter);
-  if (statusFilter === "brokenLinks" || statusFilter === "redirectLinks") {
-    const brokenTargets = brokenGraphTargets(graph);
-    const matchingEdges = graph.edges.filter((edge) =>
-      statusFilter === "brokenLinks"
-        ? isBrokenGraphEdge(edge, brokenTargets)
-        : isRedirectGraphEdge(edge),
-    );
-    const endpointUrls = new Set<string>();
-    matchingEdges.forEach((edge) => {
-      endpointUrls.add(edge.sourceUrl);
-      endpointUrls.add(edge.targetUrl);
-    });
-    const nodes = graph.nodes.filter((node) => {
-      if (!endpointUrls.has(node.url)) {
-        return false;
-      }
-      if (selectedDepth !== undefined) {
-        return node.depth === selectedDepth;
-      }
-      return true;
-    });
-    const nodeUrls = new Set(nodes.map((node) => node.url));
-    const edges = matchingEdges.filter(
-      (edge) => nodeUrls.has(edge.sourceUrl) && nodeUrls.has(edge.targetUrl),
-    );
-
-    return {
-      ...graph,
-      nodes,
-      edges,
-      totalNodes: nodes.length,
-      totalEdges: edges.length,
-    };
-  }
-
-  const nodes = graph.nodes.filter((node) => {
-    if (!nodeMatchesGraphStatus(node, statusFilter)) {
-      return false;
-    }
-    if (selectedDepth !== undefined) {
-      return node.depth === selectedDepth;
-    }
-    return true;
-  });
-  const nodeUrls = new Set(nodes.map((node) => node.url));
-  const edges = graph.edges.filter(
-    (edge) => nodeUrls.has(edge.sourceUrl) && nodeUrls.has(edge.targetUrl),
-  );
-
-  return {
-    ...graph,
-    nodes,
-    edges,
-    totalNodes: nodes.length,
-    totalEdges: edges.length,
-  };
-}
-
-function nodeMatchesGraphStatus(node: GraphNode, statusFilter: GraphStatusFilter) {
-  switch (statusFilter) {
-    case "success":
-      return isStatusBetween(node.statusCode, 200, 299);
-    case "redirect":
-      return isStatusBetween(node.statusCode, 300, 399);
-    case "broken":
-      return (typeof node.statusCode === "number" && node.statusCode >= 400) || (node.crawled && node.statusCode == null);
-    case "brokenLinks":
-      return true;
-    case "redirectLinks":
-      return true;
-    case "external":
-      return node.classification === "external";
-    case "uncrawled":
-      return !node.crawled;
-    default:
-      return true;
-  }
-}
-
-function brokenGraphTargets(graph?: CrawlGraph) {
-  return new Set(graph?.nodes.filter((node) => nodeMatchesGraphStatus(node, "broken")).map((node) => node.url));
-}
-
-function isBrokenGraphEdge(edge: LinkEdge, brokenTargets: Set<string>) {
-  return (typeof edge.targetStatusCode === "number" && edge.targetStatusCode >= 400) || brokenTargets.has(edge.targetUrl);
-}
-
-function isRedirectGraphEdge(edge: LinkEdge) {
-  return isStatusBetween(edge.targetStatusCode, 300, 399);
-}
-
-function graphDepthOptions(graph: CrawlGraph | undefined) {
-  if (!graph) {
-    return [];
-  }
-  return [
-    ...new Set(
-      graph.nodes.flatMap((node) =>
-        typeof node.depth === "number" ? [node.depth] : [],
-      ),
-    ),
-  ].sort((left, right) => left - right);
-}
-
-function graphNodeColor(node: GraphNode, colors: ReturnType<typeof graphPalette>) {
-  if (!node.crawled) {
-    return colors.border;
-  }
-  if (nodeMatchesGraphStatus(node, "broken")) return colors.danger;
-  if (node.statusCode == null) return colors.border;
-  if (node.classification === "external") {
-    return colors.muted;
-  }
-  if (node.statusCode >= 400) {
-    return colors.danger;
-  }
-  if (node.statusCode >= 300) {
-    return colors.warning;
-  }
-  if (node.statusCode >= 200) {
-    return colors.success;
-  }
-  return colors.primary;
-}
-
-function graphNodeSize(node: GraphNode) {
-  const linkWeight = Math.log2(node.inlinkCount + node.outlinkCount + 2);
-  if (!node.crawled) {
-    return 4 + linkWeight;
-  }
-  if (
-    node.statusCode !== null &&
-    node.statusCode !== undefined &&
-    node.statusCode >= 400
-  ) {
-    return 8 + linkWeight;
-  }
-  return 6 + linkWeight;
-}
-
-function graphForceLabel(node: GraphNode, nodeCount: number) {
-  if (node.depth === 0) {
-    return true;
-  }
-  if (
-    node.statusCode !== null &&
-    node.statusCode !== undefined &&
-    node.statusCode >= 400
-  ) {
-    return true;
-  }
-  return nodeCount <= 70;
-}
-
-function graphEdgeStatusLabel(edge: LinkEdge) {
-  if (edge.targetStatusCode === null || edge.targetStatusCode === undefined) {
-    return "Unresolved";
-  }
-  if (edge.targetStatusCode >= 400) {
-    return `Broken ${edge.targetStatusCode}`;
-  }
-  if (edge.targetStatusCode >= 300) {
-    return `Redirect ${edge.targetStatusCode}`;
-  }
-  return String(edge.targetStatusCode);
-}
-
-function graphEdgeColor(edge: LinkEdge, colors: ReturnType<typeof graphPalette>) {
-  if (edge.linkType === "external") {
-    return colors.muted;
-  }
-  if (edge.targetStatusCode === null || edge.targetStatusCode === undefined) {
-    return colors.border;
-  }
-  if (edge.targetStatusCode >= 400) {
-    return colors.danger;
-  }
-  if (edge.relNofollow) {
-    return colors.warning;
-  }
-  return colors.border;
-}
-
-function graphEdgeSize(edge: LinkEdge) {
-  if (
-    edge.targetStatusCode !== null &&
-    edge.targetStatusCode !== undefined &&
-    edge.targetStatusCode >= 400
-  ) {
-    return 1.8;
-  }
-  return edge.relNofollow ? 1.3 : 1;
-}
-
-function graphInitialPosition(
-  node: GraphNode,
-  index: number,
-  nodes: GraphNode[],
-  layoutMode: GraphLayoutMode,
-  radius: number,
-) {
-  const maxKnownDepth = nodes.reduce((maxDepth, current) => {
-    if (typeof current.depth === "number") {
-      return Math.max(maxDepth, current.depth);
-    }
-    return maxDepth;
-  }, 0);
-  const depth =
-    typeof node.depth === "number" && node.classification !== "external"
-      ? node.depth
-      : maxKnownDepth + 1;
-
-  if (layoutMode === "radial") {
-    const ring = ((depth + 1) / Math.max(1, maxKnownDepth + 2)) * radius;
-    const angle = (index / Math.max(1, nodes.length)) * Math.PI * 2;
-    return { x: Math.cos(angle) * ring, y: Math.sin(angle) * ring };
-  }
-
-  const x = ((depth / Math.max(1, maxKnownDepth + 1)) * 2 - 1) * radius;
-  const y = ((index / Math.max(1, nodes.length - 1)) * 2 - 1) * radius;
-  return { x, y };
-}
-
-function graphNodePreviewAttributes(
-  node: GraphNode & {
-    x: number;
-    y: number;
-    radius: number;
-    color: string;
-    forceLabel: boolean;
-  },
-): GraphNodeAttributes {
-  return {
-    label: node.label || graphLabel(node.url),
-    url: node.url,
-    status: graphStatusLabel(node),
-    depth: node.depth === null || node.depth === undefined ? "Unknown" : String(node.depth),
-    inlinks: node.inlinkCount,
-    outlinks: node.outlinkCount,
-    x: node.x,
-    y: node.y,
-    size: node.radius,
-    color: node.color,
-    forceLabel: node.forceLabel,
-  };
-}
-
-function svgGraphLayout(graph: CrawlGraph, layoutMode: GraphLayoutMode) {
-  if (layoutMode === "radial") {
-    return svgRadialGraphLayout(graph);
-  }
-
-  const colors = graphPalette();
-  const width = 1100;
-  const height = 660;
-  const margin = 58;
-  const nodes = graph.nodes.slice(0, 700);
-  const nodeByUrl = new Map(nodes.map((node) => [node.url, node]));
-  const maxKnownDepth = nodes.reduce((maxDepth, node) => {
-    if (typeof node.depth === "number") {
-      return Math.max(maxDepth, node.depth);
-    }
-    return maxDepth;
-  }, 0);
-  const unknownDepth = maxKnownDepth + 1;
-  const groups = new Map<number, GraphNode[]>();
-
-  nodes.forEach((node) => {
-    const depth =
-      typeof node.depth === "number" && node.classification !== "external"
-        ? node.depth
-        : unknownDepth;
-    const group = groups.get(depth) ?? [];
-    group.push(node);
-    groups.set(depth, group);
-  });
-
-  const depthKeys = [...groups.keys()].sort((left, right) => left - right);
-  const xByDepth = new Map<number, number>();
-  const columnCount = Math.max(1, depthKeys.length - 1);
-  depthKeys.forEach((depth, index) => {
-    xByDepth.set(depth, margin + (index / columnCount) * (width - margin * 2));
-  });
-
-  const positioned = new Map<
-    string,
-    GraphNode & {
-      x: number;
-      y: number;
-      radius: number;
-      color: string;
-      forceLabel: boolean;
-    }
-  >();
-
-  depthKeys.forEach((depth) => {
-    const group = [...(groups.get(depth) ?? [])].sort((left, right) =>
-      left.url.localeCompare(right.url),
-    );
-    const step = (height - margin * 2) / Math.max(1, group.length);
-    group.forEach((node, index) => {
-      positioned.set(node.url, {
-        ...node,
-        x: xByDepth.get(depth) ?? margin,
-        y: margin + step * (index + 0.5),
-        radius: Math.min(13, Math.max(5, graphNodeSize(node))),
-        color: graphNodeColor(node, colors),
-        forceLabel: graphForceLabel(node, nodes.length),
-      });
-    });
-  });
-
-  const edges = graph.edges
-    .slice(0, 1_500)
-    .map((edge) => {
-      const source = positioned.get(edge.sourceUrl);
-      const target = positioned.get(edge.targetUrl);
-      if (!source || !target || !nodeByUrl.has(edge.sourceUrl) || !nodeByUrl.has(edge.targetUrl)) {
-        return null;
-      }
-      return {
-        id: edge.id,
-        source,
-        target,
-        color: graphEdgeColor(edge, colors),
-        width: graphEdgeSize(edge),
-        opacity: edge.linkType === "external" ? 0.75 : 0.85,
-      };
-    })
-    .filter((edge): edge is NonNullable<typeof edge> => edge !== null);
-
-  return {
-    width,
-    height,
-    nodes: [...positioned.values()],
-    edges,
-  };
-}
-
-function svgRadialGraphLayout(graph: CrawlGraph) {
-  const colors = graphPalette();
-  const width = 1100;
-  const height = 660;
-  const centerX = width / 2;
-  const centerY = height / 2;
-  const maxRadius = Math.min(width, height) / 2 - 64;
-  const nodes = graph.nodes.slice(0, 700);
-  const nodeByUrl = new Map(nodes.map((node) => [node.url, node]));
-  const maxKnownDepth = nodes.reduce((maxDepth, node) => {
-    if (typeof node.depth === "number") {
-      return Math.max(maxDepth, node.depth);
-    }
-    return maxDepth;
-  }, 0);
-  const unknownDepth = maxKnownDepth + 1;
-  const groups = new Map<number, GraphNode[]>();
-
-  nodes.forEach((node) => {
-    const depth =
-      typeof node.depth === "number" && node.classification !== "external"
-        ? node.depth
-        : unknownDepth;
-    const group = groups.get(depth) ?? [];
-    group.push(node);
-    groups.set(depth, group);
-  });
-
-  const positioned = new Map<
-    string,
-    GraphNode & {
-      x: number;
-      y: number;
-      radius: number;
-      color: string;
-      forceLabel: boolean;
-    }
-  >();
-
-  [...groups.keys()]
-    .sort((left, right) => left - right)
-    .forEach((depth) => {
-      const group = [...(groups.get(depth) ?? [])].sort((left, right) =>
-        left.url.localeCompare(right.url),
-      );
-      const ring = ((depth + 1) / Math.max(1, unknownDepth + 1)) * maxRadius;
-      group.forEach((node, index) => {
-        const angle = (index / Math.max(1, group.length)) * Math.PI * 2;
-        positioned.set(node.url, {
-          ...node,
-          x: centerX + Math.cos(angle) * ring,
-          y: centerY + Math.sin(angle) * ring,
-          radius: Math.min(13, Math.max(5, graphNodeSize(node))),
-          color: graphNodeColor(node, colors),
-          forceLabel: graphForceLabel(node, nodes.length),
-        });
-      });
-    });
-
-  const edges = graph.edges
-    .slice(0, 1_500)
-    .map((edge) => {
-      const source = positioned.get(edge.sourceUrl);
-      const target = positioned.get(edge.targetUrl);
-      if (!source || !target || !nodeByUrl.has(edge.sourceUrl) || !nodeByUrl.has(edge.targetUrl)) {
-        return null;
-      }
-      return {
-        id: edge.id,
-        source,
-        target,
-        color: graphEdgeColor(edge, colors),
-        width: graphEdgeSize(edge),
-        opacity: edge.linkType === "external" ? 0.75 : 0.85,
-      };
-    })
-    .filter((edge): edge is NonNullable<typeof edge> => edge !== null);
-
-  return {
-    width,
-    height,
-    nodes: [...positioned.values()],
-    edges,
-  };
-}
-
-function graphPalette() {
-  return {
-    primary: cssVar("--color-primary"),
-    success: cssVar("--ui-success"),
-    warning: cssVar("--ui-warning"),
-    danger: cssVar("--ui-danger"),
-    muted: cssVar("--ui-text-muted"),
-    border: cssVar("--ui-text-toned"),
-    surface: cssVar("--ui-bg-elevated"),
-    text: cssVar("--ui-text-highlighted"),
-  };
-}
-
-function supportsWebGl() {
-  try {
-    const canvas = document.createElement("canvas");
-    return Boolean(canvas.getContext("webgl2") || canvas.getContext("webgl"));
-  } catch {
-    return false;
-  }
-}
-
 function formatTime(timestamp: number) {
   return new Date(timestamp).toLocaleTimeString([], {
     hour: "2-digit",
@@ -8174,6 +8227,22 @@ function cssVar(name: string, fallback = "") {
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+function getInitialColumnLayout(): ColumnLayout {
+  const fallback: ColumnLayout = { active: "relevant", custom: [], presets: [] };
+  try {
+    const saved = JSON.parse(readPreference(columnLayoutStorageKey) ?? "null");
+    const validColumns = (keys: unknown): keys is string[] => Array.isArray(keys) && keys.length <= 512 &&
+      keys.every((key) => typeof key === "string" && key.length <= 512) && new Set(keys).size === keys.length;
+    if (saved?.version !== 1 || typeof saved.active !== "string" || !validColumns(saved.custom) ||
+      !Array.isArray(saved.presets) || saved.presets.length > 100 || !saved.presets.every((preset: ColumnLayout["presets"][number]) =>
+        preset && typeof preset.name === "string" && preset.name.trim().length > 0 && preset.name.length <= 60 && validColumns(preset.columns)) ||
+      new Set(saved.presets.map((preset: ColumnLayout["presets"][number]) => preset.name.toLowerCase())).size !== saved.presets.length) return fallback;
+    const active = ["relevant", "all", "custom", ...saved.presets.map((preset: ColumnLayout["presets"][number]) => `saved:${preset.name}`)].includes(saved.active)
+      ? saved.active : "relevant";
+    return { active, custom: saved.custom, presets: saved.presets };
+  } catch { return fallback; }
 }
 
 function readPreference(key: string): string | null {
@@ -8215,10 +8284,10 @@ function resolveTheme(theme: ThemePreference): Theme {
 
 function getInitialStartUrl() {
   if (typeof window === "undefined") {
-    return "https://example.com/";
+    return "";
   }
 
-  return readPreference(lastUrlStorageKey) ?? "https://example.com/";
+  return readPreference(lastUrlStorageKey) ?? "";
 }
 
 function getInitialOverviewWidth() {
@@ -8293,32 +8362,16 @@ function patternsToText(patterns: string[]) {
 }
 
 function textToPatterns(value: string) {
-  return value
-    .split(/\r?\n/)
-    .map((pattern) => pattern.trim())
-    .filter(Boolean);
+  return cleanPatterns(value.split(/\r?\n/));
+}
+
+function cleanPatterns(patterns: string[] = []) {
+  return patterns.map((pattern) => pattern.trim()).filter(Boolean);
 }
 
 function extractUrlsFromText(value: string) {
   const matches = value.match(/https?:\/\/[^\s"'<>),]+/gi) ?? [];
-  return mergeUniqueValues(
-    [],
-    matches.map((url) => url.replace(/[.;\]]+$/g, "")),
-  );
-}
-
-function mergeUniqueValues(existing: string[], incoming: string[]) {
-  const seen = new Set<string>();
-  const merged: string[] = [];
-  for (const value of [...existing, ...incoming]) {
-    const trimmed = value.trim();
-    if (!trimmed || seen.has(trimmed)) {
-      continue;
-    }
-    seen.add(trimmed);
-    merged.push(trimmed);
-  }
-  return merged;
+  return matches.map((url) => url.replace(/[.;\]]+$/g, ""));
 }
 
 function applyTheme(theme: Theme) {

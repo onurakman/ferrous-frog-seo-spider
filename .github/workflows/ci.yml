@@ -59,4 +59,5 @@ jobs:
       - name: Verify versions, formatting, Clippy, Rust tests, frontend and optional rendering
         env:
           CHROME_BIN: ${{ steps.chrome.outputs.chrome-path }}
+          CHROME: ${{ steps.chrome.outputs.chrome-path }}
         run: make ci

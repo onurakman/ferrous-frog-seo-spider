@@ -12,11 +12,11 @@ Primary stack:
 - Tauri 2 desktop shell.
 - React, TypeScript, and Vite frontend.
 - Virtualized grid UI with server-side paging, sorting, and filtering.
-- In-memory storage for quick crawls and SQLite-backed storage for larger/resumable current crawls.
+- SQLite-backed desktop crawl sessions with automatic persistence; the in-memory backend remains available for headless engine use and tests.
 
 ## Non-Negotiables
 
-- Keep the crawler polite by default: respect robots.txt, use sane rate limits, and send a clear User-Agent.
+- Keep the crawler polite by default: respect robots.txt, use sane rate limits, and send the configured User-Agent.
 - Keep the engine independent from the UI. UI code must not own the full crawl dataset.
 - Stream progress to the UI. Query result windows through commands.
 - Avoid cloning large HTML bodies across pipeline stages.
@@ -102,6 +102,7 @@ Add tests with the feature they prove:
 - Build the actual app screen first, not a marketing landing page.
 - Use a top crawl toolbar, left issue tree, central virtualized grid, and bottom detail panel.
 - Keep the grid virtualized and backed by server-side queries.
+- Open on the crawl library/URL launcher. New desktop crawls get separate SQLite sessions; opening a saved crawl restores its workbench without starting requests or replacing another session's data.
 - Include dark/light theme support.
 - Ensure controls remain usable on small screens.
 - Avoid decorative-only UI that slows repeated operational use.
@@ -110,7 +111,7 @@ Add tests with the feature they prove:
 
 - Never default to ignoring robots.txt.
 - Make aggressive crawl settings explicit user choices.
-- Keep a clear default User-Agent, for example `FerrousFrogSeoSpider/0.1 (+https://example.invalid/ferrous-frog)`.
+- The user-selected default request preset is Chrome desktop. Keep User-Agent and non-secret header values editable, preserve explicit saved settings, and retain the Ferrous Frog identification preset. Browser-specific transport and resource headers belong to the HTTP client/browser; do not forge unsupported capabilities.
 - Do not add trademarked names, logos, or assets from competing products.
 - Do not commit API keys, crawl databases, generated exports, or user crawl data.
 
@@ -118,6 +119,7 @@ Add tests with the feature they prove:
 
 - Use the Rust toolchain in `rust-toolchain.toml` and Node version in `.node-version`.
 - Use `npm ci` and locked Cargo commands. `make ci` mirrors the GitHub checks, including Clippy and the existing browser smoke test.
+- Workbook inspection tests require Python 3 (`python3` or `python`) and use its standard-library ZIP/XML readers; the application itself does not require Python.
 - `make build` builds the desktop release executable; `make release` also creates installers. The Cargo target directory belongs to the workspace root.
 - Follow Conventional Commits. Release Please owns version updates across npm, Tauri and the shared Cargo workspace; run `make check-versions` after touching manifests or release configuration.
 - Preserve draft-only uploads and the all-platform success gate before publication. See `docs/RELEASING.md` for retry and signing procedures.

@@ -13,10 +13,13 @@ js-rendering = ["ferrous-frog-crawler-core/js-rendering"]
 tauri-build.workspace = true
 
 [dependencies]
+csv.workspace = true
 ferrous-frog-analysis.workspace = true
 ferrous-frog-crawler-core.workspace = true
 ferrous-frog-export.workspace = true
+ferrous-frog-extractors.workspace = true
 ferrous-frog-integrations.workspace = true
+ferrous-frog-parser.workspace = true
 ferrous-frog-storage.workspace = true
 keyring.workspace = true
 reqwest.workspace = true
@@ -26,6 +29,8 @@ serde.workspace = true
 serde_json.workspace = true
 tauri = { workspace = true, features = [] }
 tauri-plugin-opener.workspace = true
+tauri-plugin-window-state.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 url.workspace = true
 

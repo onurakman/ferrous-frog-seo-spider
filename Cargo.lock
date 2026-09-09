@@ -1334,10 +1334,13 @@ dependencies = [
 name = "ferrous-frog-app"
 version = "0.2.0"
 dependencies = [
+ "csv",
  "ferrous-frog-analysis",
  "ferrous-frog-crawler-core",
  "ferrous-frog-export",
+ "ferrous-frog-extractors",
  "ferrous-frog-integrations",
+ "ferrous-frog-parser",
  "ferrous-frog-storage",
  "keyring",
  "reqwest",
@@ -1348,6 +1351,8 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tauri-plugin-window-state",
+ "tempfile",
  "tokio",
  "url",
 ]
@@ -1364,6 +1369,8 @@ dependencies = [
  "ferrous-frog-storage",
  "futures",
  "governor",
+ "httpdate",
+ "psl",
  "quick-xml 0.42.0",
  "regex",
  "reqwest",
@@ -1371,7 +1378,9 @@ dependencies = [
  "rustls-pki-types",
  "rustls-platform-verifier",
  "serde",
+ "serde_json",
  "simhash",
+ "tempfile",
  "texting_robots",
  "tokio",
  "tokio-rustls",
@@ -1411,6 +1420,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "url",
 ]
 
@@ -2128,6 +2138,12 @@ name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hyper"
@@ -3501,6 +3517,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "psl"
+version = "2.1.231"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62697aa3f75e221e1ecfa35146237f7a3fa7f234b523816734deb198a1b23418"
+dependencies = [
+ "psl-types",
+]
+
+[[package]]
 name = "psl-types"
 version = "2.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3841,6 +3866,7 @@ version = "0.99.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c073c0bd3868defc46035bf95b2e70389cefc59c528b8674fe90594c9c2b3f6f"
 dependencies = [
+ "tempfile",
  "zip",
 ]
 
@@ -4815,6 +4841,21 @@ dependencies = [
  "url",
  "windows",
  "zbus",
+]
+
+[[package]]
+name = "tauri-plugin-window-state"
+version = "2.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73736611e14142408d15353e21e3cca2f12a3cfb523ad0ce85999b6d2ef1a704"
+dependencies = [
+ "bitflags 2.13.0",
+ "log",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

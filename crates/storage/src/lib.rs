@@ -2,16 +2,31 @@ use regex::Regex;
 use rusqlite::{Connection, OptionalExtension, params, types::Value};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
+mod native_exports;
+
+#[cfg(test)]
+mod frontier_tests;
+
+#[cfg(test)]
+mod image_assets_tests;
+
+#[cfg(test)]
+mod metadata_whitespace_tests;
+
+#[cfg(test)]
+mod summary_tests;
+
 const IMAGE_ASSET_OVERSIZE_BYTES: u64 = 200 * 1024;
-const SUCCESS_HTML_SQL: &str =
-    "status_code >= 200 AND status_code < 300 AND lower(content_type) LIKE '%text/html%'";
+pub const SUCCESS_HTML_SQL: &str = "status_code >= 200 AND status_code < 300 AND lower(content_type) LIKE '%text/html%' AND indexability_status != 'Response body incomplete'";
 const NO_RESPONSE_SQL: &str = "status_code IS NULL AND error IS NOT NULL AND status_text != 'Blocked by robots.txt' AND error != 'Blocked by robots.txt'";
+const MARK_SITEMAP_URLS_SQL: &str = "UPDATE crawl_records SET in_sitemap = 1
+    WHERE (url = ?1 OR final_url = ?1) AND in_sitemap = 0";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -61,12 +76,14 @@ pub enum IssueView {
     NoResponse,
     TitleMissing,
     TitleDuplicate,
+    TitleMultiple,
     TitleTooShort,
     TitleTooLong,
     TitlePixelTooNarrow,
     TitlePixelTooWide,
     MetaMissing,
     MetaDuplicate,
+    MetaMultiple,
     MetaTooShort,
     MetaTooLong,
     MetaPixelTooNarrow,
@@ -80,6 +97,19 @@ pub enum IssueView {
     TitleSameAsH1,
     CanonicalMissing,
     CanonicalMultiple,
+    CanonicalUncrawled,
+    CanonicalToRedirect,
+    CanonicalToError,
+    CanonicalNonIndexable,
+    CanonicalChain,
+    CanonicalLoop,
+    PaginationNextToError,
+    PaginationPrevToError,
+    PaginationNextLoop,
+    PaginationPrevLoop,
+    PaginationNextNonReciprocal,
+    PaginationPrevNonReciprocal,
+    AmpToError,
     DirectivesNoindex,
     ImagesMissingAlt,
     ImagesAltTooLong,
@@ -100,6 +130,7 @@ pub enum IssueView {
     HtmlDuplicateIds,
     RenderedDomChanged,
     NearDuplicate,
+    ExactDuplicate,
     BrokenLinks,
     SitemapOrphan,
 }
@@ -166,6 +197,31 @@ pub struct StructuredDataIssue {
     pub path: String,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PageSpeedStrategy {
+    Mobile,
+    Desktop,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PageSpeedSnapshot {
+    pub strategy: PageSpeedStrategy,
+    pub requested_url: String,
+    pub completed_at_ms: i64,
+    pub final_url: Option<String>,
+    pub fetched_at: Option<String>,
+    pub lighthouse_version: Option<String>,
+    pub performance_score: Option<f64>,
+    pub accessibility_score: Option<f64>,
+    pub best_practices_score: Option<f64>,
+    pub seo_score: Option<f64>,
+    pub lcp_ms: Option<f64>,
+    pub cls: Option<f64>,
+    pub tbt_ms: Option<f64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CrawlRecord {
@@ -198,9 +254,13 @@ pub struct CrawlRecord {
     pub redirect_type: Option<String>,
     pub redirect_chain: Vec<RedirectHop>,
     pub title: Option<String>,
+    #[serde(default)]
+    pub title_count: Option<usize>,
     pub title_len: usize,
     pub title_pixel_width: u32,
     pub meta_description: Option<String>,
+    #[serde(default)]
+    pub meta_description_count: Option<usize>,
     pub meta_description_len: usize,
     pub meta_description_pixel_width: u32,
     pub meta_robots: Option<String>,
@@ -271,6 +331,8 @@ pub struct CrawlRecord {
     pub search_console_ctr: Option<f64>,
     #[serde(default)]
     pub search_console_average_position: Option<f64>,
+    #[serde(default)]
+    pub page_speed: Option<PageSpeedSnapshot>,
     pub error: Option<String>,
 }
 
@@ -306,9 +368,11 @@ impl CrawlRecord {
             redirect_type: None,
             redirect_chain: Vec::new(),
             title: None,
+            title_count: None,
             title_len: 0,
             title_pixel_width: 0,
             meta_description: None,
+            meta_description_count: None,
             meta_description_len: 0,
             meta_description_pixel_width: 0,
             meta_robots: None,
@@ -368,6 +432,7 @@ impl CrawlRecord {
             search_console_impressions: None,
             search_console_ctr: None,
             search_console_average_position: None,
+            page_speed: None,
             error: None,
         }
     }
@@ -406,18 +471,50 @@ pub struct CrawlSummary {
     pub no_response: usize,
     pub broken: usize,
     pub near_duplicates: usize,
+    #[serde(default)]
+    pub exact_duplicates: usize,
     pub indexable: usize,
     pub non_indexable: usize,
     pub title_missing: usize,
     pub title_duplicate: usize,
+    #[serde(default)]
+    pub title_multiple: usize,
     pub meta_missing: usize,
     pub meta_duplicate: usize,
+    #[serde(default)]
+    pub meta_multiple: usize,
     pub h1_missing: usize,
     pub h1_duplicate: usize,
     pub h2_missing: usize,
     pub h2_duplicate: usize,
     pub canonical_missing: usize,
     pub canonical_multiple: usize,
+    #[serde(default)]
+    pub canonical_uncrawled: usize,
+    #[serde(default)]
+    pub canonical_to_redirect: usize,
+    #[serde(default)]
+    pub canonical_to_error: usize,
+    #[serde(default)]
+    pub canonical_non_indexable: usize,
+    #[serde(default)]
+    pub canonical_chain: usize,
+    #[serde(default)]
+    pub canonical_loop: usize,
+    #[serde(default)]
+    pub pagination_next_to_error: usize,
+    #[serde(default)]
+    pub pagination_prev_to_error: usize,
+    #[serde(default)]
+    pub pagination_next_loop: usize,
+    #[serde(default)]
+    pub pagination_prev_loop: usize,
+    #[serde(default)]
+    pub pagination_next_non_reciprocal: usize,
+    #[serde(default)]
+    pub pagination_prev_non_reciprocal: usize,
+    #[serde(default)]
+    pub amp_to_error: usize,
     pub noindex: usize,
     pub images_missing_alt: usize,
     pub images_alt_too_long: usize,
@@ -444,6 +541,8 @@ pub struct GridQuery {
     pub segment_pattern: Option<String>,
     #[serde(default)]
     pub segment_regex: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<GridFilterGroup>,
     pub sort_by: Option<String>,
     pub sort_dir: SortDirection,
     pub view: IssueView,
@@ -457,11 +556,63 @@ impl Default for GridQuery {
             global_search: None,
             segment_pattern: None,
             segment_regex: false,
+            filters: None,
             sort_by: None,
             sort_dir: SortDirection::Asc,
             view: IssueView::All,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GridFilterGroup {
+    #[serde(rename = "match")]
+    pub match_mode: GridFilterMatch,
+    pub rules: Vec<GridFilterRule>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GridFilterMatch {
+    All,
+    Any,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GridFilterRule {
+    pub field: GridFilterField,
+    pub operator: GridFilterOperator,
+    pub value: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GridFilterField {
+    Url,
+    FinalUrl,
+    Title,
+    MetaDescription,
+    Canonical,
+    StatusCode,
+    Depth,
+    WordCount,
+    ResponseTimeMs,
+    Indexability,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GridFilterOperator {
+    Contains,
+    NotContains,
+    Equals,
+    NotEquals,
+    IsEmpty,
+    IsNotEmpty,
+    LessThan,
+    GreaterThan,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -762,6 +913,14 @@ fn default_true() -> bool {
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("crawl record {0} was not found")]
+    RecordNotFound(u64),
+    #[error("invalid PageSpeed snapshot: {0}")]
+    InvalidPageSpeedSnapshot(String),
+    #[error("invalid grid query: {0}")]
+    InvalidQuery(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("serialization error: {0}")]
@@ -770,10 +929,30 @@ pub enum StorageError {
     LockPoisoned,
 }
 
+fn validate_page_speed_snapshot(snapshot: &PageSpeedSnapshot) -> Result<(), StorageError> {
+    for (name, value) in [
+        ("performanceScore", snapshot.performance_score),
+        ("accessibilityScore", snapshot.accessibility_score),
+        ("bestPracticesScore", snapshot.best_practices_score),
+        ("seoScore", snapshot.seo_score),
+        ("lcpMs", snapshot.lcp_ms),
+        ("cls", snapshot.cls),
+        ("tbtMs", snapshot.tbt_ms),
+    ] {
+        if value.is_some_and(|value| !value.is_finite()) {
+            return Err(StorageError::InvalidPageSpeedSnapshot(format!(
+                "{name} must be finite"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub trait CrawlStore: Clone + Send + Sync + 'static {
     fn clear(&self);
     fn upsert(&self, record: CrawlRecord) -> CrawlRecord;
     fn add_inlink(&self, target_url: &str);
+    fn mark_sitemap_urls(&self, urls: &[String]);
     fn add_link_edge(&self, edge: LinkEdge) -> LinkEdge;
     fn add_image_assets(&self, page_url: &str, images: Vec<ImageAsset>);
     fn merge_search_console_metrics(&self, metrics: Vec<SearchConsoleMetricRow>) -> usize;
@@ -792,6 +971,11 @@ pub trait CrawlStore: Clone + Send + Sync + 'static {
 
     fn summary(&self) -> CrawlSummary {
         summarize(&self.records())
+    }
+
+    /// Frequent crawler progress does not rebuild cross-page canonical diagnostics.
+    fn progress_summary(&self) -> CrawlSummary {
+        summarize_without_canonicals(&self.records())
     }
 
     fn crawl_graph(&self, query: CrawlGraphQuery) -> CrawlGraph {
@@ -832,6 +1016,7 @@ pub struct MemoryStore {
 struct MemoryStoreInner {
     records: Vec<CrawlRecord>,
     url_to_index: HashMap<String, usize>,
+    alias_to_indices: HashMap<String, BTreeSet<usize>>,
     inlink_counts: HashMap<String, u32>,
     link_edges: Vec<LinkEdge>,
     image_assets: Vec<ImageAsset>,
@@ -868,23 +1053,56 @@ impl MemoryStore {
         record.inlink_count =
             memory_inlink_count_for_record(&inner, &record).unwrap_or(record.inlink_count);
 
-        if let Some(index) = inner.url_to_index.get(&key).copied() {
+        let index = if let Some(index) = inner.url_to_index.get(&key).copied() {
+            for alias in record_url_aliases(&inner.records[index]) {
+                if let Some(indices) = inner.alias_to_indices.get_mut(&alias) {
+                    indices.remove(&index);
+                    if indices.is_empty() {
+                        inner.alias_to_indices.remove(&alias);
+                    }
+                }
+            }
             record.id = inner.records[index].id;
+            if record.page_speed.is_none() {
+                record.page_speed = inner.records[index].page_speed.clone();
+            }
             inner.records[index] = record.clone();
-            update_memory_edge_statuses(&mut inner.link_edges, &record);
-            let mut returned = record;
-            apply_first_inlink_sources(std::slice::from_mut(&mut returned), &inner.link_edges);
-            return returned;
+            index
+        } else {
+            inner.next_id += 1;
+            record.id = inner.next_id;
+            let index = inner.records.len();
+            inner.url_to_index.insert(key, index);
+            inner.records.push(record.clone());
+            index
+        };
+        for alias in record_url_aliases(&record) {
+            inner
+                .alias_to_indices
+                .entry(alias)
+                .or_default()
+                .insert(index);
         }
-
-        inner.next_id += 1;
-        record.id = inner.next_id;
-        let index = inner.records.len();
-        inner.url_to_index.insert(key, index);
-        inner.records.push(record.clone());
         update_memory_edge_statuses(&mut inner.link_edges, &record);
         apply_first_inlink_sources(std::slice::from_mut(&mut record), &inner.link_edges);
         record
+    }
+
+    /// Replace only the selected occurrence's latest snapshot; aliases are not merged.
+    pub fn try_save_page_speed(
+        &self,
+        id: u64,
+        snapshot: PageSpeedSnapshot,
+    ) -> Result<(), StorageError> {
+        validate_page_speed_snapshot(&snapshot)?;
+        let mut inner = self.inner.write().map_err(|_| StorageError::LockPoisoned)?;
+        let record = inner
+            .records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(StorageError::RecordNotFound(id))?;
+        record.page_speed = Some(snapshot);
+        Ok(())
     }
 
     pub fn add_inlink(&self, target_url: &str) {
@@ -898,16 +1116,16 @@ impl MemoryStore {
             *count = count.saturating_add(1);
         }
 
-        let inlink_counts = inner.inlink_counts.clone();
-        for record in &mut inner.records {
-            let record_aliases = record_url_aliases(record);
-            if target_aliases
-                .iter()
-                .any(|alias| record_aliases.contains(alias))
-            {
-                record.inlink_count =
-                    memory_inlink_count_for_aliases(&inlink_counts, &record_aliases);
-            }
+        let indices: HashSet<usize> = target_aliases
+            .iter()
+            .filter_map(|alias| inner.alias_to_indices.get(alias))
+            .flatten()
+            .copied()
+            .collect();
+        for index in indices {
+            let record_aliases = record_url_aliases(&inner.records[index]);
+            inner.records[index].inlink_count =
+                memory_inlink_count_for_aliases(&inner.inlink_counts, &record_aliases);
         }
     }
 
@@ -980,14 +1198,43 @@ impl MemoryStore {
         records
     }
 
+    pub fn crawl_graph(&self, query: CrawlGraphQuery) -> CrawlGraph {
+        let inner = self.inner.read().expect("memory store lock poisoned");
+        let matching_edges = inner
+            .link_edges
+            .iter()
+            .filter(|edge| !query.internal_only || edge.link_type == LinkType::Internal);
+        let total_edges = matching_edges.clone().count();
+        let edges = matching_edges
+            .take(query.max_edges.clamp(1, 1_000_000))
+            .cloned()
+            .collect();
+        let nodes = graph_record_nodes(&inner.records, &query);
+        finish_crawl_graph(nodes, edges, total_edges, query.max_nodes.max(1))
+    }
+
     pub fn summary(&self) -> CrawlSummary {
         let records = self.records();
         summarize(&records)
     }
 
     pub fn query(&self, query: GridQuery) -> GridResponse {
+        if validate_grid_query(&query).is_err() {
+            return GridResponse {
+                rows: Vec::new(),
+                total: 0,
+                summary: self.summary(),
+            };
+        }
         let mut rows = self.records();
-        let summary = summarize(&rows);
+        let references = reference_diagnostics(&rows);
+        let exact = exact_duplicate_hashes(&rows);
+        let mut summary = summarize_without_canonicals(&rows);
+        add_reference_summary(&mut summary, &references);
+        summary.exact_duplicates = rows
+            .iter()
+            .filter(|row| is_exact_duplicate_record(row, &exact))
+            .count();
         let html_rows = rows.iter().filter(|row| is_success_html_record(row));
         let title_counts =
             duplicate_counts(html_rows.clone().filter_map(|row| row.title.as_deref()));
@@ -1001,6 +1248,7 @@ impl MemoryStore {
         let near_duplicate_counts =
             cluster_counts(html_rows.filter_map(|row| row.near_duplicate_cluster_id));
         let hreflang_index = HreflangAuditIndex::from_records(&rows);
+        let mut references = references.iter();
 
         rows.retain(|row| {
             matches_view(
@@ -1011,7 +1259,11 @@ impl MemoryStore {
                 &h1_counts,
                 &h2_counts,
                 &near_duplicate_counts,
+                &exact,
                 &hreflang_index,
+                references
+                    .next()
+                    .expect("one reference diagnostic per record"),
             )
         });
         if let Some(segment_matcher) = SegmentMatcher::from_query(&query) {
@@ -1025,6 +1277,17 @@ impl MemoryStore {
             && !search.is_empty()
         {
             rows.retain(|row| row_matches_search(row, &search));
+        }
+
+        if let Some(group) = &query.filters {
+            let rules: Vec<_> = group.rules.iter().map(PreparedGridRule::new).collect();
+            rows.retain(|row| {
+                rules.is_empty()
+                    || match group.match_mode {
+                        GridFilterMatch::All => rules.iter().all(|rule| rule.matches(row)),
+                        GridFilterMatch::Any => rules.iter().any(|rule| rule.matches(row)),
+                    }
+            });
         }
 
         if let Some(sort_by) = query.sort_by.as_deref() {
@@ -1094,16 +1357,73 @@ impl MemoryStore {
 
     pub fn image_assets(&self, query: ImageAssetQuery) -> ImageAssetResponse {
         let inner = self.inner.read().expect("memory store lock poisoned");
-        let mut images = annotate_memory_image_assets(&inner);
-        filter_image_assets(&mut images, &query);
-        if let Some(sort_by) = query.sort_by.as_deref() {
-            sort_image_assets(&mut images, sort_by, &query.sort_dir);
-        } else {
-            sort_image_assets(&mut images, "pageUrl", &SortDirection::Asc);
-        }
+        let sizes = image_size_by_alias(&inner.records);
+        let page_aliases = query
+            .page_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(url_aliases);
+        let search = query
+            .global_search
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase);
+        // Sorting keeps references; only the returned page clones image strings.
+        let mut images = inner
+            .image_assets
+            .iter()
+            .filter(|image| {
+                (!query.missing_alt_only || image.missing_alt)
+                    && page_aliases
+                        .as_ref()
+                        .is_none_or(|aliases| !aliases.is_disjoint(&url_aliases(&image.page_url)))
+                    && search
+                        .as_deref()
+                        .is_none_or(|search| image_asset_matches_search(image, search))
+            })
+            .map(|image| {
+                let size = url_aliases(&image.image_url)
+                    .iter()
+                    .filter_map(|alias| sizes.get(alias))
+                    .max_by_key(|(id, _)| *id)
+                    .map(|(_, size)| *size);
+                (image, size)
+            })
+            .filter(|(_, size)| {
+                !query.oversized_only || size.is_some_and(|size| size > IMAGE_ASSET_OVERSIZE_BYTES)
+            })
+            .collect::<Vec<_>>();
+        let sort_by = query.sort_by.as_deref().unwrap_or("pageUrl");
+        images.sort_by(|(left, left_size), (right, right_size)| {
+            let ordering = match sort_by {
+                "sizeBytes" => left_size.cmp(right_size),
+                "oversized" => left_size
+                    .is_some_and(|size| size > IMAGE_ASSET_OVERSIZE_BYTES)
+                    .cmp(&right_size.is_some_and(|size| size > IMAGE_ASSET_OVERSIZE_BYTES)),
+                _ => compare_image_assets(left, right, sort_by),
+            }
+            .then_with(|| left.page_url.cmp(&right.page_url))
+            .then_with(|| left.source_position.cmp(&right.source_position));
+            if query.sort_by.is_some() && query.sort_dir == SortDirection::Desc {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
         let total = images.len();
         let limit = query.limit.min(1_000_000);
-        let images = images.into_iter().skip(query.offset).take(limit).collect();
+        let images = images
+            .into_iter()
+            .skip(query.offset)
+            .take(limit)
+            .map(|(image, size_bytes)| ImageAsset {
+                size_bytes,
+                oversized: size_bytes.is_some_and(|size| size > IMAGE_ASSET_OVERSIZE_BYTES),
+                ..image.clone()
+            })
+            .collect();
         ImageAssetResponse { images, total }
     }
 
@@ -1136,6 +1456,19 @@ impl CrawlStore for MemoryStore {
         Self::add_inlink(self, target_url);
     }
 
+    fn mark_sitemap_urls(&self, urls: &[String]) {
+        if urls.is_empty() {
+            return;
+        }
+        let urls: HashSet<&str> = urls.iter().map(String::as_str).collect();
+        let mut inner = self.inner.write().expect("memory store lock poisoned");
+        for record in &mut inner.records {
+            if urls.contains(record.url.as_str()) || urls.contains(record.final_url.as_str()) {
+                record.in_sitemap = true;
+            }
+        }
+    }
+
     fn add_link_edge(&self, edge: LinkEdge) -> LinkEdge {
         Self::add_link_edge(self, edge)
     }
@@ -1150,6 +1483,10 @@ impl CrawlStore for MemoryStore {
 
     fn records(&self) -> Vec<CrawlRecord> {
         Self::records(self)
+    }
+
+    fn crawl_graph(&self, query: CrawlGraphQuery) -> CrawlGraph {
+        Self::crawl_graph(self, query)
     }
 
     fn query(&self, query: GridQuery) -> GridResponse {
@@ -1183,11 +1520,40 @@ impl CrawlStore for MemoryStore {
     fn summary(&self) -> CrawlSummary {
         Self::summary(self)
     }
+
+    fn progress_summary(&self) -> CrawlSummary {
+        let inner = self.inner.read().expect("memory store lock poisoned");
+        summarize_without_canonicals(&inner.records)
+    }
+
+    fn sitemap_validation(&self, query: SitemapValidationQuery) -> SitemapValidationResponse {
+        let inner = self.inner.read().expect("memory store lock poisoned");
+        build_sitemap_validation_report(&inner.records, query)
+    }
 }
 
 #[derive(Clone)]
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
+    summary_cache: Arc<Mutex<Option<CachedSummary>>>,
+    reference_cache: Arc<Mutex<Option<CachedReferences>>>,
+    exact_duplicate_cache: Arc<Mutex<Option<CachedExactDuplicates>>>,
+    image_alias_revision: Arc<Mutex<Option<i64>>>,
+}
+
+struct CachedSummary {
+    revision: i64,
+    summary: CrawlSummary,
+}
+
+struct CachedReferences {
+    revision: i64,
+    counts: [usize; 13],
+}
+
+struct CachedExactDuplicates {
+    revision: i64,
+    count: usize,
 }
 
 impl SqliteStore {
@@ -1195,6 +1561,10 @@ impl SqliteStore {
         let conn = Connection::open(path)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            summary_cache: Default::default(),
+            reference_cache: Default::default(),
+            exact_duplicate_cache: Default::default(),
+            image_alias_revision: Default::default(),
         };
         store.initialize()?;
         Ok(store)
@@ -1204,6 +1574,10 @@ impl SqliteStore {
         let conn = Connection::open_in_memory()?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            summary_cache: Default::default(),
+            reference_cache: Default::default(),
+            exact_duplicate_cache: Default::default(),
+            image_alias_revision: Default::default(),
         };
         store.initialize()?;
         Ok(store)
@@ -1221,18 +1595,47 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn try_mark_sitemap_urls(&self, urls: &[String]) -> Result<(), StorageError> {
+        if urls.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        {
+            let mut statement = transaction.prepare_cached(MARK_SITEMAP_URLS_SQL)?;
+            for url in urls {
+                statement.execute([url])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn try_upsert(&self, mut record: CrawlRecord) -> Result<CrawlRecord, StorageError> {
         let conn = self.connection()?;
         if record.storage_key.trim().is_empty() {
             record.storage_key = record.final_url.clone();
         }
-        let existing_id = conn
+        let existing = conn
             .query_row(
-                "SELECT id FROM crawl_records WHERE storage_key = ?1",
+                "SELECT id, page_speed FROM crawl_records WHERE storage_key = ?1",
                 [&record.storage_key],
-                |row| row.get::<_, i64>(0).map(|id| id as u64),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
             )
             .optional()?;
+        if record.page_speed.is_none() {
+            record.page_speed = existing
+                .as_ref()
+                .and_then(|(_, snapshot)| snapshot.as_deref())
+                .map(serde_json::from_str)
+                .transpose()?;
+        }
+        let existing_id = existing.map(|(id, _)| id);
         record.inlink_count =
             sqlite_inlink_count_for_record(&conn, &record)?.unwrap_or(record.inlink_count);
         let redirect_chain = serde_json::to_string(&record.redirect_chain)?;
@@ -1240,6 +1643,11 @@ impl SqliteStore {
         let structured_data_issues = serde_json::to_string(&record.structured_data_issues)?;
         let custom_extractions = serde_json::to_string(&record.custom_extractions)?;
         let custom_searches = serde_json::to_string(&record.custom_searches)?;
+        let page_speed = record
+            .page_speed
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let classification = classification_to_str(&record.classification);
         let simhash = record.simhash.map(|value| value.to_string());
         let near_duplicate_cluster_id = record.near_duplicate_cluster_id.map(|value| value as i64);
@@ -1343,8 +1751,11 @@ impl SqliteStore {
                     structured_data_warning_count = ?85,
                     structured_data_issues = ?86,
                     title_pixel_width = ?87,
-                    meta_description_pixel_width = ?88
-                 WHERE id = ?89",
+                    meta_description_pixel_width = ?88,
+                    title_count = ?89,
+                    meta_description_count = ?90,
+                    page_speed = ?91
+                 WHERE id = ?92",
                 params![
                     record.url,
                     record.final_url,
@@ -1434,6 +1845,9 @@ impl SqliteStore {
                     structured_data_issues,
                     record.title_pixel_width,
                     record.meta_description_pixel_width,
+                    record.title_count.map(|count| count as i64),
+                    record.meta_description_count.map(|count| count as i64),
+                    page_speed,
                     record.id as i64
                 ],
             )?;
@@ -1530,7 +1944,10 @@ impl SqliteStore {
                     structured_data_warning_count,
                     structured_data_issues,
                     title_pixel_width,
-                    meta_description_pixel_width
+                    meta_description_pixel_width,
+                    title_count,
+                    meta_description_count,
+                    page_speed
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
@@ -1539,7 +1956,7 @@ impl SqliteStore {
                     ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57,
                     ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65, ?66, ?67, ?68, ?69,
                     ?70, ?71, ?72, ?73, ?74, ?75, ?76, ?77, ?78, ?79, ?80,
-                    ?81, ?82, ?83, ?84, ?85, ?86, ?87, ?88
+                    ?81, ?82, ?83, ?84, ?85, ?86, ?87, ?88, ?89, ?90, ?91
                  )",
                 params![
                     record.url,
@@ -1629,7 +2046,10 @@ impl SqliteStore {
                     record.structured_data_warning_count,
                     structured_data_issues,
                     record.title_pixel_width,
-                    record.meta_description_pixel_width
+                    record.meta_description_pixel_width,
+                    record.title_count.map(|count| count as i64),
+                    record.meta_description_count.map(|count| count as i64),
+                    page_speed
                 ],
             )?;
             record.id = conn.last_insert_rowid() as u64;
@@ -1637,6 +2057,28 @@ impl SqliteStore {
             annotate_sqlite_first_inlink_sources(&conn, std::slice::from_mut(&mut record))?;
             Ok(record)
         }
+    }
+
+    /// Replace one occurrence's snapshot atomically without rewriting crawl evidence.
+    pub fn try_save_page_speed(
+        &self,
+        id: u64,
+        snapshot: PageSpeedSnapshot,
+    ) -> Result<(), StorageError> {
+        validate_page_speed_snapshot(&snapshot)?;
+        let payload = serde_json::to_string(&snapshot)?;
+        let sql_id = i64::try_from(id).map_err(|_| StorageError::RecordNotFound(id))?;
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        if transaction.execute(
+            "UPDATE crawl_records SET page_speed = ?1 WHERE id = ?2",
+            params![payload, sql_id],
+        )? == 0
+        {
+            return Err(StorageError::RecordNotFound(id));
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn try_add_inlink(&self, target_url: &str) -> Result<(), StorageError> {
@@ -1818,6 +2260,75 @@ impl SqliteStore {
         )
     }
 
+    pub fn try_crawl_graph(&self, query: CrawlGraphQuery) -> Result<CrawlGraph, StorageError> {
+        let conn = self.connection()?;
+        let transaction = conn.unchecked_transaction()?;
+        let edge_filter = if query.internal_only {
+            " WHERE link_type = 'internal'"
+        } else {
+            ""
+        };
+        let total_edges = count_query(
+            &transaction,
+            &format!("SELECT COUNT(*) FROM link_edges{edge_filter}"),
+            &[],
+        )?;
+        let edge_limit = query.max_edges.clamp(1, 1_000_000);
+        let edges = query_link_edges_with_args(
+            &transaction,
+            &format!("SELECT * FROM link_edges{edge_filter} ORDER BY id ASC LIMIT {edge_limit}"),
+            &[],
+        )?;
+        let filter = if query.internal_only {
+            " AND classification != 'external'"
+        } else {
+            ""
+        };
+        let max_nodes = query.max_nodes.max(1);
+        // Admission follows the first occurrence; metadata follows the last occurrence
+        // of that literal final URL. Rank only keys, then decode the capped winners.
+        let sql = format!(
+            "WITH first_occurrences AS (
+                SELECT final_url, COALESCE(list_position, id) AS position, id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY final_url ORDER BY COALESCE(list_position, id), id
+                    ) AS occurrence
+                FROM crawl_records WHERE 1{filter}
+            ), selected_urls AS (
+                SELECT final_url FROM first_occurrences WHERE occurrence = 1
+                ORDER BY position, id LIMIT ?1
+            )
+            SELECT r.final_url, r.classification, r.status_code, r.depth,
+                r.indexability, r.inlink_count, r.outlink_count,
+                COALESCE((status_code IS NOT NULL OR ({NO_RESPONSE_SQL})), 0) AS crawled
+            FROM selected_urls selected JOIN crawl_records r ON r.id = (
+                SELECT id FROM crawl_records WHERE final_url = selected.final_url{filter}
+                ORDER BY COALESCE(list_position, id) DESC, id DESC LIMIT 1
+            )"
+        );
+        let mut statement = transaction.prepare(&sql)?;
+        let nodes = statement
+            .query_map([max_nodes.min(i64::MAX as usize) as i64], |row| {
+                let url: String = row.get("final_url")?;
+                let classification: String = row.get("classification")?;
+                let depth: i64 = row.get("depth")?;
+                let node = GraphNode {
+                    label: graph_label(&url),
+                    url: url.clone(),
+                    crawled: row.get("crawled")?,
+                    classification: Some(classification_from_str(&classification)),
+                    status_code: row.get("status_code")?,
+                    depth: Some(depth as usize),
+                    indexability: Some(row.get("indexability")?),
+                    inlink_count: row.get("inlink_count")?,
+                    outlink_count: row.get("outlink_count")?,
+                };
+                Ok((url, node))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        Ok(finish_crawl_graph(nodes, edges, total_edges, max_nodes))
+    }
+
     pub fn try_link_edges(&self, query: LinkEdgeQuery) -> Result<LinkEdgeResponse, StorageError> {
         let conn = self.connection()?;
         let (where_clause, args) = link_edge_filter_sql(&query, &conn)?;
@@ -1827,7 +2338,7 @@ impl SqliteStore {
                     SortDirection::Asc => "ASC",
                     SortDirection::Desc => "DESC",
                 };
-                format!(" ORDER BY {column} {direction}")
+                format!(" ORDER BY {column} {direction}, id ASC")
             })
             .unwrap_or_else(|| " ORDER BY id ASC".to_string());
         let limit = query.limit.min(1_000_000);
@@ -1892,47 +2403,97 @@ impl SqliteStore {
         query: ImageAssetQuery,
     ) -> Result<ImageAssetResponse, StorageError> {
         let conn = self.connection()?;
-        let mut stmt = conn.prepare(
-            "SELECT
-                ia.id,
-                ia.page_url,
-                ia.image_url,
-                ia.alt_text,
-                ia.alt_len,
-                ia.missing_alt,
-                ia.alt_too_long,
-                ia.width,
-                ia.height,
-                ia.source_position,
-                (
-                    SELECT cr.size_bytes
-                    FROM crawl_records cr
-                    WHERE cr.final_url = ia.image_url
-                       OR cr.url = ia.image_url
-                       OR cr.storage_key = ia.image_url
-                    ORDER BY cr.id ASC
-                    LIMIT 1
-                ) AS size_bytes
-             FROM image_assets ia
-             ORDER BY ia.id ASC",
-        )?;
-        let rows = stmt.query_map([], image_asset_from_row)?;
-        let mut images = Vec::new();
-        for row in rows {
-            images.push(row?);
-        }
-
-        filter_image_assets(&mut images, &query);
-        if let Some(sort_by) = query.sort_by.as_deref() {
-            sort_image_assets(&mut images, sort_by, &query.sort_dir);
+        let (where_clause, args) = image_asset_filter_sql(&query)?;
+        let total_sql = if query.oversized_only {
+            self.ensure_image_record_aliases(&conn)?;
+            format!("{IMAGE_ASSET_SIZE_CTE} SELECT COUNT(*) FROM annotated_images{where_clause}")
         } else {
-            sort_image_assets(&mut images, "pageUrl", &SortDirection::Asc);
-        }
-        let total = images.len();
+            format!("SELECT COUNT(*) FROM image_assets{where_clause}")
+        };
+        let total = count_query(&conn, &total_sql, &args)?;
         let limit = query.limit.min(1_000_000);
-        let images = images.into_iter().skip(query.offset).take(limit).collect();
-
+        if limit == 0 || query.offset >= total {
+            return Ok(ImageAssetResponse {
+                images: Vec::new(),
+                total,
+            });
+        }
+        if !query.oversized_only {
+            self.ensure_image_record_aliases(&conn)?;
+        }
+        let sort_by = image_asset_sort_column(query.sort_by.as_deref());
+        let direction = if query.sort_by.is_some() && query.sort_dir == SortDirection::Desc {
+            "DESC"
+        } else {
+            "ASC"
+        };
+        let mut stmt = conn.prepare(&format!(
+            "{IMAGE_ASSET_SIZE_CTE} SELECT * FROM annotated_images{where_clause}
+             ORDER BY {sort_by} {direction}, page_url {direction}, source_position {direction}, id ASC
+             LIMIT {limit} OFFSET {}", query.offset
+        ))?;
+        let images = stmt
+            .query_map(
+                rusqlite::params_from_iter(args.iter()),
+                image_asset_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(ImageAssetResponse { images, total })
+    }
+
+    pub fn try_sitemap_validation(
+        &self,
+        query: SitemapValidationQuery,
+    ) -> Result<SitemapValidationResponse, StorageError> {
+        let conn = self.connection()?;
+        // Count and page retain one read snapshot if another connection commits meanwhile.
+        let transaction = conn.unchecked_transaction()?;
+        let cte = sitemap_validation_cte();
+        let (filter, args) = sitemap_validation_filter_sql(&query);
+        let total = count_query(
+            &transaction,
+            &format!("{cte} SELECT COUNT(*) FROM sitemap_report{filter}"),
+            &args,
+        )?;
+        let limit = query.limit.min(1_000_000);
+        if limit == 0 || query.offset >= total {
+            return Ok(SitemapValidationResponse {
+                rows: Vec::new(),
+                total,
+            });
+        }
+        let order = sitemap_validation_order_sql(&query);
+        let mut statement = transaction.prepare(&format!(
+            "{cte} SELECT url, final_url, status_code, status_text, indexability,
+             indexability_status, inlink_count, redirect_target, canonical,
+             issue_count, severity_rank, issues FROM sitemap_report{filter}
+             ORDER BY {order} LIMIT {limit} OFFSET {}",
+            query.offset
+        ))?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                let issues: String = row.get("issues")?;
+                Ok(SitemapValidationRow {
+                    url: row.get("url")?,
+                    final_url: row.get("final_url")?,
+                    status_code: row.get("status_code")?,
+                    status_text: row.get("status_text")?,
+                    indexability: row.get("indexability")?,
+                    indexability_status: row.get("indexability_status")?,
+                    inlink_count: row.get("inlink_count")?,
+                    redirect_target: row.get("redirect_target")?,
+                    canonical: row.get("canonical")?,
+                    issue_count: usize::from(row.get::<_, u8>("issue_count")?),
+                    severity: match row.get::<_, u8>("severity_rank")? {
+                        2 => Severity::Error,
+                        1 => Severity::Warning,
+                        _ => Severity::Info,
+                    },
+                    issues: issues.split("; ").map(str::to_string).collect(),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(SitemapValidationResponse { rows, total })
     }
 
     pub fn try_save_frontier_state(&self, state: CrawlFrontierState) -> Result<(), StorageError> {
@@ -1942,8 +2503,8 @@ impl SqliteStore {
         tx.execute("DELETE FROM crawl_frontier_seen", [])?;
         tx.execute("DELETE FROM crawl_frontier_meta", [])?;
 
-        for (position, item) in state.queued.into_iter().enumerate() {
-            tx.execute(
+        if !state.queued.is_empty() {
+            let mut insert = tx.prepare(
                 "INSERT INTO crawl_frontier_queue (
                     position,
                     url,
@@ -1953,7 +2514,9 @@ impl SqliteStore {
                     list_position,
                     list_duplicate_index
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
+            )?;
+            for (position, item) in state.queued.into_iter().enumerate() {
+                insert.execute(params![
                     position as i64,
                     item.url,
                     item.depth as i64,
@@ -1961,15 +2524,16 @@ impl SqliteStore {
                     item.storage_key,
                     item.list_position.map(i64::from),
                     i64::from(item.list_duplicate_index),
-                ],
-            )?;
+                ])?;
+            }
         }
 
-        for url in state.seen {
-            tx.execute(
-                "INSERT OR IGNORE INTO crawl_frontier_seen (url) VALUES (?1)",
-                [url],
-            )?;
+        if !state.seen.is_empty() {
+            let mut insert =
+                tx.prepare("INSERT OR IGNORE INTO crawl_frontier_seen (url) VALUES (?1)")?;
+            for url in state.seen {
+                insert.execute([url])?;
+            }
         }
 
         tx.execute(
@@ -2038,32 +2602,35 @@ impl SqliteStore {
     }
 
     pub fn try_query(&self, query: GridQuery) -> Result<GridResponse, StorageError> {
-        if needs_duplicate_filter(&query.view) || needs_regex_segment_filter(&query) {
-            let memory = MemoryStore::new();
-            for record in self.try_records()? {
-                memory.upsert(record);
-            }
-            return Ok(memory.query(query));
-        }
+        validate_grid_query(&query)?;
+        let ctes = if matches!(
+            query.view,
+            IssueView::HreflangMissingReturnLink | IssueView::HreflangNonCanonicalTarget
+        ) {
+            HREFLANG_AUDIT_CTES
+        } else {
+            ""
+        };
 
-        let summary = self.try_summary()?;
         let (where_clause, args) = query_filter_sql(&query);
-        let order_by = sort_column(query.sort_by.as_deref())
-            .map(|column| {
-                let direction = match query.sort_dir {
-                    SortDirection::Asc => "ASC",
-                    SortDirection::Desc => "DESC",
-                };
-                format!(" ORDER BY {column} {direction}")
-            })
-            .unwrap_or_else(|| " ORDER BY id ASC".to_string());
+        let order_by = if query.sort_by.is_some() {
+            let column = sort_column(query.sort_by.as_deref()).unwrap_or_else(|| "id".into());
+            let direction = match query.sort_dir {
+                SortDirection::Asc => "ASC",
+                SortDirection::Desc => "DESC",
+            };
+            format!(" ORDER BY {column} {direction}, id ASC")
+        } else {
+            " ORDER BY COALESCE(list_position, id) ASC, id ASC".to_string()
+        };
         let limit = query.limit.min(1_000_000);
-        let total_sql = format!("SELECT COUNT(*) FROM crawl_records{where_clause}");
+        let total_sql = format!("{ctes}SELECT COUNT(*) FROM crawl_records{where_clause}");
         let select_sql = format!(
-            "SELECT * FROM crawl_records{where_clause}{order_by} LIMIT {limit} OFFSET {}",
+            "{ctes}SELECT * FROM crawl_records{where_clause}{order_by} LIMIT {limit} OFFSET {}",
             query.offset
         );
         let conn = self.connection()?;
+        let summary = self.summary_with_connection(&conn)?;
         let total = count_query(&conn, &total_sql, &args)?;
         let rows = query_records_with_args(&conn, &select_sql, &args)?;
 
@@ -2076,65 +2643,250 @@ impl SqliteStore {
 
     pub fn try_summary(&self) -> Result<CrawlSummary, StorageError> {
         let conn = self.connection()?;
-        let count_view = |view| {
-            let (where_clause, args) = query_filter_sql(&GridQuery {
-                view,
-                ..GridQuery::default()
-            });
-            count_query(
-                &conn,
-                &format!("SELECT COUNT(*) FROM crawl_records{where_clause}"),
-                &args,
-            )
+        self.summary_with_connection(&conn)
+    }
+
+    pub fn try_progress_summary(&self) -> Result<CrawlSummary, StorageError> {
+        let conn = self.connection()?;
+        self.progress_summary_with_connection(&conn)
+    }
+
+    fn summary_with_connection(&self, conn: &Connection) -> Result<CrawlSummary, StorageError> {
+        let mut summary = self.progress_summary_with_connection(conn)?;
+        set_reference_summary(&mut summary, self.ensure_reference_diagnostics(conn)?);
+        summary.exact_duplicates = self.ensure_exact_duplicates(conn)?;
+        Ok(summary)
+    }
+
+    fn progress_summary_with_connection(
+        &self,
+        conn: &Connection,
+    ) -> Result<CrawlSummary, StorageError> {
+        let revision = crawl_audit_revision(conn)?;
+        // ponytail: reuse aggregates between writes; incremental counters if active large crawls dominate.
+        let mut cache = self
+            .summary_cache
+            .lock()
+            .map_err(|_| StorageError::LockPoisoned)?;
+        if let Some(cached) = &*cache
+            && cached.revision == revision
+        {
+            return Ok(cached.summary.clone());
+        }
+        let mut summary = sqlite_progress_counts(conn)?;
+        summary.title_duplicate = sqlite_duplicate_count(conn, "title")?;
+        summary.meta_duplicate = sqlite_duplicate_count(conn, "meta_description")?;
+        summary.h1_duplicate = sqlite_duplicate_count(conn, "h1")?;
+        summary.h2_duplicate = sqlite_duplicate_count(conn, "h2")?;
+        *cache = Some(CachedSummary {
+            revision,
+            summary: summary.clone(),
+        });
+        Ok(summary)
+    }
+
+    fn ensure_reference_diagnostics(&self, conn: &Connection) -> Result<[usize; 13], StorageError> {
+        let revision = crawl_audit_revision(conn)?;
+        let mut cache = self
+            .reference_cache
+            .lock()
+            .map_err(|_| StorageError::LockPoisoned)?;
+        if let Some(cached) = &*cache
+            && cached.revision == revision
+        {
+            return Ok(cached.counts);
+        }
+        let transaction = conn.unchecked_transaction()?;
+        let records = {
+            let sql = format!("SELECT id, url, final_url, canonical,
+                COALESCE(({SUCCESS_HTML_SQL}), 0), classification = 'internal',
+                (status_code IS NOT NULL OR error IS NOT NULL OR status_text = 'Blocked by robots.txt'),
+                COALESCE(({}), 0),
+                (status_code IS NULL AND (status_text = 'Blocked by robots.txt' OR error = 'Blocked by robots.txt'))
+                    OR (indexability = 'Non-indexable' AND NOT COALESCE(({}), 0)
+                        AND NOT COALESCE(status_code BETWEEN 300 AND 399, 0)),
+                COALESCE(status_code BETWEEN 300 AND 399, 0), redirect_chain,
+                rel_next, rel_prev,
+                COALESCE((status_code IS NOT NULL OR ({NO_RESPONSE_SQL})), 0),
+                COALESCE((status_code BETWEEN 400 AND 599 OR ({NO_RESPONSE_SQL})
+                    OR (status_code BETWEEN 300 AND 399 AND error IS NOT NULL)), 0),
+                COALESCE(error != 'Redirect limit exceeded', 1), amphtml
+                FROM crawl_records ORDER BY id", broken_record_sql(), broken_record_sql());
+            let mut statement = transaction.prepare(&sql)?;
+            let rows = statement.query_map([], reference_audit_record_from_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        Ok(CrawlSummary {
-            total: count_view(IssueView::All)?,
-            internal: count_view(IssueView::Internal)?,
-            external: count_view(IssueView::External)?,
-            success: count_view(IssueView::Status2xx)?,
-            redirects: count_view(IssueView::Status3xx)?,
-            client_errors: count_view(IssueView::Status4xx)?,
-            server_errors: count_view(IssueView::Status5xx)?,
-            no_response: count_view(IssueView::NoResponse)?,
-            broken: count_view(IssueView::BrokenLinks)?,
-            near_duplicates: count_view(IssueView::NearDuplicate)?,
-            indexable: summary_count(
-                &conn,
-                "SELECT COUNT(*) FROM crawl_records WHERE indexability = 'Indexable'",
-            )?,
-            non_indexable: summary_count(
-                &conn,
-                "SELECT COUNT(*) FROM crawl_records WHERE indexability = 'Non-indexable'",
-            )?,
-            title_missing: count_view(IssueView::TitleMissing)?,
-            title_duplicate: sqlite_duplicate_count(&conn, "title")?,
-            meta_missing: count_view(IssueView::MetaMissing)?,
-            meta_duplicate: sqlite_duplicate_count(&conn, "meta_description")?,
-            h1_missing: count_view(IssueView::H1Missing)?,
-            h1_duplicate: sqlite_duplicate_count(&conn, "h1")?,
-            h2_missing: count_view(IssueView::H2Missing)?,
-            h2_duplicate: sqlite_duplicate_count(&conn, "h2")?,
-            canonical_missing: count_view(IssueView::CanonicalMissing)?,
-            canonical_multiple: count_view(IssueView::CanonicalMultiple)?,
-            noindex: count_view(IssueView::DirectivesNoindex)?,
-            images_missing_alt: count_view(IssueView::ImagesMissingAlt)?,
-            images_alt_too_long: count_view(IssueView::ImagesAltTooLong)?,
-            mixed_content: count_view(IssueView::SecurityMixedContent)?,
-            insecure_forms: count_view(IssueView::SecurityInsecureForms)?,
-            hreflang_invalid: count_view(IssueView::HreflangInvalid)?,
-            structured_data_invalid: count_view(IssueView::StructuredDataInvalid)?,
-            structured_data_warnings: count_view(IssueView::StructuredDataWarning)?,
-            deprecated_html_tags: count_view(IssueView::HtmlDeprecatedTags)?,
-            duplicate_ids: count_view(IssueView::HtmlDuplicateIds)?,
-            rendered_dom_changed: count_view(IssueView::RenderedDomChanged)?,
-            missing_viewport: count_view(IssueView::MobileMissingViewport)?,
-            missing_hsts: count_view(IssueView::SecurityMissingHsts)?,
-            sitemap_orphans: count_view(IssueView::SitemapOrphan)?,
-        })
+        let diagnostics = build_reference_diagnostics(&records);
+        let counts = reference_counts(&diagnostics);
+        transaction.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS ff_reference_diagnostics (
+            record_id INTEGER PRIMARY KEY, flags INTEGER NOT NULL);
+            DELETE FROM ff_reference_diagnostics;",
+        )?;
+        {
+            let mut statement = transaction.prepare_cached(
+                "INSERT INTO ff_reference_diagnostics (record_id, flags) VALUES (?1, ?2)",
+            )?;
+            for (record, diagnostic) in records.iter().zip(diagnostics) {
+                if diagnostic.flags() != 0 {
+                    statement.execute(params![record.id as i64, diagnostic.flags()])?;
+                }
+            }
+        }
+        transaction.commit()?;
+        // Keep the pre-read evidence revision: a concurrent external record write must still
+        // invalidate this snapshot. Derived TEMP writes never change the evidence revision.
+        *cache = Some(CachedReferences { revision, counts });
+        Ok(counts)
+    }
+
+    fn ensure_exact_duplicates(&self, conn: &Connection) -> Result<usize, StorageError> {
+        let revision = crawl_audit_revision(conn)?;
+        let mut cache = self
+            .exact_duplicate_cache
+            .lock()
+            .map_err(|_| StorageError::LockPoisoned)?;
+        if let Some(cached) = &*cache
+            && cached.revision == revision
+        {
+            return Ok(cached.count);
+        }
+        let transaction = conn.unchecked_transaction()?;
+        transaction.execute_batch(&format!(
+            "CREATE TEMP TABLE IF NOT EXISTS ff_exact_duplicate_records (record_id INTEGER PRIMARY KEY);
+            DELETE FROM ff_exact_duplicate_records;
+            INSERT INTO ff_exact_duplicate_records (record_id)
+            SELECT id FROM crawl_records
+            WHERE {SUCCESS_HTML_SQL} AND ff_final_url_key(final_url) IS NOT NULL
+            AND response_hash IN (
+                SELECT response_hash FROM crawl_records
+                WHERE {SUCCESS_HTML_SQL} AND response_hash IS NOT NULL AND ff_text_key(response_hash) != ''
+                GROUP BY response_hash
+                HAVING COUNT(DISTINCT ff_final_url_key(final_url)) > 1
+            );"
+        ))?;
+        let count = summary_count(
+            &transaction,
+            "SELECT COUNT(*) FROM ff_exact_duplicate_records",
+        )?;
+        transaction.commit()?;
+        *cache = Some(CachedExactDuplicates { revision, count });
+        Ok(count)
+    }
+
+    fn ensure_image_record_aliases(&self, conn: &Connection) -> Result<(), StorageError> {
+        let revision = crawl_audit_revision(conn)?;
+        let mut cached_revision = self
+            .image_alias_revision
+            .lock()
+            .map_err(|_| StorageError::LockPoisoned)?;
+        if *cached_revision == Some(revision) {
+            return Ok(());
+        }
+        let transaction = conn.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS ff_image_record_aliases (
+                alias TEXT PRIMARY KEY, record_id INTEGER NOT NULL, size_bytes INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            DELETE FROM ff_image_record_aliases;
+            INSERT INTO ff_image_record_aliases (alias, record_id, size_bytes)
+            SELECT a.value, cr.id, cr.size_bytes
+            FROM crawl_records cr, json_each(ff_url_aliases(cr.storage_key, cr.url, cr.final_url)) a
+            WHERE lower(cr.content_type) LIKE 'image/%'
+            ON CONFLICT(alias) DO UPDATE SET record_id = excluded.record_id, size_bytes = excluded.size_bytes
+            WHERE excluded.record_id > ff_image_record_aliases.record_id;",
+        )?;
+        transaction.commit()?;
+        *cached_revision = Some(revision);
+        Ok(())
     }
 
     fn initialize(&self) -> Result<(), StorageError> {
         let conn = self.connection()?;
+        let flags = rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC;
+        conn.create_scalar_function("ff_final_url_key", 1, flags, |context| {
+            Ok(normalized_final_url(
+                context.get_raw(0).as_str().unwrap_or_default(),
+            ))
+        })?;
+        conn.create_scalar_function("ff_text_key", 1, flags, |context| {
+            Ok(normalize_text_key(
+                context
+                    .get::<Option<String>>(0)?
+                    .as_deref()
+                    .unwrap_or_default(),
+            ))
+        })?;
+        conn.create_scalar_function("ff_trim", 1, flags, |context| {
+            Ok(context
+                .get::<Option<String>>(0)?
+                .unwrap_or_default()
+                .trim()
+                .to_string())
+        })?;
+        conn.create_scalar_function("ff_regexp", 2, flags, |context| {
+            let regex = match context.get_aux::<Option<Regex>>(0)? {
+                Some(regex) => regex,
+                None => context.set_aux(0, Regex::new(&context.get::<String>(0)?).ok())?,
+            };
+            Ok(regex.as_ref().as_ref().is_some_and(|regex| {
+                regex.is_match(context.get_raw(1).as_str().unwrap_or_default())
+            }))
+        })?;
+        conn.create_scalar_function("ff_contains", 2, flags, |context| {
+            use rusqlite::types::ValueRef;
+            let text = match context.get_raw(0) {
+                ValueRef::Text(_) => context.get_raw(0).as_str()?.to_lowercase(),
+                ValueRef::Integer(value) => value.to_string(),
+                ValueRef::Real(value) => value.to_string(),
+                _ => return Ok(false),
+            };
+            Ok(text.contains(context.get_raw(1).as_str()?))
+        })?;
+        conn.create_scalar_function("ff_custom_contains", 4, flags, |context| {
+            Ok(custom_data_matches_search(
+                &serde_json::from_str::<Vec<CustomExtractionValue>>(context.get_raw(0).as_str()?)
+                    .unwrap_or_default(),
+                &serde_json::from_str::<Vec<CustomSearchValue>>(context.get_raw(1).as_str()?)
+                    .unwrap_or_default(),
+                &serde_json::from_str::<Vec<StructuredDataIssue>>(context.get_raw(2).as_str()?)
+                    .unwrap_or_default(),
+                context.get_raw(3).as_str()?,
+            ))
+        })?;
+        conn.create_scalar_function("ff_extraction_sort", 2, flags, |context| {
+            Ok(custom_extraction_sort_value(
+                &serde_json::from_str::<Vec<CustomExtractionValue>>(context.get_raw(0).as_str()?)
+                    .unwrap_or_default(),
+                context.get_raw(1).as_str()?,
+            ))
+        })?;
+        conn.create_scalar_function("ff_url_aliases", 3, flags, |context| {
+            let aliases = sorted_aliases(url_aliases_many([
+                context.get_raw(0).as_str()?,
+                context.get_raw(1).as_str()?,
+                context.get_raw(2).as_str()?,
+            ]));
+            serde_json::to_string(&aliases)
+                .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+        })?;
+        conn.create_scalar_function("ff_hreflang_aliases", 1, flags, |context| {
+            let links = serde_json::from_str::<Vec<HreflangLink>>(context.get_raw(0).as_str()?)
+                .unwrap_or_default();
+            let aliases = links
+                .iter()
+                .enumerate()
+                .filter(|(_, link)| link.valid)
+                .flat_map(|(index, link)| {
+                    url_aliases(&link.url)
+                        .into_iter()
+                        .map(move |alias| (index, alias))
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string(&aliases)
+                .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+        })?;
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -2169,9 +2921,11 @@ impl SqliteStore {
                 redirect_type TEXT,
                 redirect_chain TEXT NOT NULL,
                 title TEXT,
+                title_count INTEGER,
                 title_len INTEGER NOT NULL,
                 title_pixel_width INTEGER NOT NULL DEFAULT 0,
                 meta_description TEXT,
+                meta_description_count INTEGER,
                 meta_description_len INTEGER NOT NULL,
                 meta_description_pixel_width INTEGER NOT NULL DEFAULT 0,
                 meta_robots TEXT,
@@ -2228,6 +2982,7 @@ impl SqliteStore {
                 search_console_impressions REAL,
                 search_console_ctr REAL,
                 search_console_average_position REAL,
+                page_speed TEXT,
                 error TEXT,
                 in_sitemap INTEGER NOT NULL DEFAULT 0
             );
@@ -2333,6 +3088,8 @@ impl SqliteStore {
         add_column_if_missing(&conn, "meta_robots", "TEXT")?;
         add_column_if_missing(&conn, "x_robots_tag", "TEXT")?;
         add_column_if_missing(&conn, "title_pixel_width", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column_if_missing(&conn, "title_count", "INTEGER")?;
+        add_column_if_missing(&conn, "meta_description_count", "INTEGER")?;
         add_column_if_missing(
             &conn,
             "meta_description_pixel_width",
@@ -2429,6 +3186,7 @@ impl SqliteStore {
         add_column_if_missing(&conn, "search_console_impressions", "REAL")?;
         add_column_if_missing(&conn, "search_console_ctr", "REAL")?;
         add_column_if_missing(&conn, "search_console_average_position", "REAL")?;
+        add_column_if_missing(&conn, "page_speed", "TEXT")?;
         add_column_if_missing(&conn, "in_sitemap", "INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&conn, "storage_key", "TEXT")?;
         conn.execute(
@@ -2441,6 +3199,28 @@ impl SqliteStore {
         add_column_if_missing(&conn, "list_duplicate_index", "INTEGER NOT NULL DEFAULT 0")?;
         migrate_final_url_unique_constraint(&conn)?;
         create_crawl_record_indexes(&conn)?;
+        // Persistent triggers also observe writes from other SQLite connections and roll back
+        // with the changed records. Frontier/seen/edge/TEMP writes do not invalidate audits.
+        // Install after migrations which can replace crawl_records and remove its triggers.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS crawl_audit_revision (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                revision INTEGER NOT NULL
+            );
+            INSERT OR IGNORE INTO crawl_audit_revision (id, revision) VALUES (1, 0);
+            CREATE TRIGGER IF NOT EXISTS crawl_records_audit_insert AFTER INSERT ON crawl_records
+            BEGIN
+                UPDATE crawl_audit_revision SET revision = revision + 1 WHERE id = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS crawl_records_audit_update AFTER UPDATE ON crawl_records
+            BEGIN
+                UPDATE crawl_audit_revision SET revision = revision + 1 WHERE id = 1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS crawl_records_audit_delete AFTER DELETE ON crawl_records
+            BEGIN
+                UPDATE crawl_audit_revision SET revision = revision + 1 WHERE id = 1;
+            END;",
+        )?;
         add_table_column_if_missing(
             &conn,
             "link_edges",
@@ -2497,6 +3277,11 @@ impl CrawlStore for SqliteStore {
             .expect("sqlite inlink update failed");
     }
 
+    fn mark_sitemap_urls(&self, urls: &[String]) {
+        self.try_mark_sitemap_urls(urls)
+            .expect("sqlite sitemap provenance update failed");
+    }
+
     fn add_link_edge(&self, edge: LinkEdge) -> LinkEdge {
         self.try_add_link_edge(edge)
             .expect("sqlite link edge insert failed")
@@ -2514,6 +3299,11 @@ impl CrawlStore for SqliteStore {
 
     fn records(&self) -> Vec<CrawlRecord> {
         self.try_records().expect("sqlite record query failed")
+    }
+
+    fn crawl_graph(&self, query: CrawlGraphQuery) -> CrawlGraph {
+        self.try_crawl_graph(query)
+            .expect("sqlite graph query failed")
     }
 
     fn query(&self, query: GridQuery) -> GridResponse {
@@ -2553,6 +3343,16 @@ impl CrawlStore for SqliteStore {
     fn summary(&self) -> CrawlSummary {
         self.try_summary().expect("sqlite summary query failed")
     }
+
+    fn progress_summary(&self) -> CrawlSummary {
+        self.try_progress_summary()
+            .expect("sqlite progress summary query failed")
+    }
+
+    fn sitemap_validation(&self, query: SitemapValidationQuery) -> SitemapValidationResponse {
+        self.try_sitemap_validation(query)
+            .expect("sqlite sitemap validation query failed")
+    }
 }
 
 #[derive(Clone)]
@@ -2562,12 +3362,30 @@ pub enum ActiveStore {
 }
 
 impl ActiveStore {
+    pub fn try_save_page_speed(
+        &self,
+        id: u64,
+        snapshot: PageSpeedSnapshot,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(store) => store.try_save_page_speed(id, snapshot),
+            Self::Sqlite(store) => store.try_save_page_speed(id, snapshot),
+        }
+    }
+
     pub fn memory() -> Self {
         Self::Memory(MemoryStore::new())
     }
 
     pub fn sqlite(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Ok(Self::Sqlite(SqliteStore::open(path)?))
+    }
+
+    pub fn try_crawl_graph(&self, query: CrawlGraphQuery) -> Result<CrawlGraph, StorageError> {
+        match self {
+            Self::Memory(store) => Ok(store.crawl_graph(query)),
+            Self::Sqlite(store) => store.try_crawl_graph(query),
+        }
     }
 }
 
@@ -2590,6 +3408,13 @@ impl CrawlStore for ActiveStore {
         match self {
             ActiveStore::Memory(store) => store.add_inlink(target_url),
             ActiveStore::Sqlite(store) => store.add_inlink(target_url),
+        }
+    }
+
+    fn mark_sitemap_urls(&self, urls: &[String]) {
+        match self {
+            ActiveStore::Memory(store) => store.mark_sitemap_urls(urls),
+            ActiveStore::Sqlite(store) => store.mark_sitemap_urls(urls),
         }
     }
 
@@ -2619,6 +3444,10 @@ impl CrawlStore for ActiveStore {
             ActiveStore::Memory(store) => store.records(),
             ActiveStore::Sqlite(store) => store.records(),
         }
+    }
+
+    fn crawl_graph(&self, query: CrawlGraphQuery) -> CrawlGraph {
+        self.try_crawl_graph(query).expect("graph query failed")
     }
 
     fn query(&self, query: GridQuery) -> GridResponse {
@@ -2676,9 +3505,34 @@ impl CrawlStore for ActiveStore {
             ActiveStore::Sqlite(store) => store.summary(),
         }
     }
+
+    fn progress_summary(&self) -> CrawlSummary {
+        match self {
+            ActiveStore::Memory(store) => store.progress_summary(),
+            ActiveStore::Sqlite(store) => store.progress_summary(),
+        }
+    }
+
+    fn sitemap_validation(&self, query: SitemapValidationQuery) -> SitemapValidationResponse {
+        match self {
+            ActiveStore::Memory(store) => store.sitemap_validation(query),
+            ActiveStore::Sqlite(store) => store.sitemap_validation(query),
+        }
+    }
 }
 
 pub fn summarize(records: &[CrawlRecord]) -> CrawlSummary {
+    let mut summary = summarize_without_canonicals(records);
+    add_reference_summary(&mut summary, &reference_diagnostics(records));
+    let hashes = exact_duplicate_hashes(records);
+    summary.exact_duplicates = records
+        .iter()
+        .filter(|row| is_exact_duplicate_record(row, &hashes))
+        .count();
+    summary
+}
+
+fn summarize_without_canonicals(records: &[CrawlRecord]) -> CrawlSummary {
     let mut summary = CrawlSummary {
         total: records.len(),
         ..CrawlSummary::default()
@@ -2753,6 +3607,10 @@ pub fn summarize(records: &[CrawlRecord]) -> CrawlSummary {
         if !is_success_html_record(record) {
             continue;
         }
+
+        summary.title_multiple += usize::from(record.title_count.is_some_and(|count| count > 1));
+        summary.meta_multiple +=
+            usize::from(record.meta_description_count.is_some_and(|count| count > 1));
 
         if record.title.as_deref().unwrap_or("").trim().is_empty() {
             summary.title_missing += 1;
@@ -3114,6 +3972,147 @@ fn compare_sitemap_validation_rows(
     }
 }
 
+// Conditions and issue order mirror sitemap_validation_issues; parity fixtures cover both.
+// These are record-local findings: repeated List/redirect aliases retain separate rows.
+const SITEMAP_ISSUE_SQL: &[(&str, &str, u8)] = &[
+    (
+        "status_code IS NULL AND (status_text = 'Blocked by robots.txt' OR error = 'Blocked by robots.txt')",
+        "Robots-blocked URL in sitemap",
+        1,
+    ),
+    (NO_RESPONSE_SQL, "No response URL in sitemap", 2),
+    (
+        "status_code BETWEEN 300 AND 399",
+        "Redirecting URL in sitemap",
+        1,
+    ),
+    ("status_code BETWEEN 400 AND 499", "4xx URL in sitemap", 2),
+    ("status_code BETWEEN 500 AND 599", "5xx URL in sitemap", 2),
+    (
+        "indexability != 'Indexable' OR indexability_status != 'Indexable'",
+        "Non-indexable URL in sitemap",
+        1,
+    ),
+    (
+        "ff_trim(canonical) != '' AND ff_trim(canonical) != final_url",
+        "Canonical points to a different URL",
+        1,
+    ),
+    (
+        "ff_trim(redirect_target) != ''",
+        "Sitemap URL has a redirect target",
+        1,
+    ),
+    ("classification = 'external'", "External URL in sitemap", 1),
+    (
+        "inlink_count = 0 AND classification != 'external'",
+        "Orphan URL in sitemap",
+        1,
+    ),
+    (
+        "NOT (status_code IS NULL AND (status_text = 'Blocked by robots.txt' OR error = 'Blocked by robots.txt')) AND ff_trim(error) != ''",
+        "Fetch error for sitemap URL",
+        2,
+    ),
+];
+
+fn sitemap_validation_cte() -> String {
+    let mut flags = Vec::new();
+    let mut counts = Vec::new();
+    let mut severities = Vec::new();
+    let mut messages = Vec::new();
+    for (index, (condition, message, rank)) in SITEMAP_ISSUE_SQL.iter().enumerate() {
+        let flag = format!("issue_{index}");
+        flags.push(format!("CASE WHEN {condition} THEN 1 ELSE 0 END AS {flag}"));
+        counts.push(flag.clone());
+        severities.push(format!("{flag} * {rank}"));
+        messages.push(format!(
+            "CASE WHEN {flag} THEN '; {}' ELSE '' END",
+            message.replace('\'', "''")
+        ));
+    }
+    format!(
+        "WITH sitemap_flags AS (
+            SELECT id, list_position, url, final_url, status_code, status_text,
+                indexability, indexability_status, inlink_count, redirect_target, canonical, {}
+            FROM crawl_records WHERE in_sitemap != 0
+        ), sitemap_report AS (
+            SELECT *, MAX(1, {}) AS issue_count, MAX({}) AS severity_rank,
+                COALESCE(NULLIF(SUBSTR({}, 3), ''), 'OK') AS issues
+            FROM sitemap_flags
+        )",
+        flags.join(", "),
+        counts.join(" + "),
+        severities.join(", "),
+        messages.join(" || ")
+    )
+}
+
+fn sitemap_validation_filter_sql(query: &SitemapValidationQuery) -> (String, Vec<String>) {
+    let Some(search) = query
+        .global_search
+        .as_deref()
+        .map(str::trim)
+        .filter(|search| !search.is_empty())
+        .map(str::to_lowercase)
+    else {
+        return (String::new(), Vec::new());
+    };
+    let mut conditions = [
+        "url",
+        "final_url",
+        "status_text",
+        "indexability",
+        "indexability_status",
+        "redirect_target",
+        "canonical",
+        "status_code",
+    ]
+    .map(|column| format!("ff_contains({column}, ?1)"))
+    .to_vec();
+    // Match individual issue labels, so a search cannot bridge their display separator.
+    for (index, (_, message, _)) in SITEMAP_ISSUE_SQL.iter().enumerate() {
+        if message.to_lowercase().contains(&search) {
+            conditions.push(format!("issue_{index} = 1"));
+        }
+    }
+    if "ok".contains(&search) {
+        conditions.push("severity_rank = 0".into());
+    }
+    (
+        format!(" WHERE ({})", conditions.join(" OR ")),
+        vec![search],
+    )
+}
+
+fn sitemap_validation_order_sql(query: &SitemapValidationQuery) -> String {
+    let descending = query.sort_by.is_some() && query.sort_dir == SortDirection::Desc;
+    let direction = if descending { "DESC" } else { "ASC" };
+    let reverse = if descending { "ASC" } else { "DESC" };
+    let column = match query.sort_by.as_deref() {
+        Some("url") => Some("url"),
+        Some("finalUrl") => Some("final_url"),
+        Some("statusCode") => Some("status_code"),
+        Some("statusText") => Some("status_text"),
+        Some("indexability") => Some("indexability"),
+        Some("indexabilityStatus") => Some("indexability_status"),
+        Some("inlinkCount") => Some("inlink_count"),
+        Some("redirectTarget") => Some("redirect_target"),
+        Some("canonical") => Some("canonical"),
+        Some("issueCount") => Some("issue_count"),
+        Some("severity") => Some("severity_rank"),
+        Some("issues") => Some("issues"),
+        _ => None,
+    };
+    let primary = column
+        .map(|column| format!("{column} {direction}, "))
+        .unwrap_or_default();
+    // The old report stably sorted try_records(), whose input follows List position then ID.
+    format!(
+        "{primary}severity_rank {reverse}, issue_count {reverse}, final_url {direction}, COALESCE(list_position, id) ASC, id ASC"
+    )
+}
+
 fn classification_to_str(classification: &UrlClassification) -> &'static str {
     match classification {
         UrlClassification::Internal => "internal",
@@ -3175,6 +4174,9 @@ fn search_console_metrics_by_alias(
 }
 
 fn add_url_aliases(aliases: &mut HashSet<String>, value: &str) {
+    #[cfg(test)]
+    URL_ALIAS_EXPANSIONS.with(|count| count.set(count.get() + 1));
+
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return;
@@ -3209,6 +4211,11 @@ fn add_url_aliases(aliases: &mut HashSet<String>, value: &str) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static URL_ALIAS_EXPANSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn sorted_aliases(aliases: HashSet<String>) -> Vec<String> {
     let mut aliases = aliases.into_iter().collect::<Vec<_>>();
     aliases.sort();
@@ -3235,16 +4242,13 @@ fn optional_u16_value(value: Option<u16>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn record_matches_url(record: &CrawlRecord, url: &str) -> bool {
-    let aliases = record_url_aliases(record);
-    url_aliases(url).iter().any(|alias| aliases.contains(alias))
-}
-
 fn memory_record_index_by_url(inner: &MemoryStoreInner, url: &str) -> Option<usize> {
-    inner
-        .records
+    // A redirect or List occurrence can share aliases with later records.
+    // Keep the earliest stored record, including when its aliases change on update.
+    url_aliases(url)
         .iter()
-        .position(|record| record_matches_url(record, url))
+        .filter_map(|alias| inner.alias_to_indices.get(alias)?.first().copied())
+        .min()
 }
 
 fn update_memory_edge_statuses(edges: &mut [LinkEdge], record: &CrawlRecord) {
@@ -3375,32 +4379,51 @@ fn build_crawl_graph(
     total_edges: usize,
     query: CrawlGraphQuery,
 ) -> CrawlGraph {
-    let max_nodes = query.max_nodes.max(1);
-    let mut nodes = HashMap::new();
+    let nodes = graph_record_nodes(&records, &query);
+    finish_crawl_graph(nodes, edges, total_edges, query.max_nodes.max(1))
+}
 
+fn graph_record_nodes<'a>(
+    records: impl IntoIterator<Item = &'a CrawlRecord>,
+    query: &CrawlGraphQuery,
+) -> HashMap<String, GraphNode> {
+    let max_nodes = query.max_nodes.max(1);
+    let mut selected = HashMap::new();
     for record in records.into_iter().filter(|record| {
         !query.internal_only || record.classification == UrlClassification::Internal
     }) {
-        if nodes.len() >= max_nodes && !nodes.contains_key(&record.final_url) {
+        if selected.len() >= max_nodes && !selected.contains_key(record.final_url.as_str()) {
             continue;
         }
-        let crawled = record.status_code.is_some() || is_no_response_record(&record);
-        nodes.insert(
-            record.final_url.clone(),
-            GraphNode {
-                label: graph_label(&record.final_url),
-                url: record.final_url,
-                crawled,
-                classification: Some(record.classification),
-                status_code: record.status_code,
-                depth: Some(record.depth),
-                indexability: Some(record.indexability),
-                inlink_count: record.inlink_count,
-                outlink_count: record.outlink_count,
-            },
-        );
+        selected.insert(record.final_url.as_str(), record);
     }
+    selected
+        .into_values()
+        .map(|record| {
+            (
+                record.final_url.clone(),
+                GraphNode {
+                    label: graph_label(&record.final_url),
+                    url: record.final_url.clone(),
+                    crawled: record.status_code.is_some() || is_no_response_record(record),
+                    classification: Some(record.classification.clone()),
+                    status_code: record.status_code,
+                    depth: Some(record.depth),
+                    indexability: Some(record.indexability.clone()),
+                    inlink_count: record.inlink_count,
+                    outlink_count: record.outlink_count,
+                },
+            )
+        })
+        .collect()
+}
 
+fn finish_crawl_graph(
+    mut nodes: HashMap<String, GraphNode>,
+    edges: Vec<LinkEdge>,
+    total_edges: usize,
+    max_nodes: usize,
+) -> CrawlGraph {
     for edge in &edges {
         if nodes.len() >= max_nodes {
             break;
@@ -3615,6 +4638,19 @@ fn graph_label(url: &str) -> String {
 }
 
 fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CrawlRecord> {
+    let page_speed_column = row.as_ref().column_index("page_speed")?;
+    let page_speed = row
+        .get::<_, Option<String>>(page_speed_column)?
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    page_speed_column,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?;
     let redirect_chain_json: String = row.get("redirect_chain")?;
     let redirect_chain = serde_json::from_str(&redirect_chain_json).unwrap_or_default();
     let hreflang_links_json: String = row.get("hreflang_links")?;
@@ -3683,9 +4719,15 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CrawlRecord> {
         redirect_type: row.get("redirect_type")?,
         redirect_chain,
         title: row.get("title")?,
+        title_count: row
+            .get::<_, Option<i64>>("title_count")?
+            .map(|count| count.max(0) as usize),
         title_len: title_len as usize,
         title_pixel_width: title_pixel_width.max(0) as u32,
         meta_description: row.get("meta_description")?,
+        meta_description_count: row
+            .get::<_, Option<i64>>("meta_description_count")?
+            .map(|count| count.max(0) as usize),
         meta_description_len: meta_description_len as usize,
         meta_description_pixel_width: meta_description_pixel_width.max(0) as u32,
         meta_robots: row.get("meta_robots")?,
@@ -3745,6 +4787,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CrawlRecord> {
         search_console_impressions: row.get("search_console_impressions")?,
         search_console_ctr: row.get("search_console_ctr")?,
         search_console_average_position: row.get("search_console_average_position")?,
+        page_speed,
         error: row.get("error")?,
     })
 }
@@ -3984,7 +5027,7 @@ fn annotate_sqlite_first_inlink_sources(
             "SELECT source_url, target_url, anchor_text, source_position, discovery_order
              FROM link_edges
              WHERE target_url IN ({placeholders})
-             ORDER BY target_url ASC, discovery_order ASC, source_position ASC, id ASC"
+             ORDER BY target_url ASC, discovery_order ASC, source_position ASC, source_url ASC, id ASC"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
@@ -4105,9 +5148,11 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             redirect_type TEXT,
             redirect_chain TEXT NOT NULL,
             title TEXT,
+            title_count INTEGER,
             title_len INTEGER NOT NULL,
             title_pixel_width INTEGER NOT NULL DEFAULT 0,
             meta_description TEXT,
+            meta_description_count INTEGER,
             meta_description_len INTEGER NOT NULL,
             meta_description_pixel_width INTEGER NOT NULL DEFAULT 0,
             meta_robots TEXT,
@@ -4164,6 +5209,7 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             search_console_impressions REAL,
             search_console_ctr REAL,
             search_console_average_position REAL,
+            page_speed TEXT,
             error TEXT,
             in_sitemap INTEGER NOT NULL DEFAULT 0
         );
@@ -4197,8 +5243,10 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             redirect_type,
             redirect_chain,
             title,
+            title_count,
             title_len,
             meta_description,
+            meta_description_count,
             meta_description_len,
             meta_robots,
             x_robots_tag,
@@ -4243,6 +5291,7 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             internal_outlink_count,
             external_outlink_count,
             custom_extractions,
+            page_speed,
             error,
             in_sitemap
         )
@@ -4275,8 +5324,10 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             redirect_type,
             redirect_chain,
             title,
+            title_count,
             title_len,
             meta_description,
+            meta_description_count,
             meta_description_len,
             meta_robots,
             x_robots_tag,
@@ -4321,6 +5372,7 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             internal_outlink_count,
             external_outlink_count,
             custom_extractions,
+            page_speed,
             error,
             in_sitemap
         FROM crawl_records_old;
@@ -4386,6 +5438,7 @@ fn create_crawl_record_indexes(conn: &Connection) -> Result<(), StorageError> {
         "
         CREATE INDEX IF NOT EXISTS idx_crawl_records_status_code ON crawl_records(status_code);
         CREATE INDEX IF NOT EXISTS idx_crawl_records_storage_key ON crawl_records(storage_key);
+        CREATE INDEX IF NOT EXISTS idx_crawl_records_url ON crawl_records(url);
         CREATE INDEX IF NOT EXISTS idx_crawl_records_final_url ON crawl_records(final_url);
         CREATE INDEX IF NOT EXISTS idx_crawl_records_list_position ON crawl_records(list_position);
         CREATE INDEX IF NOT EXISTS idx_crawl_records_classification ON crawl_records(classification);
@@ -4393,30 +5446,229 @@ fn create_crawl_record_indexes(conn: &Connection) -> Result<(), StorageError> {
         CREATE INDEX IF NOT EXISTS idx_crawl_records_title ON crawl_records(title);
         CREATE INDEX IF NOT EXISTS idx_crawl_records_meta_description ON crawl_records(meta_description);
         CREATE INDEX IF NOT EXISTS idx_crawl_records_near_duplicate_cluster_id ON crawl_records(near_duplicate_cluster_id);
+        CREATE INDEX IF NOT EXISTS idx_crawl_records_response_hash ON crawl_records(response_hash);
         ",
     )?;
     Ok(())
 }
 
-fn needs_duplicate_filter(view: &IssueView) -> bool {
-    matches!(
-        view,
-        IssueView::TitleDuplicate
-            | IssueView::MetaDuplicate
-            | IssueView::H1Duplicate
-            | IssueView::H2Duplicate
-            | IssueView::HreflangMissingReturnLink
-            | IssueView::HreflangNonCanonicalTarget
-    )
+/// Validate advanced rules before querying or opening an export destination.
+pub fn validate_grid_query(query: &GridQuery) -> Result<(), StorageError> {
+    let Some(group) = &query.filters else {
+        return Ok(());
+    };
+    if group.rules.len() > 20 {
+        return Err(StorageError::InvalidQuery(
+            "Advanced filters support at most 20 rules".into(),
+        ));
+    }
+    for (index, rule) in group.rules.iter().enumerate() {
+        let invalid = |message: String| {
+            StorageError::InvalidQuery(format!("Filter rule {}: {message}", index + 1))
+        };
+        if rule.value.chars().take(2_001).count() > 2_000 {
+            return Err(invalid("value exceeds 2,000 characters".into()));
+        }
+        let valid_operator = if rule.field.is_numeric() {
+            matches!(
+                rule.operator,
+                GridFilterOperator::Equals
+                    | GridFilterOperator::NotEquals
+                    | GridFilterOperator::LessThan
+                    | GridFilterOperator::GreaterThan
+            )
+        } else {
+            !matches!(
+                rule.operator,
+                GridFilterOperator::LessThan | GridFilterOperator::GreaterThan
+            )
+        };
+        if !valid_operator {
+            return Err(invalid(format!(
+                "{:?} does not support {:?}",
+                rule.field, rule.operator
+            )));
+        }
+        if rule.field.is_numeric() && !rule.value.trim().parse::<f64>().is_ok_and(f64::is_finite) {
+            return Err(invalid(format!(
+                "{:?} requires a finite number",
+                rule.field
+            )));
+        }
+    }
+    Ok(())
 }
 
-fn needs_regex_segment_filter(query: &GridQuery) -> bool {
-    query.segment_regex
-        && query
-            .segment_pattern
-            .as_ref()
-            .map(|pattern| !pattern.trim().is_empty())
-            .unwrap_or(false)
+impl GridFilterField {
+    fn is_numeric(self) -> bool {
+        matches!(
+            self,
+            Self::StatusCode | Self::Depth | Self::WordCount | Self::ResponseTimeMs
+        )
+    }
+
+    fn column(self) -> &'static str {
+        match self {
+            Self::Url => "url",
+            Self::FinalUrl => "final_url",
+            Self::Title => "title",
+            Self::MetaDescription => "meta_description",
+            Self::Canonical => "canonical",
+            Self::StatusCode => "status_code",
+            Self::Depth => "depth",
+            Self::WordCount => "word_count",
+            Self::ResponseTimeMs => "response_time_ms",
+            Self::Indexability => "indexability",
+        }
+    }
+
+    fn text(self, row: &CrawlRecord) -> &str {
+        match self {
+            Self::Url => &row.url,
+            Self::FinalUrl => &row.final_url,
+            Self::Title => row.title.as_deref().unwrap_or_default(),
+            Self::MetaDescription => row.meta_description.as_deref().unwrap_or_default(),
+            Self::Canonical => row.canonical.as_deref().unwrap_or_default(),
+            Self::Indexability => &row.indexability,
+            _ => "",
+        }
+    }
+
+    fn number(self, row: &CrawlRecord) -> Option<u64> {
+        match self {
+            Self::StatusCode => row.status_code.map(u64::from),
+            Self::Depth => Some(row.depth as u64),
+            Self::WordCount => Some(row.word_count as u64),
+            Self::ResponseTimeMs => Some(row.response_time_ms),
+            _ => None,
+        }
+    }
+}
+
+struct PreparedGridRule<'a> {
+    rule: &'a GridFilterRule,
+    text: String,
+    number: Option<GridFilterNumber>,
+}
+
+#[derive(Clone, Copy)]
+enum GridFilterNumber {
+    Integer(i64),
+    Real(f64),
+}
+
+impl<'a> PreparedGridRule<'a> {
+    fn new(rule: &'a GridFilterRule) -> Self {
+        Self {
+            rule,
+            text: normalize_text_key(&rule.value),
+            number: rule
+                .value
+                .trim()
+                .parse()
+                .map(GridFilterNumber::Integer)
+                .or_else(|_| rule.value.trim().parse().map(GridFilterNumber::Real))
+                .ok(),
+        }
+    }
+
+    fn matches(&self, row: &CrawlRecord) -> bool {
+        use GridFilterOperator::*;
+        if self.rule.field.is_numeric() {
+            let Some(value) = self.rule.field.number(row) else {
+                return false;
+            };
+            let Some(number) = self.number else {
+                return false;
+            };
+            // Compare an integer against a floating-point threshold without rounding the
+            // stored integer first, matching SQLite even above f64's exact-integer range.
+            let ordering = match number {
+                GridFilterNumber::Integer(number) => i128::from(value).cmp(&i128::from(number)),
+                GridFilterNumber::Real(number) if number < 0.0 => Ordering::Greater,
+                GridFilterNumber::Real(number) if number >= u64::MAX as f64 => Ordering::Less,
+                GridFilterNumber::Real(number) => value.cmp(&(number as u64)).then_with(|| {
+                    if number.fract() == 0.0 {
+                        Ordering::Equal
+                    } else {
+                        Ordering::Less
+                    }
+                }),
+            };
+            match self.rule.operator {
+                Equals => ordering == Ordering::Equal,
+                NotEquals => ordering != Ordering::Equal,
+                LessThan => ordering == Ordering::Less,
+                GreaterThan => ordering == Ordering::Greater,
+                _ => false,
+            }
+        } else {
+            let text = normalize_text_key(self.rule.field.text(row));
+            match self.rule.operator {
+                Contains => text.contains(&self.text),
+                NotContains => !text.contains(&self.text),
+                Equals => text == self.text,
+                NotEquals => text != self.text,
+                IsEmpty => text.is_empty(),
+                IsNotEmpty => !text.is_empty(),
+                _ => false,
+            }
+        }
+    }
+}
+
+fn grid_filter_group_sql(group: &GridFilterGroup, args: &mut Vec<String>) -> Option<String> {
+    use GridFilterOperator::*;
+    if group.rules.is_empty() {
+        return None;
+    }
+    let clauses = group
+        .rules
+        .iter()
+        .map(|rule| {
+            let column = rule.field.column();
+            if matches!(rule.operator, IsEmpty | IsNotEmpty) {
+                let operator = if rule.operator == IsEmpty { "=" } else { "!=" };
+                return format!("ff_text_key({column}) {operator} ''");
+            }
+            let parameter = format!("?{}", args.len() + 1);
+            args.push(if rule.field.is_numeric() {
+                rule.value.trim().to_string()
+            } else {
+                normalize_text_key(&rule.value)
+            });
+            let operator = match rule.operator {
+                Equals => "=",
+                NotEquals => "!=",
+                LessThan => "<",
+                GreaterThan => ">",
+                Contains | NotContains => {
+                    let compare = if rule.operator == Contains {
+                        "> 0"
+                    } else {
+                        "= 0"
+                    };
+                    return format!("instr(ff_text_key({column}), {parameter}) {compare}");
+                }
+                _ => unreachable!("empty operators are handled above"),
+            };
+            if rule.field.is_numeric() {
+                let kind = if rule.value.trim().parse::<i64>().is_ok() {
+                    "INTEGER"
+                } else {
+                    "REAL"
+                };
+                format!("{column} {operator} CAST({parameter} AS {kind})")
+            } else {
+                format!("ff_text_key({column}) {operator} {parameter}")
+            }
+        })
+        .collect::<Vec<_>>();
+    let joiner = match group.match_mode {
+        GridFilterMatch::All => " AND ",
+        GridFilterMatch::Any => " OR ",
+    };
+    Some(format!("({})", clauses.join(joiner)))
 }
 
 enum SegmentMatcher {
@@ -4450,12 +5702,50 @@ impl SegmentMatcher {
     }
 }
 
+// ponytail: build narrow alias joins per query; persist indexed aliases if repeated large audits dominate.
+const HREFLANG_AUDIT_CTES: &str = "WITH
+    ff_record_aliases AS MATERIALIZED (
+        SELECT r.id AS record_id, a.value AS alias
+        FROM crawl_records r, json_each(ff_url_aliases(r.storage_key, r.url, r.final_url)) a
+    ),
+    ff_hreflang_refs AS MATERIALIZED (
+        SELECT r.id AS source_id, json_extract(a.value, '$[0]') AS link_id,
+            json_extract(a.value, '$[1]') AS alias
+        FROM crawl_records r, json_each(ff_hreflang_aliases(r.hreflang_links)) a
+    ),
+    ff_primary_aliases AS MATERIALIZED (
+        SELECT alias, MIN(record_id) AS record_id FROM ff_record_aliases GROUP BY alias
+    ),
+    ff_hreflang_targets AS (
+        SELECT refs.source_id, refs.link_id, MIN(target.record_id) AS target_id,
+            MAX(source.record_id IS NOT NULL) AS self_reference
+        FROM ff_hreflang_refs refs JOIN ff_primary_aliases target ON target.alias = refs.alias
+        LEFT JOIN ff_record_aliases source ON source.record_id = refs.source_id AND source.alias = refs.alias
+        GROUP BY refs.source_id, refs.link_id
+    ) ";
+
 fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
     let mut clauses = Vec::new();
     let mut args = Vec::new();
 
     if is_html_audit_view(&query.view) {
         clauses.push(SUCCESS_HTML_SQL.to_string());
+    }
+    let duplicate_column = match query.view {
+        IssueView::TitleDuplicate => Some("title"),
+        IssueView::MetaDuplicate => Some("meta_description"),
+        IssueView::H1Duplicate => Some("h1"),
+        IssueView::H2Duplicate => Some("h2"),
+        _ => None,
+    };
+    if let Some(column) = duplicate_column {
+        clauses.push(format!(
+            "ff_text_key({column}) IN (
+            SELECT ff_text_key({column}) FROM crawl_records
+            WHERE {SUCCESS_HTML_SQL} AND ff_text_key({column}) != ''
+            GROUP BY ff_text_key({column}) HAVING COUNT(*) > 1
+        )"
+        ));
     }
 
     match query.view {
@@ -4467,30 +5757,41 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
         IssueView::Status4xx => clauses.push("status_code >= 400 AND status_code < 500".to_string()),
         IssueView::Status5xx => clauses.push("status_code >= 500".to_string()),
         IssueView::NoResponse => clauses.push(NO_RESPONSE_SQL.to_string()),
-        IssueView::TitleMissing => clauses.push("(title IS NULL OR trim(title) = '')".to_string()),
+        IssueView::TitleMissing => clauses.push("(title IS NULL OR ff_trim(title) = '')".to_string()),
         IssueView::TitleDuplicate => {}
-        IssueView::TitleTooShort => clauses.push("(title IS NOT NULL AND trim(title) != '' AND title_len < 30)".to_string()),
+        IssueView::TitleMultiple => clauses.push("title_count > 1".to_string()),
+        IssueView::TitleTooShort => clauses.push("(title IS NOT NULL AND ff_trim(title) != '' AND title_len < 30)".to_string()),
         IssueView::TitleTooLong => clauses.push("title_len > 60".to_string()),
-        IssueView::TitlePixelTooNarrow => clauses.push("(title IS NOT NULL AND trim(title) != '' AND title_pixel_width < 200)".to_string()),
+        IssueView::TitlePixelTooNarrow => clauses.push("(title IS NOT NULL AND ff_trim(title) != '' AND title_pixel_width < 200)".to_string()),
         IssueView::TitlePixelTooWide => clauses.push("title_pixel_width > 580".to_string()),
-        IssueView::MetaMissing => clauses.push("(meta_description IS NULL OR trim(meta_description) = '')".to_string()),
+        IssueView::MetaMissing => clauses.push("(meta_description IS NULL OR ff_trim(meta_description) = '')".to_string()),
         IssueView::MetaDuplicate => {}
-        IssueView::MetaTooShort => clauses.push("(meta_description IS NOT NULL AND trim(meta_description) != '' AND meta_description_len < 70)".to_string()),
+        IssueView::MetaMultiple => clauses.push("meta_description_count > 1".to_string()),
+        IssueView::MetaTooShort => clauses.push("(meta_description IS NOT NULL AND ff_trim(meta_description) != '' AND meta_description_len < 70)".to_string()),
         IssueView::MetaTooLong => clauses.push("meta_description_len > 160".to_string()),
-        IssueView::MetaPixelTooNarrow => clauses.push("(meta_description IS NOT NULL AND trim(meta_description) != '' AND meta_description_pixel_width < 400)".to_string()),
+        IssueView::MetaPixelTooNarrow => clauses.push("(meta_description IS NOT NULL AND ff_trim(meta_description) != '' AND meta_description_pixel_width < 400)".to_string()),
         IssueView::MetaPixelTooWide => clauses.push("meta_description_pixel_width > 920".to_string()),
-        IssueView::H1Missing => clauses.push("(h1 IS NULL OR trim(h1) = '')".to_string()),
+        IssueView::H1Missing => clauses.push("(h1 IS NULL OR ff_trim(h1) = '')".to_string()),
         IssueView::H1Duplicate => {}
         IssueView::H1TooLong => clauses.push("h1_len > 70".to_string()),
-        IssueView::H2Missing => clauses.push("(h2 IS NULL OR trim(h2) = '')".to_string()),
+        IssueView::H2Missing => clauses.push("(h2 IS NULL OR ff_trim(h2) = '')".to_string()),
         IssueView::H2Duplicate => {}
         IssueView::H2TooLong => clauses.push("h2_len > 70".to_string()),
         IssueView::TitleSameAsH1 => clauses.push(
-            "(title IS NOT NULL AND h1 IS NOT NULL AND trim(title) != '' AND lower(trim(title)) = lower(trim(h1)))"
+            "(title IS NOT NULL AND h1 IS NOT NULL AND ff_trim(title) != '' AND lower(ff_trim(title)) = lower(ff_trim(h1)))"
                 .to_string(),
         ),
-        IssueView::CanonicalMissing => clauses.push("(canonical IS NULL OR trim(canonical) = '')".to_string()),
+        IssueView::CanonicalMissing => clauses.push("(canonical IS NULL OR ff_trim(canonical) = '')".to_string()),
         IssueView::CanonicalMultiple => clauses.push("canonical_count > 1".to_string()),
+        IssueView::CanonicalUncrawled | IssueView::CanonicalToRedirect | IssueView::CanonicalToError
+        | IssueView::CanonicalNonIndexable | IssueView::CanonicalChain | IssueView::CanonicalLoop
+        | IssueView::PaginationNextToError | IssueView::PaginationPrevToError
+        | IssueView::PaginationNextLoop | IssueView::PaginationPrevLoop
+        | IssueView::PaginationNextNonReciprocal | IssueView::PaginationPrevNonReciprocal
+        | IssueView::AmpToError => {
+            let mask = reference_view_mask(&query.view).expect("reference view");
+            clauses.push(format!("id IN (SELECT record_id FROM ff_reference_diagnostics WHERE (flags & {mask}) != 0)"));
+        }
         IssueView::DirectivesNoindex => clauses.push("lower(indexability_status) LIKE '%noindex%'".to_string()),
         IssueView::ImagesMissingAlt => clauses.push("images_missing_alt > 0".to_string()),
         IssueView::ImagesAltTooLong => clauses.push("images_alt_too_long > 0".to_string()),
@@ -4510,8 +5811,25 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
         IssueView::HreflangMissingSelfReference => {
             clauses.push("hreflang_missing_self_reference != 0".to_string())
         }
-        IssueView::HreflangMissingReturnLink => {}
-        IssueView::HreflangNonCanonicalTarget => {}
+        IssueView::HreflangMissingReturnLink => clauses.push(
+            "id IN (SELECT links.source_id FROM ff_hreflang_targets links
+            WHERE links.self_reference = 0 AND NOT EXISTS (
+                SELECT 1 FROM ff_hreflang_refs back
+                JOIN ff_record_aliases source ON source.alias = back.alias
+                WHERE back.source_id = links.target_id AND source.record_id = links.source_id
+            ))".into(),
+        ),
+        IssueView::HreflangNonCanonicalTarget => clauses.push(
+            "id IN (SELECT links.source_id FROM ff_hreflang_targets links
+            JOIN crawl_records target ON target.id = links.target_id
+            WHERE target.canonical IS NOT NULL
+                AND ff_url_aliases(target.canonical, '', '') != '[]'
+                AND NOT EXISTS (
+                    SELECT 1 FROM ff_record_aliases a
+                    JOIN json_each(ff_url_aliases(target.canonical, '', '')) c ON a.alias = c.value
+                    WHERE a.record_id = target.id
+                ))".into(),
+        ),
         IssueView::StructuredDataInvalid => clauses.push(
             "(structured_data_error_count > 0 OR json_ld_invalid_count > 0)".to_string(),
         ),
@@ -4530,6 +5848,9 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
                 HAVING COUNT(*) > 1
             )"
         )),
+        IssueView::ExactDuplicate => clauses.push(
+            "id IN (SELECT record_id FROM ff_exact_duplicate_records)".into(),
+        ),
         IssueView::BrokenLinks => clauses.push(broken_record_sql()),
         IssueView::SitemapOrphan => clauses
             .push("in_sitemap != 0 AND inlink_count = 0 AND classification = 'internal'".to_string()),
@@ -4538,24 +5859,64 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
     if let Some(search) = query.global_search.as_ref().map(|value| value.trim())
         && !search.is_empty()
     {
-        clauses.push(
-                "(lower(url) LIKE ? OR lower(final_url) LIKE ? OR lower(title) LIKE ? OR lower(meta_description) LIKE ? OR lower(meta_robots) LIKE ? OR lower(x_robots_tag) LIKE ? OR lower(h1) LIKE ? OR lower(h2) LIKE ? OR lower(canonical) LIKE ? OR lower(amphtml) LIKE ? OR lower(rel_next) LIKE ? OR lower(rel_prev) LIKE ? OR lower(response_hash) LIKE ? OR lower(custom_extractions) LIKE ? OR lower(custom_searches) LIKE ? OR lower(structured_data_issues) LIKE ? OR CAST(status_code AS TEXT) LIKE ? OR CAST(near_duplicate_cluster_id AS TEXT) LIKE ? OR CAST(list_position AS TEXT) LIKE ? OR CAST(deprecated_html_tag_count AS TEXT) LIKE ? OR CAST(duplicate_id_count AS TEXT) LIKE ? OR CAST(js_rendered AS TEXT) LIKE ? OR CAST(rendered_dom_changed AS TEXT) LIKE ? OR CAST(rendered_word_count_delta AS TEXT) LIKE ? OR CAST(rendered_link_count_delta AS TEXT) LIKE ? OR CAST(search_console_clicks AS TEXT) LIKE ? OR CAST(search_console_impressions AS TEXT) LIKE ? OR CAST(search_console_ctr AS TEXT) LIKE ? OR CAST(search_console_average_position AS TEXT) LIKE ?)"
-                    .to_string(),
-            );
-        let pattern = format!("%{}%", search.to_lowercase());
-        for _ in 0..29 {
-            args.push(pattern.clone());
-        }
+        let parameter = format!("?{}", args.len() + 1);
+        let mut predicates = [
+            "url",
+            "final_url",
+            "title",
+            "meta_description",
+            "meta_robots",
+            "x_robots_tag",
+            "h1",
+            "h2",
+            "canonical",
+            "amphtml",
+            "rel_next",
+            "rel_prev",
+            "response_hash",
+            "status_code",
+            "near_duplicate_cluster_id",
+            "list_position",
+            "deprecated_html_tag_count",
+            "duplicate_id_count",
+            "CASE WHEN js_rendered THEN 'true' ELSE 'false' END",
+            "CASE WHEN rendered_dom_changed THEN 'true' ELSE 'false' END",
+            "rendered_word_count_delta",
+            "rendered_link_count_delta",
+            "search_console_clicks",
+            "search_console_impressions",
+            "search_console_ctr",
+            "search_console_average_position",
+        ]
+        .into_iter()
+        .map(|column| format!("ff_contains({column}, {parameter})"))
+        .collect::<Vec<_>>();
+        predicates.push(format!("ff_custom_contains(custom_extractions, custom_searches, structured_data_issues, {parameter})"));
+        predicates.push(sqlite_first_inlink_expression(&format!(
+            "ff_contains(source_url, {parameter}) OR ff_contains(anchor_text, {parameter}) OR ff_contains(source_position, {parameter})"
+        )));
+        clauses.push(format!("({})", predicates.join(" OR ")));
+        args.push(search.to_lowercase());
     }
 
     if let Some(segment) = query.segment_pattern.as_ref().map(|value| value.trim())
         && !segment.is_empty()
-        && !query.segment_regex
     {
-        clauses.push("(lower(url) LIKE ? OR lower(final_url) LIKE ?)".to_string());
-        let pattern = format!("%{}%", segment.to_lowercase());
+        let pattern = if query.segment_regex {
+            clauses.push("(ff_regexp(?, url) OR ff_regexp(?, final_url))".to_string());
+            segment.to_string()
+        } else {
+            clauses.push("(ff_contains(url, ?) OR ff_contains(final_url, ?))".to_string());
+            segment.to_lowercase()
+        };
         args.push(pattern.clone());
         args.push(pattern);
+    }
+
+    if let Some(group) = &query.filters
+        && let Some(clause) = grid_filter_group_sql(group, &mut args)
+    {
+        clauses.push(clause);
     }
 
     if clauses.is_empty() {
@@ -4620,14 +5981,25 @@ fn link_edge_filter_sql(
     if let Some(search) = query.global_search.as_ref().map(|value| value.trim())
         && !search.is_empty()
     {
-        clauses.push(
-                "(lower(source_url) LIKE ? OR lower(target_url) LIKE ? OR lower(anchor_text) LIKE ? OR lower(rel) LIKE ? OR lower(link_type) LIKE ? OR CAST(source_status_code AS TEXT) LIKE ? OR CAST(target_status_code AS TEXT) LIKE ? OR CAST(source_depth AS TEXT) LIKE ? OR CAST(target_depth AS TEXT) LIKE ? OR CAST(source_position AS TEXT) LIKE ?)"
-                    .to_string(),
-            );
-        let pattern = format!("%{}%", search.to_lowercase());
-        for _ in 0..10 {
-            args.push(pattern.clone());
-        }
+        let parameter = format!("?{}", args.len() + 1);
+        let predicates = [
+            "source_url",
+            "target_url",
+            "anchor_text",
+            "rel",
+            "link_type",
+            "source_status_code",
+            "target_status_code",
+            "source_depth",
+            "target_depth",
+            "source_position",
+            "discovery_order",
+        ]
+        .into_iter()
+        .map(|column| format!("ff_contains({column}, {parameter})"))
+        .collect::<Vec<_>>();
+        clauses.push(format!("({})", predicates.join(" OR ")));
+        args.push(search.to_lowercase());
     }
 
     if clauses.is_empty() {
@@ -4685,12 +6057,13 @@ fn custom_search_sort_name(sort_by: &str) -> Option<String> {
 
 fn sqlite_custom_extraction_sort_expression(name: &str) -> String {
     let escaped_name = name.replace('\'', "''");
-    format!(
-        "(SELECT lower(COALESCE(json_extract(value, '$.values[0]'), ''))
-          FROM json_each(crawl_records.custom_extractions)
-          WHERE json_extract(value, '$.name') = '{escaped_name}'
-          LIMIT 1)"
-    )
+    format!("ff_extraction_sort(custom_extractions, '{escaped_name}')")
+}
+
+fn sqlite_first_inlink_expression(column: &str) -> String {
+    format!("(SELECT {column} FROM link_edges
+        WHERE target_url IN (SELECT value FROM json_each(ff_url_aliases(crawl_records.storage_key, crawl_records.url, crawl_records.final_url)))
+        ORDER BY discovery_order, source_position, source_url, id LIMIT 1)")
 }
 
 fn sqlite_custom_search_sort_expression(name: &str) -> String {
@@ -4726,9 +6099,11 @@ fn sort_column(sort_by: Option<&str>) -> Option<String> {
         Some("sizeBytes") => Some("size_bytes".to_string()),
         Some("depth") => Some("depth".to_string()),
         Some("titleLen") => Some("title_len".to_string()),
+        Some("titleCount") => Some("title_count".to_string()),
         Some("titlePixelWidth") => Some("title_pixel_width".to_string()),
         Some("metaDescription") => Some("meta_description".to_string()),
         Some("metaDescriptionLen") => Some("meta_description_len".to_string()),
+        Some("metaDescriptionCount") => Some("meta_description_count".to_string()),
         Some("metaDescriptionPixelWidth") => Some("meta_description_pixel_width".to_string()),
         Some("h1") => Some("h1".to_string()),
         Some("h1Len") => Some("h1_len".to_string()),
@@ -4737,6 +6112,9 @@ fn sort_column(sort_by: Option<&str>) -> Option<String> {
         Some("h2Len") => Some("h2_len".to_string()),
         Some("h2Count") => Some("h2_count".to_string()),
         Some("canonicalCount") => Some("canonical_count".to_string()),
+        Some("relNext") => Some("rel_next".to_string()),
+        Some("relPrev") => Some("rel_prev".to_string()),
+        Some("amphtml") => Some("amphtml".to_string()),
         Some("wordCount") => Some("word_count".to_string()),
         Some("textToCodeRatio") => Some("text_to_code_ratio".to_string()),
         Some("imageCount") => Some("image_count".to_string()),
@@ -4764,6 +6142,10 @@ fn sort_column(sort_by: Option<&str>) -> Option<String> {
         Some("searchConsoleAveragePosition") => Some("search_console_average_position".to_string()),
         Some("nearDuplicateClusterId") => Some("near_duplicate_cluster_id".to_string()),
         Some("inlinkCount") => Some("inlink_count".to_string()),
+        Some("firstInlinkSourceUrl") => Some(sqlite_first_inlink_expression("source_url")),
+        Some("firstInlinkSourcePosition") => {
+            Some(sqlite_first_inlink_expression("source_position"))
+        }
         Some("outlinkCount") => Some("outlink_count".to_string()),
         Some("title") => Some("title".to_string()),
         Some("url") => Some("url".to_string()),
@@ -4780,6 +6162,14 @@ fn count_query(conn: &Connection, sql: &str, args: &[String]) -> Result<usize, S
     Ok(value)
 }
 
+fn crawl_audit_revision(conn: &Connection) -> Result<i64, StorageError> {
+    Ok(conn.query_row(
+        "SELECT revision FROM crawl_audit_revision WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 fn summary_count(conn: &Connection, sql: &str) -> Result<usize, StorageError> {
     let value = conn.query_row(sql, [], |row| {
         row.get::<_, i64>(0).map(|count| count as usize)
@@ -4787,20 +6177,84 @@ fn summary_count(conn: &Connection, sql: &str) -> Result<usize, StorageError> {
     Ok(value)
 }
 
+fn sqlite_progress_counts(conn: &Connection) -> Result<CrawlSummary, StorageError> {
+    let view_filter = |view| {
+        let (filter, args) = query_filter_sql(&GridQuery {
+            view,
+            ..GridQuery::default()
+        });
+        debug_assert!(args.is_empty());
+        filter
+    };
+    // Pair each SQL projection with its decoded field so column order cannot drift.
+    macro_rules! count_fields {
+        ($($field:ident: $filter:expr),+ $(,)?) => {{
+            let projections = [$({
+                let filter = $filter;
+                let count = if filter.is_empty() {
+                    "COUNT(*)".to_string()
+                } else {
+                    format!("COUNT(*) FILTER({filter})")
+                };
+                format!("{count} AS {}", stringify!($field))
+            }),+];
+            let sql = format!("SELECT {} FROM crawl_records", projections.join(", "));
+            Ok(conn.query_row(&sql, [], |row| Ok(CrawlSummary {
+                $($field: row.get::<_, i64>(stringify!($field))? as usize,)+
+                ..CrawlSummary::default()
+            }))?)
+        }};
+    }
+    count_fields! {
+        total: view_filter(IssueView::All),
+        internal: view_filter(IssueView::Internal),
+        external: view_filter(IssueView::External),
+        success: view_filter(IssueView::Status2xx),
+        redirects: view_filter(IssueView::Status3xx),
+        client_errors: view_filter(IssueView::Status4xx),
+        server_errors: view_filter(IssueView::Status5xx),
+        no_response: view_filter(IssueView::NoResponse),
+        broken: view_filter(IssueView::BrokenLinks),
+        near_duplicates: view_filter(IssueView::NearDuplicate),
+        indexable: " WHERE indexability = 'Indexable'".to_string(),
+        non_indexable: " WHERE indexability = 'Non-indexable'".to_string(),
+        title_missing: view_filter(IssueView::TitleMissing),
+        title_multiple: view_filter(IssueView::TitleMultiple),
+        meta_missing: view_filter(IssueView::MetaMissing),
+        meta_multiple: view_filter(IssueView::MetaMultiple),
+        h1_missing: view_filter(IssueView::H1Missing),
+        h2_missing: view_filter(IssueView::H2Missing),
+        canonical_missing: view_filter(IssueView::CanonicalMissing),
+        canonical_multiple: view_filter(IssueView::CanonicalMultiple),
+        noindex: view_filter(IssueView::DirectivesNoindex),
+        images_missing_alt: view_filter(IssueView::ImagesMissingAlt),
+        images_alt_too_long: view_filter(IssueView::ImagesAltTooLong),
+        mixed_content: view_filter(IssueView::SecurityMixedContent),
+        insecure_forms: view_filter(IssueView::SecurityInsecureForms),
+        hreflang_invalid: view_filter(IssueView::HreflangInvalid),
+        structured_data_invalid: view_filter(IssueView::StructuredDataInvalid),
+        structured_data_warnings: view_filter(IssueView::StructuredDataWarning),
+        deprecated_html_tags: view_filter(IssueView::HtmlDeprecatedTags),
+        duplicate_ids: view_filter(IssueView::HtmlDuplicateIds),
+        rendered_dom_changed: view_filter(IssueView::RenderedDomChanged),
+        missing_viewport: view_filter(IssueView::MobileMissingViewport),
+        missing_hsts: view_filter(IssueView::SecurityMissingHsts),
+        sitemap_orphans: view_filter(IssueView::SitemapOrphan),
+    }
+}
+
 fn sqlite_duplicate_count(conn: &Connection, column: &str) -> Result<usize, StorageError> {
     let column = sqlite_identifier(column);
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {column} FROM crawl_records WHERE {SUCCESS_HTML_SQL} AND {column} IS NOT NULL"
-    ))?;
-    let values = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut counts = HashMap::<String, usize>::new();
-    for value in values {
-        let key = normalize_text_key(&value?);
-        if !key.is_empty() {
-            *counts.entry(key).or_default() += 1;
-        }
-    }
-    Ok(counts.values().filter(|count| **count > 1).sum())
+    summary_count(
+        conn,
+        &format!(
+            "SELECT COALESCE(SUM(CASE WHEN text_key != '' THEN matches ELSE 0 END), 0) FROM (
+        SELECT ff_text_key({column}) AS text_key, COUNT(*) AS matches FROM crawl_records
+        WHERE {SUCCESS_HTML_SQL}
+        GROUP BY ff_text_key({column}) HAVING COUNT(*) > 1
+    )"
+        ),
+    )
 }
 
 fn query_records_with_args(
@@ -4865,8 +6319,506 @@ fn cluster_counts(values: impl Iterator<Item = u64>) -> HashMap<u64, usize> {
     counts
 }
 
+/// Cross-page evidence for one source row, in the same order as the supplied records.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CanonicalDiagnostics {
+    pub uncrawled: bool,
+    pub to_redirect: bool,
+    pub to_error: bool,
+    pub non_indexable: bool,
+    pub chain: bool,
+    /// The canonical path enters a cycle of distinct pages. Self-canonicals are valid.
+    pub loop_detected: bool,
+}
+
+impl CanonicalDiagnostics {
+    fn flags(self) -> u8 {
+        u8::from(self.uncrawled)
+            | (u8::from(self.to_redirect) << 1)
+            | (u8::from(self.to_error) << 2)
+            | (u8::from(self.non_indexable) << 3)
+            | (u8::from(self.chain) << 4)
+            | (u8::from(self.loop_detected) << 5)
+    }
+}
+
+/// Canonical, pagination and AMP evidence share one target index and cache revision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReferenceDiagnostics {
+    pub canonical: CanonicalDiagnostics,
+    pub pagination_next_to_error: bool,
+    pub pagination_prev_to_error: bool,
+    pub amp_to_error: bool,
+    /// The source's next-only path enters a cycle, including self-pagination.
+    pub pagination_next_loop: bool,
+    /// The source's previous-only path enters a cycle, including self-pagination.
+    pub pagination_prev_loop: bool,
+    /// An observed next page has no captured previous return, or returns to another known page.
+    pub pagination_next_non_reciprocal: bool,
+    /// An observed previous page has no captured next return, or returns to another known page.
+    pub pagination_prev_non_reciprocal: bool,
+}
+
+impl ReferenceDiagnostics {
+    fn flags(self) -> u16 {
+        u16::from(self.canonical.flags())
+            | (u16::from(self.pagination_next_to_error) << 6)
+            | (u16::from(self.pagination_prev_to_error) << 7)
+            | (u16::from(self.amp_to_error) << 8)
+            | (u16::from(self.pagination_next_loop) << 9)
+            | (u16::from(self.pagination_prev_loop) << 10)
+            | (u16::from(self.pagination_next_non_reciprocal) << 11)
+            | (u16::from(self.pagination_prev_non_reciprocal) << 12)
+    }
+}
+
+#[derive(Debug)]
+struct ReferenceAuditRecord {
+    id: u64,
+    url: String,
+    final_url: String,
+    canonical: Option<String>,
+    rel_next: Option<String>,
+    rel_prev: Option<String>,
+    amphtml: Option<String>,
+    eligible: bool,
+    internal: bool,
+    fetched: bool,
+    broken: bool,
+    non_indexable: bool,
+    redirect: bool,
+    redirect_urls: Vec<String>,
+    observed: bool,
+    target_error: bool,
+    final_observed: bool,
+}
+
+impl From<&CrawlRecord> for ReferenceAuditRecord {
+    fn from(record: &CrawlRecord) -> Self {
+        Self {
+            id: record.id,
+            url: record.url.clone(),
+            final_url: record.final_url.clone(),
+            canonical: record.canonical.clone(),
+            rel_next: record.rel_next.clone(),
+            rel_prev: record.rel_prev.clone(),
+            amphtml: record.amphtml.clone(),
+            eligible: is_success_html_record(record),
+            internal: record.classification == UrlClassification::Internal,
+            fetched: record.status_code.is_some()
+                || record.error.is_some()
+                || is_robots_blocked_record(record),
+            broken: is_broken_record(record),
+            non_indexable: is_robots_blocked_record(record)
+                || (record.indexability == "Non-indexable"
+                    && !is_broken_record(record)
+                    && !matches!(record.status_code, Some(300..=399))),
+            redirect: matches!(record.status_code, Some(300..=399)),
+            redirect_urls: record
+                .redirect_chain
+                .iter()
+                .filter(|hop| (300..400).contains(&hop.status_code))
+                .map(|hop| hop.url.clone())
+                .collect(),
+            observed: record.status_code.is_some() || is_no_response_record(record),
+            target_error: is_no_response_record(record)
+                || matches!(record.status_code, Some(400..=599))
+                || (matches!(record.status_code, Some(300..=399)) && record.error.is_some()),
+            // The redirect limiter records the next destination before requesting it.
+            final_observed: record.error.as_deref() != Some("Redirect limit exceeded"),
+        }
+    }
+}
+
+fn reference_audit_record_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ReferenceAuditRecord> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Hop {
+        url: String,
+        status_code: u16,
+    }
+    let hops = serde_json::from_str::<Vec<Hop>>(&row.get::<_, String>(10)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(ReferenceAuditRecord {
+        id: row.get::<_, i64>(0)? as u64,
+        url: row.get(1)?,
+        final_url: row.get(2)?,
+        canonical: row.get(3)?,
+        rel_next: row.get(11)?,
+        rel_prev: row.get(12)?,
+        amphtml: row.get(16)?,
+        eligible: row.get(4)?,
+        internal: row.get(5)?,
+        fetched: row.get(6)?,
+        broken: row.get(7)?,
+        non_indexable: row.get::<_, Option<bool>>(8)?.unwrap_or(false),
+        redirect: row.get(9)?,
+        redirect_urls: hops
+            .into_iter()
+            .filter(|hop| (300..400).contains(&hop.status_code))
+            .map(|hop| hop.url)
+            .collect(),
+        observed: row.get(13)?,
+        target_error: row.get(14)?,
+        final_observed: row.get(15)?,
+    })
+}
+
+/// Audits complete HTML sources without cloning record payloads or walking each chain repeatedly.
+pub fn canonical_diagnostics(records: &[CrawlRecord]) -> Vec<CanonicalDiagnostics> {
+    reference_diagnostics(records)
+        .into_iter()
+        .map(|diagnostic| diagnostic.canonical)
+        .collect()
+}
+
+/// Audits complete HTML sources using only known target evidence; unknown pagination/AMP targets
+/// are not failures. Results preserve source order and separate List occurrences.
+pub fn reference_diagnostics(records: &[CrawlRecord]) -> Vec<ReferenceDiagnostics> {
+    build_reference_diagnostics(
+        &records
+            .iter()
+            .map(ReferenceAuditRecord::from)
+            .collect::<Vec<_>>(),
+    )
+}
+
+type ReferenceCandidate = (bool, u8, u64, usize, bool);
+
+struct ReferenceTarget {
+    canonical: ReferenceCandidate,
+    observed: Option<ReferenceCandidate>,
+}
+
+fn build_reference_diagnostics(records: &[ReferenceAuditRecord]) -> Vec<ReferenceDiagnostics> {
+    // Direct request evidence outranks redirect hops, then final URL aliases. Earliest List
+    // occurrences break ties; a pending occurrence must not hide an observed response.
+    let mut targets = HashMap::<String, ReferenceTarget>::new();
+    for (index, record) in records.iter().enumerate() {
+        let mut add = |url: &str, priority: u8, redirect: bool| {
+            let candidate = (!record.fetched, priority, record.id, index, redirect);
+            let observed =
+                (record.observed && (priority != 2 || record.final_observed)).then_some(candidate);
+            for alias in url_aliases(url) {
+                targets
+                    .entry(alias)
+                    .and_modify(|previous| {
+                        if candidate < previous.canonical {
+                            previous.canonical = candidate;
+                        }
+                        if let Some(candidate) = observed
+                            && previous
+                                .observed
+                                .is_none_or(|previous| candidate < previous)
+                        {
+                            previous.observed = Some(candidate);
+                        }
+                    })
+                    .or_insert(ReferenceTarget {
+                        canonical: candidate,
+                        observed,
+                    });
+            }
+        };
+        add(
+            &record.url,
+            0,
+            record.redirect || !record.redirect_urls.is_empty(),
+        );
+        for url in &record.redirect_urls {
+            add(url, 1, true);
+        }
+        add(&record.final_url, 2, record.redirect);
+    }
+    let canonical = build_canonical_diagnostics(records, &targets);
+    let mut next = vec![None; records.len()];
+    let mut prev = vec![None; records.len()];
+    let mut diagnostics = records
+        .iter()
+        .zip(canonical)
+        .enumerate()
+        .map(|(source_index, (record, canonical))| {
+            let mut diagnostic = ReferenceDiagnostics {
+                canonical,
+                ..ReferenceDiagnostics::default()
+            };
+            if !record.eligible
+                || (record.rel_next.is_none()
+                    && record.rel_prev.is_none()
+                    && record.amphtml.is_none())
+            {
+                return diagnostic;
+            }
+            // A successful source proves its own route and final page work even when an older
+            // List occurrence failed. Recorded redirect hops are part of that successful route.
+            let source_aliases = url_aliases_many(
+                [record.url.as_str(), record.final_url.as_str()]
+                    .into_iter()
+                    .chain(record.redirect_urls.iter().map(String::as_str)),
+            );
+            let observed_target = |value: Option<&str>| {
+                let target = value.and_then(normalized_final_url)?;
+                let aliases = url_aliases(&target);
+                if aliases_overlap(&aliases, &source_aliases) {
+                    return Some(source_index);
+                }
+                aliases
+                    .iter()
+                    .filter_map(|alias| targets.get(alias).and_then(|target| target.observed))
+                    .min()
+                    .map(|(_, _, _, index, _)| index)
+            };
+            let next_target = observed_target(record.rel_next.as_deref());
+            let prev_target = observed_target(record.rel_prev.as_deref());
+            let target_has_error =
+                |target: Option<usize>| target.is_some_and(|index| records[index].target_error);
+            diagnostic.pagination_next_to_error = target_has_error(next_target);
+            diagnostic.pagination_prev_to_error = target_has_error(prev_target);
+            diagnostic.amp_to_error = target_has_error(observed_target(record.amphtml.as_deref()));
+            let source_final = normalized_final_url(&record.final_url);
+            let loop_target = |target: Option<usize>| {
+                target
+                    .filter(|&index| records[index].eligible)
+                    .map(|index| {
+                        // A distinct request route returning to this final page is self-pagination,
+                        // regardless of whether that route's List occurrence has another relation.
+                        if source_final.is_some()
+                            && source_final == normalized_final_url(&records[index].final_url)
+                        {
+                            source_index
+                        } else {
+                            index
+                        }
+                    })
+            };
+            next[source_index] = loop_target(next_target);
+            prev[source_index] = loop_target(prev_target);
+            diagnostic
+        })
+        .collect::<Vec<_>>();
+    for (source_index, ((diagnostic, next_loop), prev_loop)) in diagnostics
+        .iter_mut()
+        .zip(paths_entering_cycles(&next))
+        .zip(paths_entering_cycles(&prev))
+        .enumerate()
+    {
+        diagnostic.pagination_next_loop = next_loop;
+        diagnostic.pagination_prev_loop = prev_loop;
+        if next[source_index].is_none_or(|index| index == source_index)
+            && prev[source_index].is_none_or(|index| index == source_index)
+        {
+            continue;
+        }
+        let source = &records[source_index];
+        let source_final = normalized_final_url(&source.final_url);
+        let source_aliases = url_aliases_many(
+            [source.url.as_str(), source.final_url.as_str()]
+                .into_iter()
+                .chain(source.redirect_urls.iter().map(String::as_str)),
+        );
+        let non_reciprocal = |target: Option<usize>, return_is_prev: bool| {
+            // The existing edges contain only complete HTML targets, resolved in each source's
+            // own context. Self-pagination is already reported by the direction-specific loops.
+            let Some(target_index) = target.filter(|&index| index != source_index) else {
+                return false;
+            };
+            let target = &records[target_index];
+            let (return_url, return_target) = if return_is_prev {
+                (target.rel_prev.as_deref(), prev[target_index])
+            } else {
+                (target.rel_next.as_deref(), next[target_index])
+            };
+            let Some(return_url) = return_url.filter(|value| !value.trim().is_empty()) else {
+                return true;
+            };
+            let Some(return_url) = normalized_final_url(return_url) else {
+                return false;
+            };
+            // Current source evidence outranks an older failed List occurrence of its route.
+            if aliases_overlap(&url_aliases(&return_url), &source_aliases) {
+                return false;
+            }
+            // A different URL may redirect back to this page. Only a known complete return
+            // destination supports a mismatch; robots, errors and uncrawled returns stay unknown.
+            match (
+                source_final.as_ref(),
+                return_target.and_then(|index| normalized_final_url(&records[index].final_url)),
+            ) {
+                (Some(source), Some(returned)) => source != &returned,
+                _ => false,
+            }
+        };
+        diagnostic.pagination_next_non_reciprocal = non_reciprocal(next[source_index], true);
+        diagnostic.pagination_prev_non_reciprocal = non_reciprocal(prev[source_index], false);
+    }
+    diagnostics
+}
+
+fn build_canonical_diagnostics(
+    records: &[ReferenceAuditRecord],
+    targets: &HashMap<String, ReferenceTarget>,
+) -> Vec<CanonicalDiagnostics> {
+    let canonical_urls = records
+        .iter()
+        .map(|record| {
+            record
+                .canonical
+                .as_deref()
+                .and_then(|value| url::Url::parse(value.trim()).ok())
+                .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+        })
+        .collect::<Vec<_>>();
+    let has_next = records
+        .iter()
+        .zip(&canonical_urls)
+        .map(|(record, canonical)| {
+            record.eligible
+                && canonical.as_ref().is_some_and(|canonical| {
+                    !aliases_overlap(
+                        &url_aliases(canonical.as_str()),
+                        &url_aliases_many([record.url.as_str(), record.final_url.as_str()]),
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    let mut diagnostics = vec![CanonicalDiagnostics::default(); records.len()];
+    let mut next = vec![None; records.len()];
+    for (index, record) in records.iter().enumerate() {
+        let Some(canonical) = canonical_urls[index].as_ref().filter(|_| record.eligible) else {
+            continue;
+        };
+        let canonical_aliases = url_aliases(canonical.as_str());
+        let target = if !has_next[index] {
+            // A source's own successful response is stronger self-canonical evidence than
+            // another List occurrence's old error or redirect to the same final URL.
+            let redirects = record.redirect
+                || record
+                    .redirect_urls
+                    .iter()
+                    .any(|url| aliases_overlap(&canonical_aliases, &url_aliases(url)));
+            Some((false, 0, record.id, index, redirects))
+        } else {
+            canonical_aliases
+                .iter()
+                .filter_map(|alias| targets.get(alias).map(|target| target.canonical))
+                .min()
+        };
+        let result = &mut diagnostics[index];
+        if target.is_none_or(|candidate| candidate.0) {
+            // Storage does not own crawl scope; only same-host internal targets are definite
+            // candidates for "uncrawled". Unknown subdomains/external hosts stay unclassified.
+            result.uncrawled = record.internal
+                && url::Url::parse(&record.final_url).is_ok_and(|source| {
+                    source.host_str().is_some() && source.host_str() == canonical.host_str()
+                });
+            continue;
+        }
+        let (_, _, _, target_index, redirects) = target.expect("observed target");
+        let target = &records[target_index];
+        result.to_redirect = redirects;
+        result.to_error = target.broken;
+        result.non_indexable = target.non_indexable;
+        let same_page = aliases_overlap(
+            &url_aliases(&record.final_url),
+            &url_aliases(&target.final_url),
+        );
+        if has_next[index] && !same_page && target.eligible {
+            next[index] = Some(target_index);
+            result.chain = has_next[target_index];
+        }
+    }
+    for (diagnostic, loops) in diagnostics.iter_mut().zip(paths_entering_cycles(&next)) {
+        diagnostic.loop_detected = loops;
+    }
+    diagnostics
+}
+
+// Each node has at most one edge. Memoize whether its path enters a cycle in linear time,
+// without recursion or a depth limit. Callers decide whether self-edges are valid relations.
+fn paths_entering_cycles(next: &[Option<usize>]) -> Vec<bool> {
+    let mut state = vec![0u8; next.len()];
+    let mut enters_cycle = vec![false; next.len()];
+    let mut path = Vec::new();
+    for start in 0..next.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        path.clear();
+        let mut current = Some(start);
+        while let Some(index) = current {
+            if state[index] != 0 {
+                break;
+            }
+            state[index] = 1;
+            path.push(index);
+            current = next[index];
+        }
+        let loops = current.is_some_and(|index| state[index] == 1 || enters_cycle[index]);
+        for &index in &path {
+            state[index] = 2;
+            enters_cycle[index] = loops;
+        }
+    }
+    enters_cycle
+}
+
+fn reference_view_mask(view: &IssueView) -> Option<u16> {
+    Some(match view {
+        IssueView::CanonicalUncrawled => 1,
+        IssueView::CanonicalToRedirect => 2,
+        IssueView::CanonicalToError => 4,
+        IssueView::CanonicalNonIndexable => 8,
+        IssueView::CanonicalChain => 16,
+        IssueView::CanonicalLoop => 32,
+        IssueView::PaginationNextToError => 64,
+        IssueView::PaginationPrevToError => 128,
+        IssueView::AmpToError => 256,
+        IssueView::PaginationNextLoop => 512,
+        IssueView::PaginationPrevLoop => 1024,
+        IssueView::PaginationNextNonReciprocal => 2048,
+        IssueView::PaginationPrevNonReciprocal => 4096,
+        _ => return None,
+    })
+}
+
+fn reference_counts(diagnostics: &[ReferenceDiagnostics]) -> [usize; 13] {
+    let mut counts = [0; 13];
+    for diagnostic in diagnostics {
+        for (index, count) in counts.iter_mut().enumerate() {
+            *count += usize::from(diagnostic.flags() & (1 << index) != 0);
+        }
+    }
+    counts
+}
+
+fn set_reference_summary(summary: &mut CrawlSummary, counts: [usize; 13]) {
+    [
+        summary.canonical_uncrawled,
+        summary.canonical_to_redirect,
+        summary.canonical_to_error,
+        summary.canonical_non_indexable,
+        summary.canonical_chain,
+        summary.canonical_loop,
+        summary.pagination_next_to_error,
+        summary.pagination_prev_to_error,
+        summary.amp_to_error,
+        summary.pagination_next_loop,
+        summary.pagination_prev_loop,
+        summary.pagination_next_non_reciprocal,
+        summary.pagination_prev_non_reciprocal,
+    ] = counts;
+}
+
+fn add_reference_summary(summary: &mut CrawlSummary, diagnostics: &[ReferenceDiagnostics]) {
+    set_reference_summary(summary, reference_counts(diagnostics));
+}
+
 #[derive(Clone, Debug)]
 struct HreflangAuditRecord {
+    id: u64,
     aliases: HashSet<String>,
     canonical: Option<String>,
     hreflang_links: Vec<HreflangLink>,
@@ -4883,6 +6835,7 @@ impl HreflangAuditIndex {
         for record in records {
             let aliases = record_url_aliases(record);
             let audit_record = HreflangAuditRecord {
+                id: record.id,
                 aliases: aliases.clone(),
                 canonical: record.canonical.clone(),
                 hreflang_links: record.hreflang_links.clone(),
@@ -4899,7 +6852,8 @@ impl HreflangAuditIndex {
     fn find(&self, url: &str) -> Option<&HreflangAuditRecord> {
         url_aliases(url)
             .into_iter()
-            .find_map(|alias| self.records_by_alias.get(&alias))
+            .filter_map(|alias| self.records_by_alias.get(&alias))
+            .min_by_key(|record| record.id)
     }
 }
 
@@ -4977,7 +6931,9 @@ fn matches_view(
     h1_counts: &HashMap<String, usize>,
     h2_counts: &HashMap<String, usize>,
     near_duplicate_counts: &HashMap<u64, usize>,
+    exact_hashes: &HashSet<String>,
     hreflang_index: &HreflangAuditIndex,
+    references: &ReferenceDiagnostics,
 ) -> bool {
     if is_html_audit_view(view) && !is_success_html_record(row) {
         return false;
@@ -4995,6 +6951,7 @@ fn matches_view(
         IssueView::Status5xx => matches!(row.status_code, Some(code) if code >= 500),
         IssueView::NoResponse => is_no_response_record(row),
         IssueView::TitleMissing => row.title.as_deref().unwrap_or("").trim().is_empty(),
+        IssueView::TitleMultiple => row.title_count.is_some_and(|count| count > 1),
         IssueView::TitleDuplicate => {
             row.title
                 .as_deref()
@@ -5019,6 +6976,7 @@ fn matches_view(
             .unwrap_or("")
             .trim()
             .is_empty(),
+        IssueView::MetaMultiple => row.meta_description_count.is_some_and(|count| count > 1),
         IssueView::MetaDuplicate => {
             row.meta_description
                 .as_deref()
@@ -5064,6 +7022,19 @@ fn matches_view(
         }
         IssueView::CanonicalMissing => row.canonical.as_deref().unwrap_or("").trim().is_empty(),
         IssueView::CanonicalMultiple => row.canonical_count > 1,
+        IssueView::CanonicalUncrawled => references.canonical.uncrawled,
+        IssueView::CanonicalToRedirect => references.canonical.to_redirect,
+        IssueView::CanonicalToError => references.canonical.to_error,
+        IssueView::CanonicalNonIndexable => references.canonical.non_indexable,
+        IssueView::CanonicalChain => references.canonical.chain,
+        IssueView::CanonicalLoop => references.canonical.loop_detected,
+        IssueView::PaginationNextToError => references.pagination_next_to_error,
+        IssueView::PaginationPrevToError => references.pagination_prev_to_error,
+        IssueView::PaginationNextLoop => references.pagination_next_loop,
+        IssueView::PaginationPrevLoop => references.pagination_prev_loop,
+        IssueView::PaginationNextNonReciprocal => references.pagination_next_non_reciprocal,
+        IssueView::PaginationPrevNonReciprocal => references.pagination_prev_non_reciprocal,
+        IssueView::AmpToError => references.amp_to_error,
         IssueView::DirectivesNoindex => row.indexability_status.to_lowercase().contains("noindex"),
         IssueView::ImagesMissingAlt => row.images_missing_alt > 0,
         IssueView::ImagesAltTooLong => row.images_alt_too_long > 0,
@@ -5103,6 +7074,7 @@ fn matches_view(
                 .unwrap_or(0)
                 > 1
         }
+        IssueView::ExactDuplicate => is_exact_duplicate_record(row, exact_hashes),
         IssueView::BrokenLinks => is_broken_record(row),
         IssueView::SitemapOrphan => {
             row.in_sitemap
@@ -5117,12 +7089,14 @@ fn is_html_audit_view(view: &IssueView) -> bool {
         view,
         IssueView::TitleMissing
             | IssueView::TitleDuplicate
+            | IssueView::TitleMultiple
             | IssueView::TitleTooShort
             | IssueView::TitleTooLong
             | IssueView::TitlePixelTooNarrow
             | IssueView::TitlePixelTooWide
             | IssueView::MetaMissing
             | IssueView::MetaDuplicate
+            | IssueView::MetaMultiple
             | IssueView::MetaTooShort
             | IssueView::MetaTooLong
             | IssueView::MetaPixelTooNarrow
@@ -5136,6 +7110,19 @@ fn is_html_audit_view(view: &IssueView) -> bool {
             | IssueView::TitleSameAsH1
             | IssueView::CanonicalMissing
             | IssueView::CanonicalMultiple
+            | IssueView::CanonicalUncrawled
+            | IssueView::CanonicalToRedirect
+            | IssueView::CanonicalToError
+            | IssueView::CanonicalNonIndexable
+            | IssueView::CanonicalChain
+            | IssueView::CanonicalLoop
+            | IssueView::PaginationNextToError
+            | IssueView::PaginationPrevToError
+            | IssueView::PaginationNextLoop
+            | IssueView::PaginationPrevLoop
+            | IssueView::PaginationNextNonReciprocal
+            | IssueView::PaginationPrevNonReciprocal
+            | IssueView::AmpToError
             | IssueView::ImagesMissingAlt
             | IssueView::ImagesAltTooLong
             | IssueView::SecurityMixedContent
@@ -5153,6 +7140,7 @@ fn is_html_audit_view(view: &IssueView) -> bool {
             | IssueView::HtmlDuplicateIds
             | IssueView::RenderedDomChanged
             | IssueView::NearDuplicate
+            | IssueView::ExactDuplicate
     )
 }
 
@@ -5182,8 +7170,58 @@ pub fn is_success_record(row: &CrawlRecord) -> bool {
     matches!(row.status_code, Some(code) if (200..300).contains(&code))
 }
 
+fn normalized_final_url(value: &str) -> Option<String> {
+    let mut url = url::Url::parse(value.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+/// Hashes shared by complete HTML responses at two or more distinct final URLs.
+/// The hash covers downloaded response bytes, before text selection or rendering.
+pub fn exact_duplicate_hashes(records: &[CrawlRecord]) -> HashSet<String> {
+    let mut groups = HashMap::<&str, (String, bool)>::new();
+    for record in records.iter().filter(|row| is_success_html_record(row)) {
+        let Some(hash) = record
+            .response_hash
+            .as_deref()
+            .filter(|hash| !hash.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(identity) = normalized_final_url(&record.final_url) else {
+            continue;
+        };
+        match groups.entry(hash) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((identity, false));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let (first, distinct) = entry.get_mut();
+                *distinct |= first != &identity;
+            }
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|(hash, (_, distinct))| distinct.then(|| hash.to_string()))
+        .collect()
+}
+
+pub fn is_exact_duplicate_record(record: &CrawlRecord, hashes: &HashSet<String>) -> bool {
+    is_success_html_record(record)
+        && record
+            .response_hash
+            .as_ref()
+            .is_some_and(|hash| hashes.contains(hash))
+        && normalized_final_url(&record.final_url).is_some()
+}
+
 pub fn is_success_html_record(row: &CrawlRecord) -> bool {
     is_success_record(row)
+        && row.indexability_status != "Response body incomplete"
         && row
             .content_type
             .as_deref()
@@ -5310,26 +7348,38 @@ fn row_matches_search(row: &CrawlRecord, search: &str) -> bool {
             .first_inlink_source_position
             .map(|position| position.to_string().contains(search))
             .unwrap_or(false)
-        || row.custom_extractions.iter().any(|extraction| {
-            extraction.name.to_lowercase().contains(search)
-                || extraction
-                    .values
-                    .iter()
-                    .any(|value| value.to_lowercase().contains(search))
-        })
-        || row.custom_searches.iter().any(|custom_search| {
-            custom_search.name.to_lowercase().contains(search)
-                || custom_search.match_count.to_string().contains(search)
-                || custom_search
-                    .snippets
-                    .iter()
-                    .any(|value| value.to_lowercase().contains(search))
-        })
-        || row.structured_data_issues.iter().any(|issue| {
-            issue.severity.to_lowercase().contains(search)
-                || issue.message.to_lowercase().contains(search)
-                || issue.path.to_lowercase().contains(search)
-        })
+        || custom_data_matches_search(
+            &row.custom_extractions,
+            &row.custom_searches,
+            &row.structured_data_issues,
+            search,
+        )
+}
+
+fn custom_data_matches_search(
+    extractions: &[CustomExtractionValue],
+    searches: &[CustomSearchValue],
+    issues: &[StructuredDataIssue],
+    search: &str,
+) -> bool {
+    extractions.iter().any(|extraction| {
+        extraction.name.to_lowercase().contains(search)
+            || extraction
+                .values
+                .iter()
+                .any(|value| value.to_lowercase().contains(search))
+    }) || searches.iter().any(|custom_search| {
+        custom_search.name.to_lowercase().contains(search)
+            || custom_search.match_count.to_string().contains(search)
+            || custom_search
+                .snippets
+                .iter()
+                .any(|value| value.to_lowercase().contains(search))
+    }) || issues.iter().any(|issue| {
+        issue.severity.to_lowercase().contains(search)
+            || issue.message.to_lowercase().contains(search)
+            || issue.path.to_lowercase().contains(search)
+    })
 }
 
 fn link_edge_matches_search(edge: &LinkEdge, search: &str) -> bool {
@@ -5375,8 +7425,9 @@ fn compare_default_row_order(left: &CrawlRecord, right: &CrawlRecord) -> Orderin
 
 fn compare_rows(left: &CrawlRecord, right: &CrawlRecord, sort_by: &str) -> Ordering {
     if let Some(name) = custom_sort_name(sort_by) {
-        return custom_extraction_sort_value(left, &name)
-            .cmp(&custom_extraction_sort_value(right, &name));
+        return custom_extraction_sort_value(&left.custom_extractions, &name).cmp(
+            &custom_extraction_sort_value(&right.custom_extractions, &name),
+        );
     }
     if let Some(name) = custom_search_sort_name(sort_by) {
         return custom_search_sort_value(left, &name).cmp(&custom_search_sort_value(right, &name));
@@ -5401,9 +7452,13 @@ fn compare_rows(left: &CrawlRecord, right: &CrawlRecord, sort_by: &str) -> Order
         "sizeBytes" => left.size_bytes.cmp(&right.size_bytes),
         "depth" => left.depth.cmp(&right.depth),
         "titleLen" => left.title_len.cmp(&right.title_len),
+        "titleCount" => left.title_count.cmp(&right.title_count),
         "titlePixelWidth" => left.title_pixel_width.cmp(&right.title_pixel_width),
         "metaDescription" => left.meta_description.cmp(&right.meta_description),
         "metaDescriptionLen" => left.meta_description_len.cmp(&right.meta_description_len),
+        "metaDescriptionCount" => left
+            .meta_description_count
+            .cmp(&right.meta_description_count),
         "metaDescriptionPixelWidth" => left
             .meta_description_pixel_width
             .cmp(&right.meta_description_pixel_width),
@@ -5414,6 +7469,9 @@ fn compare_rows(left: &CrawlRecord, right: &CrawlRecord, sort_by: &str) -> Order
         "h2Len" => left.h2_len.cmp(&right.h2_len),
         "h2Count" => left.h2_count.cmp(&right.h2_count),
         "canonicalCount" => left.canonical_count.cmp(&right.canonical_count),
+        "relNext" => left.rel_next.cmp(&right.rel_next),
+        "relPrev" => left.rel_prev.cmp(&right.rel_prev),
+        "amphtml" => left.amphtml.cmp(&right.amphtml),
         "wordCount" => left.word_count.cmp(&right.word_count),
         "textToCodeRatio" => left
             .text_to_code_ratio
@@ -5491,9 +7549,8 @@ fn compare_optional_f64(left: Option<f64>, right: Option<f64>) -> Ordering {
     }
 }
 
-fn custom_extraction_sort_value(record: &CrawlRecord, name: &str) -> String {
-    record
-        .custom_extractions
+fn custom_extraction_sort_value(extractions: &[CustomExtractionValue], name: &str) -> String {
+    extractions
         .iter()
         .find(|extraction| extraction.name == name)
         .map(|extraction| extraction.values.join(", ").to_lowercase())
@@ -5537,26 +7594,79 @@ fn compare_link_edges(left: &LinkEdge, right: &LinkEdge, sort_by: &str) -> Order
     }
 }
 
-fn annotate_memory_image_assets(inner: &MemoryStoreInner) -> Vec<ImageAsset> {
-    let size_by_alias = image_size_by_alias(&inner.records);
-    inner
-        .image_assets
-        .iter()
-        .cloned()
-        .map(|mut image| {
-            if let Some(size_bytes) = url_aliases(&image.image_url)
-                .iter()
-                .find_map(|alias| size_by_alias.get(alias).copied())
-            {
-                image.size_bytes = Some(size_bytes);
-                image.oversized = size_bytes > IMAGE_ASSET_OVERSIZE_BYTES;
-            }
-            image
-        })
-        .collect()
+// Record aliases are cached by evidence revision; image references stay live.
+// No crawl records or off-page image strings are decoded into Rust.
+const IMAGE_ASSET_SIZE_CTE: &str = "WITH annotated_images AS (
+    SELECT ia.*, (
+        SELECT sizes.size_bytes
+        FROM json_each(ff_url_aliases(ia.image_url, '', '')) refs
+        JOIN ff_image_record_aliases sizes ON sizes.alias = refs.value
+        ORDER BY sizes.record_id DESC LIMIT 1
+    ) AS size_bytes FROM image_assets ia
+)";
+
+fn image_asset_filter_sql(query: &ImageAssetQuery) -> Result<(String, Vec<String>), StorageError> {
+    let mut clauses = Vec::new();
+    let mut args = Vec::new();
+    if let Some(page_url) = query
+        .page_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        clauses.push(
+            "EXISTS (SELECT 1 FROM json_each(ff_url_aliases(page_url, '', '')) stored
+            JOIN json_each(?) wanted ON stored.value = wanted.value)"
+                .to_string(),
+        );
+        args.push(serde_json::to_string(&sorted_aliases(url_aliases(
+            page_url,
+        )))?);
+    }
+    if query.missing_alt_only {
+        clauses.push("missing_alt != 0".into());
+    }
+    if query.oversized_only {
+        clauses.push(format!("size_bytes > {IMAGE_ASSET_OVERSIZE_BYTES}"));
+    }
+    if let Some(search) = query
+        .global_search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        clauses.push(
+            "(ff_contains(page_url, ?) OR ff_contains(image_url, ?) OR ff_contains(alt_text, ?))"
+                .into(),
+        );
+        args.extend(std::iter::repeat_n(search.to_lowercase(), 3));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+    Ok((where_clause, args))
 }
 
-fn image_size_by_alias(records: &[CrawlRecord]) -> HashMap<String, u64> {
+fn image_asset_sort_column(sort_by: Option<&str>) -> &'static str {
+    match sort_by {
+        None | Some("pageUrl") => "page_url",
+        Some("imageUrl") => "image_url",
+        Some("altText") => "alt_text",
+        Some("altLen") => "alt_len",
+        Some("missingAlt") => "missing_alt",
+        Some("altTooLong") => "alt_too_long",
+        Some("width") => "width",
+        Some("height") => "height",
+        Some("sourcePosition") => "source_position",
+        Some("sizeBytes") => "size_bytes",
+        Some("oversized") => "COALESCE(size_bytes > 204800, 0)",
+        _ => "id",
+    }
+}
+
+fn image_size_by_alias(records: &[CrawlRecord]) -> HashMap<String, (u64, u64)> {
     let mut sizes = HashMap::new();
     for record in records {
         let is_image = record
@@ -5568,41 +7678,10 @@ fn image_size_by_alias(records: &[CrawlRecord]) -> HashMap<String, u64> {
             continue;
         }
         for alias in record_url_aliases(record) {
-            sizes.insert(alias, record.size_bytes as u64);
+            sizes.insert(alias, (record.id, record.size_bytes as u64));
         }
     }
     sizes
-}
-
-fn filter_image_assets(images: &mut Vec<ImageAsset>, query: &ImageAssetQuery) {
-    if let Some(page_url) = query
-        .page_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let page_aliases = url_aliases(page_url);
-        images.retain(|image| {
-            let image_page_aliases = url_aliases(&image.page_url);
-            page_aliases
-                .iter()
-                .any(|alias| image_page_aliases.contains(alias))
-        });
-    }
-    if query.oversized_only {
-        images.retain(|image| image.oversized);
-    }
-    if query.missing_alt_only {
-        images.retain(|image| image.missing_alt);
-    }
-    if let Some(search) = query
-        .global_search
-        .as_ref()
-        .map(|value| value.trim().to_lowercase())
-        .filter(|value| !value.is_empty())
-    {
-        images.retain(|image| image_asset_matches_search(image, &search));
-    }
 }
 
 fn image_asset_matches_search(image: &ImageAsset, search: &str) -> bool {
@@ -5614,18 +7693,6 @@ fn image_asset_matches_search(image: &ImageAsset, search: &str) -> bool {
             .unwrap_or_default()
             .to_lowercase()
             .contains(search)
-}
-
-fn sort_image_assets(images: &mut [ImageAsset], sort_by: &str, sort_dir: &SortDirection) {
-    images.sort_by(|left, right| {
-        let ordering = compare_image_assets(left, right, sort_by)
-            .then_with(|| left.page_url.cmp(&right.page_url))
-            .then_with(|| left.source_position.cmp(&right.source_position));
-        match sort_dir {
-            SortDirection::Asc => ordering,
-            SortDirection::Desc => ordering.reverse(),
-        }
-    });
 }
 
 fn compare_image_assets(left: &ImageAsset, right: &ImageAsset, sort_by: &str) -> Ordering {
@@ -5676,8 +7743,326 @@ fn compare_anchor_text_rows(
 }
 
 #[cfg(test)]
+mod canonical_tests;
+
+#[cfg(test)]
+mod pagination_tests;
+
+#[cfg(test)]
+mod pagespeed_tests;
+
+#[cfg(test)]
+mod amp_tests;
+
+#[cfg(test)]
+mod multiple_metadata_tests;
+
+#[cfg(test)]
+mod grid_filter_tests;
+
+#[cfg(test)]
+mod exact_duplicate_tests;
+
+#[cfg(test)]
+mod sitemap_validation_tests;
+
+#[cfg(test)]
+mod graph_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_ingestion_lookups_do_not_scan_unrelated_records() {
+        for row_count in [50, 500] {
+            let store = MemoryStore::new();
+            for index in 0..row_count {
+                let mut record =
+                    CrawlRecord::pending(format!("https://example.com/page/{index}"), index);
+                record.status_code = Some(200);
+                store.upsert(record);
+            }
+            let target = format!("https://example.com/page/{}", row_count - 1);
+            URL_ALIAS_EXPANSIONS.with(|count| count.set(0));
+            let edge = store.add_link_edge(test_edge(
+                "https://example.com/not-stored-yet",
+                &format!("{target}#section"),
+                LinkType::Internal,
+            ));
+            let edge_work = URL_ALIAS_EXPANSIONS.with(|count| count.replace(0));
+            store.add_inlink(&target);
+            let inlink_work = URL_ALIAS_EXPANSIONS.with(|count| count.get());
+            eprintln!(
+                "Memory lookup: {row_count} records, {edge_work} edge and {inlink_work} inlink alias expansions"
+            );
+            assert_eq!(edge.source_status_code, None);
+            assert_eq!(edge.target_status_code, Some(200));
+            assert_eq!(edge.target_depth, Some(row_count - 1));
+            assert_eq!(store.records().last().unwrap().inlink_count, 1);
+            assert!(
+                edge_work <= 4 && inlink_work <= 8,
+                "Lookup scanned {row_count} records: {edge_work} edge and {inlink_work} inlink alias expansions"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_progress_summary_does_not_annotate_link_sources() {
+        let store = ActiveStore::memory();
+        for path in ["source", "target"] {
+            let mut record = CrawlRecord::pending(format!("https://example.com/{path}"), 1);
+            record.status_code = Some(200);
+            record.content_type = Some("text/html".into());
+            record.title = Some("Shared title".into());
+            record.canonical = Some("https://example.com/uncrawled".into());
+            record.in_sitemap = true;
+            store.upsert(record);
+        }
+        store.add_link_edge(test_edge(
+            "https://example.com/source",
+            "https://example.com/target",
+            LinkType::Internal,
+        ));
+        store.add_inlink("https://example.com/target");
+        let expected = summarize_without_canonicals(&store.records());
+        URL_ALIAS_EXPANSIONS.with(|count| count.set(0));
+        let summary = store.progress_summary();
+        let alias_work = URL_ALIAS_EXPANSIONS.with(|count| count.get());
+        assert_eq!(
+            serde_json::to_value(&summary).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert_eq!(summary.title_duplicate, 2);
+        assert_eq!(summary.sitemap_orphans, 1);
+        assert_eq!(alias_work, 0, "Progress rebuilt URL/source annotations");
+    }
+
+    #[test]
+    fn memory_alias_status_lookup_preserves_sqlite_precedence_and_updates() {
+        for store in [
+            ActiveStore::memory(),
+            ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+        ] {
+            let mut first = CrawlRecord::pending("https://example.com/original".into(), 1);
+            first.storage_key = "list:1:https://example.com/original".into();
+            first.final_url = "https://example.com/shared".into();
+            first.status_code = Some(301);
+            let mut first = store.upsert(first);
+            let original_id = first.id;
+            for (key, depth, status) in [
+                ("https://example.com/shared", 2, 404),
+                ("list:3:https://example.com/shared", 3, 503),
+            ] {
+                let mut record = CrawlRecord::pending("https://example.com/shared".into(), depth);
+                record.storage_key = key.into();
+                record.status_code = Some(status);
+                store.upsert(record);
+            }
+            let edge = store.add_link_edge(test_edge(
+                "https://example.com/shared#fragment",
+                "https://example.com/shared",
+                LinkType::Internal,
+            ));
+            assert_eq!(edge.source_status_code, Some(301));
+            assert_eq!(edge.source_depth, 1);
+            assert_eq!(edge.target_status_code, Some(301));
+            assert_eq!(edge.target_depth, Some(1));
+
+            first.url = "https://example.com/replacement".into();
+            first.final_url = "https://example.com/".into();
+            first.status_code = Some(200);
+            first.depth = 4;
+            assert_eq!(store.upsert(first.clone()).id, original_id);
+            for source in [&first.url, &first.storage_key] {
+                let edge = store.add_link_edge(test_edge(
+                    source,
+                    "https://example.com#fragment",
+                    LinkType::Internal,
+                ));
+                assert_eq!(edge.source_status_code, Some(200));
+                assert_eq!(edge.source_depth, 4);
+                assert_eq!(edge.target_status_code, Some(200));
+                assert_eq!(edge.target_depth, Some(4));
+            }
+            let edge = store.add_link_edge(test_edge(
+                "https://example.com/shared",
+                "https://example.com/shared#fragment",
+                LinkType::Internal,
+            ));
+            assert_eq!(edge.source_status_code, Some(404));
+            assert_eq!(edge.source_depth, 2);
+            assert_eq!(edge.target_status_code, Some(404));
+            assert_eq!(edge.target_depth, Some(2));
+
+            let mut missing = test_edge(
+                "https://example.com/original",
+                "https://example.com/unknown",
+                LinkType::Internal,
+            );
+            missing.source_status_code = Some(202);
+            missing.source_depth = 9;
+            missing.target_status_code = Some(418);
+            missing.target_depth = Some(10);
+            let edge = store.add_link_edge(missing);
+            assert_eq!(edge.source_status_code, Some(202));
+            assert_eq!(edge.source_depth, 9);
+            assert_eq!(edge.target_status_code, Some(418));
+            assert_eq!(edge.target_depth, Some(10));
+
+            first.final_url = "https://example.com/shared".into();
+            first.status_code = Some(201);
+            first.depth = 5;
+            store.upsert(first);
+            let edge = store.add_link_edge(test_edge(
+                "https://example.com/",
+                "https://example.com/shared",
+                LinkType::Internal,
+            ));
+            assert_eq!(edge.source_status_code, None);
+            assert_eq!(edge.target_status_code, Some(201));
+            assert_eq!(edge.target_depth, Some(5));
+        }
+    }
+
+    #[test]
+    fn memory_alias_lookup_normalizes_stored_urls() {
+        let store = MemoryStore::new();
+        let mut record = CrawlRecord::pending("HTTPS://EXAMPLE.COM/#section".into(), 2);
+        record.status_code = Some(200);
+        store.upsert(record);
+        let edge = store.add_link_edge(test_edge(
+            "https://example.com",
+            "https://example.com/#different-fragment",
+            LinkType::Internal,
+        ));
+        assert_eq!(edge.source_status_code, Some(200));
+        assert_eq!(edge.source_depth, 2);
+        assert_eq!(edge.target_status_code, Some(200));
+        assert_eq!(edge.target_depth, Some(2));
+        store.add_inlink("https://example.com/");
+        assert_eq!(store.records()[0].inlink_count, 1);
+    }
+
+    #[test]
+    fn memory_alias_inlinks_preserve_sqlite_duplicates_replacement_and_clear() {
+        for store in [
+            ActiveStore::memory(),
+            ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+        ] {
+            store.add_inlink("https://example.com");
+            let mut first = CrawlRecord::pending("https://example.com/".into(), 1);
+            first.storage_key = "list:1:https://example.com/".into();
+            first.status_code = Some(200);
+            let mut first = store.upsert(first);
+            let mut second = first.clone();
+            second.storage_key = "list:2:https://example.com/".into();
+            store.upsert(second);
+            store.add_inlink("https://example.com/");
+            assert!(
+                store
+                    .records()
+                    .iter()
+                    .all(|record| record.inlink_count == 2)
+            );
+
+            first.url = "https://example.com/moved".into();
+            first.final_url = first.url.clone();
+            first.inlink_count = 0;
+            store.upsert(first);
+            store.add_inlink("https://example.com");
+            store.add_inlink("https://example.com/moved");
+            store.add_inlink("https://example.com/absent");
+            let records = store.records();
+            assert_eq!(records[0].inlink_count, 1);
+            assert_eq!(records[1].inlink_count, 3);
+
+            store.clear();
+            store.upsert(CrawlRecord::pending(
+                "https://example.com/unrelated".into(),
+                0,
+            ));
+            assert_eq!(store.records().len(), 1);
+            let edge = store.add_link_edge(test_edge(
+                "list:1:https://example.com/",
+                "https://example.com/",
+                LinkType::Internal,
+            ));
+            assert_eq!(edge.source_status_code, None);
+            assert_eq!(edge.target_depth, None);
+            store.add_inlink("https://example.com");
+            assert_eq!(store.records()[0].inlink_count, 0);
+            let fresh = store.upsert(CrawlRecord::pending("https://example.com/".into(), 1));
+            assert_eq!(fresh.inlink_count, 1);
+        }
+    }
+
+    #[test]
+    fn sqlite_sitemap_membership_updates_do_not_scan_the_crawl() {
+        let mut measurements = Vec::new();
+        for row_count in [500, 2_000] {
+            let store = SqliteStore::in_memory().unwrap();
+            for index in 0..row_count {
+                store.upsert(CrawlRecord::pending(
+                    format!("https://example.com/page/{index}"),
+                    0,
+                ));
+            }
+            let conn = store.connection().unwrap();
+            let mut statement = conn.prepare_cached(MARK_SITEMAP_URLS_SQL).unwrap();
+            assert_eq!(
+                statement.execute(["https://example.com/page/250"]).unwrap(),
+                1
+            );
+            let steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+            eprintln!("Sitemap membership update: {row_count} rows, {steps} VM steps");
+            measurements.push(steps);
+        }
+        assert!(
+            measurements.iter().all(|steps| *steps < 300),
+            "One sitemap membership update scanned the crawl: {measurements:?} VM steps"
+        );
+        assert!(
+            measurements[1] <= measurements[0] + 10,
+            "Sitemap membership update cost grew with the crawl: {measurements:?}"
+        );
+    }
+
+    #[test]
+    fn sitemap_discovery_updates_existing_records_in_both_stores() {
+        for store in [
+            ActiveStore::memory(),
+            ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+        ] {
+            for (path, target) in [
+                ("original", "target"),
+                ("alias", "target"),
+                ("other", "other"),
+            ] {
+                let mut record = CrawlRecord::pending(format!("https://example.com/{path}"), 0);
+                record.final_url = format!("https://example.com/{target}");
+                store.upsert(record);
+            }
+            assert_eq!(store.summary().sitemap_orphans, 0);
+            let urls = [
+                "https://example.com/target".to_string(),
+                "https://example.com/unknown".to_string(),
+            ];
+            store.mark_sitemap_urls(&urls);
+            store.mark_sitemap_urls(&urls);
+            store.mark_sitemap_urls(&[]);
+            assert_eq!(store.summary().sitemap_orphans, 2);
+            let rows = store.query(GridQuery::default()).rows;
+            assert_eq!(
+                rows.len(),
+                3,
+                "Sitemap metadata must not create or merge URL records"
+            );
+            assert_eq!(rows.iter().filter(|row| row.in_sitemap).count(), 2);
+            store.mark_sitemap_urls(&["https://example.com/other".to_string()]);
+            assert_eq!(store.summary().sitemap_orphans, 3);
+        }
+    }
 
     #[test]
     fn memory_on_page_audits_require_successful_html() {
@@ -5692,6 +8077,13 @@ mod tests {
     fn assert_on_page_audits_require_successful_html(store: impl CrawlStore) {
         let empty = hreflang_record("https://example.com/empty", Vec::new(), None);
         store.upsert(empty.clone());
+        let mut incomplete = empty.clone();
+        incomplete.url = "https://example.com/incomplete".to_string();
+        incomplete.final_url = incomplete.url.clone();
+        incomplete.storage_key = incomplete.url.clone();
+        incomplete.indexability_status = "Response body incomplete".to_string();
+        incomplete.error = Some("Response exceeds the configured download limit".to_string());
+        store.upsert(incomplete);
         for (path, status, content_type) in [
             ("image.png", Some(200), Some("image/png")),
             ("missing", Some(404), Some("text/html")),
@@ -6052,6 +8444,253 @@ mod tests {
         });
 
         assert_eq!(response.total, 2);
+    }
+
+    #[test]
+    fn sqlite_duplicate_and_regex_queries_only_decode_the_requested_window() {
+        let store = SqliteStore::in_memory().unwrap();
+        let memory = MemoryStore::new();
+        for index in 0..8 {
+            let mut record = CrawlRecord::pending(format!("https://example.test/{index}"), 0);
+            record.status_code = Some(if index == 7 { 404 } else { 200 });
+            record.content_type = Some("text/html".into());
+            record.title = Some(
+                if index % 2 == 0 {
+                    "  CAFÉ\t TITLE  "
+                } else {
+                    "café title"
+                }
+                .into(),
+            );
+            record.meta_description = record.title.clone();
+            record.h1 = record.title.clone();
+            record.h2 = record.title.clone();
+            store.try_upsert(record.clone()).unwrap();
+            memory.upsert(record);
+        }
+        // Unselected large/invalid payloads must never be decoded by a paged query.
+        store.connection().unwrap().execute("UPDATE crawl_records SET response_time_ms = 'invalid-integer' WHERE url = 'https://example.test/6'", []).unwrap();
+        assert!(store.try_records().is_err());
+        for view in [
+            IssueView::All,
+            IssueView::TitleDuplicate,
+            IssueView::MetaDuplicate,
+            IssueView::H1Duplicate,
+            IssueView::H2Duplicate,
+        ] {
+            for pattern in [None, Some("/[0-4]$"), Some("[")] {
+                let query = GridQuery {
+                    view: view.clone(),
+                    segment_pattern: pattern.map(str::to_string),
+                    segment_regex: pattern.is_some(),
+                    offset: 1,
+                    limit: 2,
+                    sort_by: Some("url".into()),
+                    ..GridQuery::default()
+                };
+                let actual = store.try_query(query.clone()).unwrap();
+                let expected = memory.query(query);
+                assert_eq!(actual.total, expected.total, "{view:?} {pattern:?}");
+                assert_eq!(
+                    actual.rows.iter().map(|row| &row.url).collect::<Vec<_>>(),
+                    expected.rows.iter().map(|row| &row.url).collect::<Vec<_>>()
+                );
+                assert_eq!(actual.summary.title_duplicate, 7);
+            }
+        }
+    }
+
+    #[test]
+    fn sqlite_search_and_list_order_match_memory_for_duplicate_and_regex_pages() {
+        let store = SqliteStore::in_memory().unwrap();
+        let memory = MemoryStore::new();
+        for (index, path) in ["a_b", "axb", "100%_saved"].into_iter().enumerate() {
+            let mut record = CrawlRecord::pending(format!("https://example.test/{path}"), 0);
+            record.list_position = Some([2, 1, 3][index]);
+            record.status_code = Some(200);
+            record.content_type = Some("text/html".into());
+            record.title = Some("CAFÉ".into());
+            record.meta_description = Some("Keep  spaces".into());
+            record.js_rendered = index == 0;
+            record.custom_extractions = vec![
+                CustomExtractionValue {
+                    name: "Code".into(),
+                    values: vec!["ÜBER".into()],
+                },
+                CustomExtractionValue {
+                    name: "Order".into(),
+                    values: vec!["same".into(), ["z", "a", "m"][index].into()],
+                },
+            ];
+            store.try_upsert(record.clone()).unwrap();
+            memory.upsert(record);
+        }
+        for (position, anchor) in [(1, "INLINKONLY"), (2, "LaterOnly")] {
+            let mut edge = test_edge(
+                "https://example.test/source",
+                "https://example.test/a_b",
+                LinkType::Internal,
+            );
+            edge.anchor_text = anchor.into();
+            edge.source_position = position;
+            edge.discovery_order = u64::from(position);
+            store.add_link_edge(edge.clone());
+            memory.add_link_edge(edge);
+        }
+        for (view, regex) in [
+            (IssueView::All, false),
+            (IssueView::TitleDuplicate, false),
+            (IssueView::All, true),
+        ] {
+            for search in [
+                None,
+                Some("café"),
+                Some("a_b"),
+                Some("%"),
+                Some("true"),
+                Some("false"),
+                Some("über"),
+                Some("values"),
+                Some("keep  spaces"),
+                Some("keep spaces"),
+                Some("inlinkonly"),
+                Some("lateronly"),
+            ] {
+                let query = GridQuery {
+                    view: view.clone(),
+                    global_search: search.map(str::to_string),
+                    segment_pattern: regex.then(|| "example".into()),
+                    segment_regex: regex,
+                    limit: 2,
+                    ..GridQuery::default()
+                };
+                let expected = memory.query(query.clone());
+                let actual = store.try_query(query).unwrap();
+                assert_eq!(actual.total, expected.total, "{view:?} {regex} {search:?}");
+                assert_eq!(
+                    actual.rows.iter().map(|row| &row.url).collect::<Vec<_>>(),
+                    expected.rows.iter().map(|row| &row.url).collect::<Vec<_>>(),
+                    "{view:?} {regex} {search:?}"
+                );
+            }
+            for sort_by in [
+                "custom:Order:0",
+                "firstInlinkSourceUrl",
+                "firstInlinkSourcePosition",
+                "unknown",
+            ] {
+                for sort_dir in [SortDirection::Asc, SortDirection::Desc] {
+                    let query = GridQuery {
+                        view: view.clone(),
+                        sort_by: Some(sort_by.into()),
+                        sort_dir,
+                        ..GridQuery::default()
+                    };
+                    let expected = memory.query(query.clone());
+                    let actual = store.try_query(query).unwrap();
+                    assert_eq!(
+                        actual.rows.iter().map(|row| &row.url).collect::<Vec<_>>(),
+                        expected.rows.iter().map(|row| &row.url).collect::<Vec<_>>(),
+                        "{sort_by}"
+                    );
+                }
+            }
+        }
+        for pattern in ["a_b", "%", "["] {
+            let query = GridQuery {
+                segment_pattern: Some(pattern.into()),
+                ..GridQuery::default()
+            };
+            assert_eq!(
+                store.try_query(query.clone()).unwrap().total,
+                memory.query(query).total,
+                "{pattern}"
+            );
+        }
+        for search in ["inlinkonly", "a_b", "a%b", "_"] {
+            let query = LinkEdgeQuery {
+                global_search: Some(search.into()),
+                ..LinkEdgeQuery::default()
+            };
+            assert_eq!(
+                store.try_link_edges(query.clone()).unwrap().total,
+                memory.link_edges(query).total,
+                "links: {search}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_reuses_summary_until_the_dataset_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let store = SqliteStore::in_memory().unwrap();
+        let work = Arc::new(AtomicUsize::new(0));
+        let calls = work.clone();
+        store
+            .connection()
+            .unwrap()
+            .create_scalar_function(
+                "ff_text_key",
+                1,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                move |context| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(normalize_text_key(
+                        context
+                            .get::<Option<String>>(0)?
+                            .as_deref()
+                            .unwrap_or_default(),
+                    ))
+                },
+            )
+            .unwrap();
+        let mut record = CrawlRecord::pending("https://example.test/one".into(), 0);
+        record.status_code = Some(200);
+        record.content_type = Some("text/html".into());
+        record.title = Some("Shared title".into());
+        store.try_upsert(record.clone()).unwrap();
+        assert_eq!(store.try_summary().unwrap().total, 1);
+        let initial_work = work.load(Ordering::Relaxed);
+        assert!(initial_work > 0);
+        store.try_query(GridQuery::default()).unwrap();
+        assert_eq!(
+            work.load(Ordering::Relaxed),
+            initial_work,
+            "Paging unchanged results must reuse summary aggregates"
+        );
+        record.url = "https://example.test/two".into();
+        record.final_url = record.url.clone();
+        record.storage_key = record.url.clone();
+        store.try_upsert(record).unwrap();
+        let summary = store.try_summary().unwrap();
+        assert_eq!((summary.total, summary.title_duplicate), (2, 2));
+        assert!(work.load(Ordering::Relaxed) > initial_work);
+        store.try_clear().unwrap();
+        assert_eq!(store.try_summary().unwrap().total, 0);
+    }
+
+    #[test]
+    fn sqlite_summary_observes_writes_from_another_connection() {
+        let path = std::env::temp_dir().join(format!(
+            "ferrous-frog-summary-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let reader = SqliteStore::open(&path).unwrap();
+        let writer = SqliteStore::open(&path).unwrap();
+        assert_eq!(reader.try_summary().unwrap().total, 0);
+        writer
+            .try_upsert(CrawlRecord::pending("https://example.test/".into(), 0))
+            .unwrap();
+        assert_eq!(reader.try_summary().unwrap().total, 1);
+        writer.try_clear().unwrap();
+        assert_eq!(reader.try_summary().unwrap().total, 0);
+        drop(reader);
+        drop(writer);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -6758,6 +9397,193 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_hreflang_work_does_not_multiply_shared_redirect_aliases() {
+        let mut work = Vec::new();
+        for count in [200, 400] {
+            let store = SqliteStore::in_memory().unwrap();
+            for index in 0..count {
+                let mut record = hreflang_record(
+                    &format!("https://example.com/redirect-{index}"),
+                    vec![hreflang_link("en", "https://example.com/en")],
+                    Some("https://example.com/en"),
+                );
+                record.final_url = "https://example.com/en".into();
+                store.try_upsert(record).unwrap();
+            }
+            let conn = store.connection().unwrap();
+            let mut steps = 0;
+            for view in [
+                IssueView::HreflangMissingReturnLink,
+                IssueView::HreflangNonCanonicalTarget,
+            ] {
+                let (filter, args) = query_filter_sql(&GridQuery {
+                    view,
+                    ..GridQuery::default()
+                });
+                let mut statement = conn
+                    .prepare(&format!(
+                        "{HREFLANG_AUDIT_CTES}SELECT COUNT(*) FROM crawl_records{filter}"
+                    ))
+                    .unwrap();
+                let total: i64 = statement
+                    .query_row(rusqlite::params_from_iter(args), |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    total, 0,
+                    "Shared final URLs still recognize self hreflang and canonicals"
+                );
+                steps += statement.get_status(rusqlite::StatementStatus::VmStep);
+            }
+            work.push(steps);
+        }
+        assert!(
+            work[1] < work[0] * 3,
+            "Doubling shared aliases must not quadruple SQLite work: {work:?}"
+        );
+    }
+
+    #[test]
+    fn sqlite_hreflang_queries_match_memory_without_decoding_other_pages() {
+        let store = SqliteStore::in_memory().unwrap();
+        let memory = MemoryStore::new();
+        let mut records = vec![
+            hreflang_record(
+                "https://example.com/en",
+                vec![hreflang_link("fr", "https://example.com/fr#section")],
+                None,
+            ),
+            hreflang_record(
+                "https://example.com/fr",
+                vec![hreflang_link("en", "https://example.com/en#return")],
+                Some("https://example.com/fr-new"),
+            ),
+            hreflang_record(
+                "https://example.com/missing-return",
+                vec![hreflang_link("de", "https://example.com/de#hint")],
+                None,
+            ),
+            hreflang_record(
+                "https://example.com/de",
+                vec![],
+                Some("https://example.com/preferred-de"),
+            ),
+            hreflang_record(
+                "https://example.com/unseen",
+                vec![hreflang_link("fr", "https://uncrawled.test/fr")],
+                None,
+            ),
+            hreflang_record(
+                "https://example.com/invalid",
+                vec![HreflangLink {
+                    valid: false,
+                    ..hreflang_link("bad_locale", "https://example.com/de")
+                }],
+                None,
+            ),
+            hreflang_record(
+                "https://host-only.test/",
+                vec![hreflang_link("en", "https://host-only.test")],
+                Some("https://host-only.test"),
+            ),
+            hreflang_record(
+                "https://example.com/failure",
+                vec![hreflang_link("de", "https://example.com/de")],
+                None,
+            ),
+        ];
+        records[1].final_url = "https://example.com/fr-new".into();
+        records[3].hreflang_links = vec![HreflangLink {
+            valid: false,
+            ..hreflang_link("bad_locale", "https://example.com/missing-return")
+        }];
+        records[7].status_code = Some(404);
+        // A later List duplicate must not replace the earliest target's evidence.
+        let mut duplicate = records[3].clone();
+        duplicate.url = "https://example.com/de#hint".into();
+        duplicate.storage_key = "list:2:https://example.com/de".into();
+        duplicate.canonical = Some("https://example.com/de".into());
+        duplicate.hreflang_links = vec![hreflang_link("en", "https://example.com/missing-return")];
+        records.push(duplicate);
+        let mut duplicate_self = records[6].clone();
+        duplicate_self.storage_key = "list:2:https://host-only.test/".into();
+        records.push(duplicate_self);
+        for record in records {
+            store.try_upsert(record.clone()).unwrap();
+            memory.upsert(record);
+        }
+        for view in [
+            IssueView::HreflangMissingReturnLink,
+            IssueView::HreflangNonCanonicalTarget,
+        ] {
+            let query = GridQuery {
+                view: view.clone(),
+                ..GridQuery::default()
+            };
+            let expected = memory.query(query.clone());
+            assert_eq!(expected.total, 1, "{view:?}");
+            assert_eq!(expected.rows[0].url, "https://example.com/missing-return");
+            // Audit joins need only the target's URL, canonical and hreflang fields.
+            store.connection().unwrap().execute("UPDATE crawl_records SET response_time_ms = 'unselected-payload' WHERE url = 'https://example.com/de'", []).unwrap();
+            assert!(store.try_records().is_err());
+            for (offset, search) in [
+                (0, None),
+                (1, None),
+                (0, Some("missing")),
+                (0, Some("no-match")),
+            ] {
+                let query = GridQuery {
+                    offset,
+                    limit: 1,
+                    global_search: search.map(str::to_string),
+                    sort_by: Some("url".into()),
+                    sort_dir: SortDirection::Desc,
+                    ..query.clone()
+                };
+                let actual = store.try_query(query.clone()).unwrap();
+                let expected = memory.query(query);
+                assert_eq!(
+                    actual.total, expected.total,
+                    "{view:?} offset={offset} search={search:?}"
+                );
+                assert_eq!(
+                    actual
+                        .rows
+                        .iter()
+                        .map(|row| &row.storage_key)
+                        .collect::<Vec<_>>(),
+                    expected
+                        .rows
+                        .iter()
+                        .map(|row| &row.storage_key)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        // New return/canonical evidence must take effect on the next query.
+        let changed = hreflang_record(
+            "https://example.com/de",
+            vec![hreflang_link("en", "https://example.com/missing-return")],
+            Some("https://example.com/de"),
+        );
+        store.try_upsert(changed).unwrap();
+        for view in [
+            IssueView::HreflangMissingReturnLink,
+            IssueView::HreflangNonCanonicalTarget,
+        ] {
+            assert_eq!(
+                store
+                    .try_query(GridQuery {
+                        view,
+                        ..GridQuery::default()
+                    })
+                    .unwrap()
+                    .total,
+                0
+            );
+        }
+    }
+
+    #[test]
     fn sqlite_hreflang_flags_missing_return_links() {
         let store = SqliteStore::in_memory().unwrap();
         store.upsert(hreflang_record(
@@ -6995,7 +9821,7 @@ mod tests {
                 "OK".to_string()
             };
             record.content_type = Some("text/html; charset=utf-8".to_string());
-            record.title = Some(format!("Synthetic page {index}"));
+            record.title = Some(format!("Synthetic page {}", index % 10_000));
             record.title_len = record.title.as_deref().unwrap_or_default().len();
             record.meta_description =
                 Some(format!("Synthetic benchmark description for page {index}."));
@@ -7003,6 +9829,20 @@ mod tests {
                 record.meta_description.as_deref().unwrap_or_default().len();
             record.h1 = Some(format!("Synthetic page {index}"));
             record.h1_len = record.h1.as_deref().unwrap_or_default().len();
+            if index % 100 == 0 && index + 1 < url_count {
+                record.hreflang_links = vec![hreflang_link(
+                    "fr",
+                    &format!("https://synthetic.example.com/page/{:08}", index + 1),
+                )];
+                record.hreflang_count = 1;
+            }
+            if index % 100 == 1 {
+                record.canonical = Some(format!(
+                    "https://synthetic.example.com/page/{:08}",
+                    index + 1
+                ));
+                record.canonical_count = 1;
+            }
             record.outlink_count = 12;
             record.internal_outlink_count = 11;
             record.external_outlink_count = 1;
@@ -7012,7 +9852,15 @@ mod tests {
         }
 
         let elapsed = started.elapsed();
+        eprintln!(
+            "Insert: {url_count} URLs, {:.2?}, {:.2} URLs/sec",
+            elapsed,
+            url_count as f64 / elapsed.as_secs_f64().max(0.001)
+        );
+        let queried = std::time::Instant::now();
         let summary = store.summary();
+        eprintln!("Summary: {:.2?}", queried.elapsed());
+        let queried = std::time::Instant::now();
         let tail = store.query(GridQuery {
             offset: url_count.saturating_sub(10),
             limit: 10,
@@ -7022,10 +9870,54 @@ mod tests {
 
         assert_eq!(summary.total, url_count);
         assert!(!tail.rows.is_empty() || url_count == 0);
+        eprintln!("Last page including summary: {:.2?}", queried.elapsed());
+        for (name, query) in [
+            (
+                "Duplicate title page",
+                GridQuery {
+                    view: IssueView::TitleDuplicate,
+                    limit: 10,
+                    ..GridQuery::default()
+                },
+            ),
+            (
+                "Regex page",
+                GridQuery {
+                    segment_pattern: Some("/page/.*[13579]$".into()),
+                    segment_regex: true,
+                    limit: 10,
+                    ..GridQuery::default()
+                },
+            ),
+            (
+                "Hreflang return-link page",
+                GridQuery {
+                    view: IssueView::HreflangMissingReturnLink,
+                    limit: 10,
+                    ..GridQuery::default()
+                },
+            ),
+            (
+                "Hreflang canonical-target page",
+                GridQuery {
+                    view: IssueView::HreflangNonCanonicalTarget,
+                    limit: 10,
+                    ..GridQuery::default()
+                },
+            ),
+        ] {
+            let queried = std::time::Instant::now();
+            let result = store.try_query(query).unwrap();
+            assert!(result.rows.len() <= 10);
+            eprintln!(
+                "{name} including summary: {:.2?}, {} matching URLs",
+                queried.elapsed(),
+                result.total
+            );
+        }
         eprintln!(
-            "Inserted and queried {url_count} synthetic URLs in {:.2?} ({:.2} URLs/sec)",
-            elapsed,
-            url_count as f64 / elapsed.as_secs_f64().max(0.001)
+            "Database size: {} bytes",
+            std::fs::metadata(&path).unwrap().len()
         );
 
         drop(store);

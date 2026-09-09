@@ -9,6 +9,6 @@ authors.workspace = true
 csv.workspace = true
 ferrous-frog-storage.workspace = true
 minijinja.workspace = true
-rust_xlsxwriter.workspace = true
+rust_xlsxwriter = { workspace = true, features = ["constant_memory"] }
 serde.workspace = true
 serde_json.workspace = true

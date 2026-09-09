@@ -1,6 +1,7 @@
 use ferrous_frog_storage::{
-    CrawlRecord, Issue, IssueView, Severity, is_no_response_record, is_success_html_record,
-    is_success_record,
+    CanonicalDiagnostics, CrawlRecord, Issue, IssueView, ReferenceDiagnostics, Severity,
+    exact_duplicate_hashes, is_exact_duplicate_record, is_no_response_record,
+    is_success_html_record, is_success_record, reference_diagnostics,
 };
 use std::collections::HashMap;
 
@@ -39,8 +40,10 @@ pub fn analyze_records(records: &[CrawlRecord]) -> Vec<Issue> {
     let near_duplicate_counts =
         cluster_counts(html_records.filter_map(|record| record.near_duplicate_cluster_id));
     let mut issues = Vec::new();
+    let references = reference_diagnostics(records);
+    let exact_hashes = exact_duplicate_hashes(records);
 
-    for record in records {
+    for (record, references) in records.iter().zip(references) {
         response_issues(record, &mut issues);
         directive_issues(record, &mut issues);
         security_issues(record, &mut issues);
@@ -52,7 +55,8 @@ pub fn analyze_records(records: &[CrawlRecord]) -> Vec<Issue> {
         meta_issues(record, &meta_counts, &mut issues);
         h1_issues(record, &h1_counts, &mut issues);
         h2_issues(record, &h2_counts, &mut issues);
-        canonical_issues(record, &mut issues);
+        canonical_issues(record, references.canonical, &mut issues);
+        reference_target_issues(record, references, &mut issues);
         image_issues(record, &mut issues);
         mobile_issues(record, &mut issues);
         hreflang_issues(record, &mut issues);
@@ -60,6 +64,18 @@ pub fn analyze_records(records: &[CrawlRecord]) -> Vec<Issue> {
         html_validation_issues(record, &mut issues);
         rendering_issues(record, &mut issues);
         near_duplicate_issues(record, &near_duplicate_counts, &mut issues);
+        if is_exact_duplicate_record(record, &exact_hashes) {
+            issues.push(issue(
+                "content.exact_duplicate",
+                IssueView::ExactDuplicate,
+                Severity::Info,
+                record,
+                format!(
+                    "Identical downloaded response body (hash {}) at multiple final URLs",
+                    record.response_hash.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
     }
 
     issues
@@ -103,6 +119,15 @@ fn response_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
 }
 
 fn title_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &mut Vec<Issue>) {
+    if let Some(count) = record.title_count.filter(|count| *count > 1) {
+        issues.push(issue(
+            "title.multiple",
+            IssueView::TitleMultiple,
+            Severity::Warning,
+            record,
+            format!("Page contains {count} title elements"),
+        ));
+    }
     let title = record.title.as_deref().unwrap_or("").trim();
     if title.is_empty() {
         issues.push(issue(
@@ -160,6 +185,15 @@ fn title_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &
 }
 
 fn meta_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &mut Vec<Issue>) {
+    if let Some(count) = record.meta_description_count.filter(|count| *count > 1) {
+        issues.push(issue(
+            "meta_description.multiple",
+            IssueView::MetaMultiple,
+            Severity::Warning,
+            record,
+            format!("Page contains {count} meta description elements"),
+        ));
+    }
     let meta = record.meta_description.as_deref().unwrap_or("").trim();
     if meta.is_empty() {
         issues.push(issue(
@@ -274,7 +308,11 @@ fn h2_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &mut
     }
 }
 
-fn canonical_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
+fn canonical_issues(
+    record: &CrawlRecord,
+    diagnostic: CanonicalDiagnostics,
+    issues: &mut Vec<Issue>,
+) {
     if record.canonical.as_deref().unwrap_or("").trim().is_empty() {
         issues.push(issue(
             "canonical.missing",
@@ -293,6 +331,136 @@ fn canonical_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
             record,
             "Multiple canonical link elements".to_string(),
         ));
+    }
+    let target = record.canonical.as_deref().unwrap_or_default();
+    for (matches, rule, view, severity, message) in [
+        (
+            diagnostic.uncrawled,
+            "canonical.uncrawled",
+            IssueView::CanonicalUncrawled,
+            Severity::Info,
+            "Canonical target has not been crawled",
+        ),
+        (
+            diagnostic.to_redirect,
+            "canonical.to_redirect",
+            IssueView::CanonicalToRedirect,
+            Severity::Warning,
+            "Canonical target redirects",
+        ),
+        (
+            diagnostic.to_error,
+            "canonical.to_error",
+            IssueView::CanonicalToError,
+            Severity::Error,
+            "Canonical target has a response or fetch error",
+        ),
+        (
+            diagnostic.non_indexable,
+            "canonical.non_indexable",
+            IssueView::CanonicalNonIndexable,
+            Severity::Warning,
+            "Canonical target is non-indexable or blocked by robots.txt",
+        ),
+        (
+            diagnostic.chain,
+            "canonical.chain",
+            IssueView::CanonicalChain,
+            Severity::Warning,
+            "Canonical target declares a further canonical",
+        ),
+        (
+            diagnostic.loop_detected,
+            "canonical.loop",
+            IssueView::CanonicalLoop,
+            Severity::Error,
+            "Canonical path enters a loop",
+        ),
+    ] {
+        if matches {
+            issues.push(issue(
+                rule,
+                view,
+                severity,
+                record,
+                format!("{message}: {target}"),
+            ));
+        }
+    }
+}
+
+fn reference_target_issues(
+    record: &CrawlRecord,
+    diagnostic: ReferenceDiagnostics,
+    issues: &mut Vec<Issue>,
+) {
+    for (matches, rule, label, view, target, severity) in [
+        (
+            diagnostic.pagination_next_to_error,
+            "pagination.next_to_error",
+            "Pagination next target has a response or fetch error",
+            IssueView::PaginationNextToError,
+            &record.rel_next,
+            Severity::Error,
+        ),
+        (
+            diagnostic.pagination_prev_to_error,
+            "pagination.prev_to_error",
+            "Pagination prev target has a response or fetch error",
+            IssueView::PaginationPrevToError,
+            &record.rel_prev,
+            Severity::Error,
+        ),
+        (
+            diagnostic.amp_to_error,
+            "amp.to_error",
+            "AMP target has a response or fetch error",
+            IssueView::AmpToError,
+            &record.amphtml,
+            Severity::Error,
+        ),
+        (
+            diagnostic.pagination_next_loop,
+            "pagination.next_loop",
+            "Next pagination path enters a loop",
+            IssueView::PaginationNextLoop,
+            &record.rel_next,
+            Severity::Error,
+        ),
+        (
+            diagnostic.pagination_prev_loop,
+            "pagination.prev_loop",
+            "Previous pagination path enters a loop",
+            IssueView::PaginationPrevLoop,
+            &record.rel_prev,
+            Severity::Error,
+        ),
+        (
+            diagnostic.pagination_next_non_reciprocal,
+            "pagination.next_non_reciprocal",
+            "Captured next target does not link back through its captured previous relation",
+            IssueView::PaginationNextNonReciprocal,
+            &record.rel_next,
+            Severity::Warning,
+        ),
+        (
+            diagnostic.pagination_prev_non_reciprocal,
+            "pagination.prev_non_reciprocal",
+            "Captured previous target does not link back through its captured next relation",
+            IssueView::PaginationPrevNonReciprocal,
+            &record.rel_prev,
+            Severity::Warning,
+        ),
+    ] {
+        if matches {
+            issues.push(issue(
+                rule,
+                view,
+                severity,
+                record,
+                format!("{label}: {}", target.as_deref().unwrap_or_default()),
+            ));
+        }
     }
 }
 
@@ -594,6 +762,285 @@ mod tests {
     use ferrous_frog_storage::CrawlRecord;
 
     #[test]
+    fn multiple_metadata_emits_warnings_even_when_retained_values_are_empty() {
+        let mut record = CrawlRecord::pending("https://example.test/multiple".into(), 0);
+        record.status_code = Some(200);
+        record.content_type = Some("text/html".into());
+        record.title_count = Some(2);
+        record.meta_description_count = Some(2);
+        let mut records = vec![record.clone()];
+        record.indexability_status = "Response body incomplete".into();
+        records.push(record);
+        let issues = analyze_records(&records);
+        let rules: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.rule_id.ends_with(".multiple"))
+            .collect();
+        assert_eq!(rules.len(), 2);
+        for (issue, (rule, view)) in rules.iter().zip([
+            ("title.multiple", IssueView::TitleMultiple),
+            ("meta_description.multiple", IssueView::MetaMultiple),
+        ]) {
+            assert_eq!(issue.rule_id, rule);
+            assert_eq!(issue.view, view);
+            assert_eq!(issue.severity, Severity::Warning);
+            assert!(issue.message.contains('2'));
+        }
+    }
+
+    #[test]
+    fn amp_emits_a_typed_error_with_the_declared_target() {
+        let mut source = CrawlRecord::pending("https://example.test/source".into(), 0);
+        source.status_code = Some(200);
+        source.content_type = Some("text/html".into());
+        source.amphtml = Some("https://example.test/amp#fragment".into());
+        let mut target = CrawlRecord::pending("https://example.test/amp".into(), 0);
+        target.status_code = Some(404);
+        let mut incomplete = source.clone();
+        incomplete.indexability_status = "Response body incomplete".into();
+        let issues = analyze_records(&[source.clone(), target, incomplete]);
+        let amp: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.rule_id == "amp.to_error")
+            .collect();
+        assert_eq!(amp.len(), 1);
+        assert_eq!(format!("{:?}", amp[0].view), "AmpToError");
+        assert_eq!(amp[0].severity, Severity::Error);
+        assert_eq!(amp[0].url, source.url);
+        assert!(amp[0].message.contains(source.amphtml.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn pagination_reciprocity_emits_advisory_directional_issues_for_captured_evidence() {
+        let page = |path: &str, next: Option<&str>, prev: Option<&str>| {
+            let mut row = CrawlRecord::pending(format!("https://example.test/{path}"), 0);
+            row.status_code = Some(200);
+            row.content_type = Some("text/html".into());
+            row.rel_next = next.map(|path| format!("https://example.test/{path}"));
+            row.rel_prev = prev.map(|path| format!("https://example.test/{path}"));
+            row
+        };
+        let mut incomplete = page("incomplete", Some("missing-return"), None);
+        incomplete.indexability_status = "Response body incomplete".into();
+        let rows = [
+            page("next", Some("missing-return#section"), None),
+            page("prev", None, Some("mismatched-return")),
+            page("missing-return", None, None),
+            page("mismatched-return", Some("other"), None),
+            page("other", None, Some("mismatched-return")),
+            page("unknown", Some("unknown-target"), None),
+            incomplete,
+        ];
+        let issues = analyze_records(&rows);
+        let reciprocity: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.rule_id.ends_with("_non_reciprocal"))
+            .collect();
+        assert_eq!(reciprocity.len(), 2);
+        for (issue, row, direction, opposite, view) in [
+            (
+                reciprocity[0],
+                &rows[0],
+                "next",
+                "previous",
+                "PaginationNextNonReciprocal",
+            ),
+            (
+                reciprocity[1],
+                &rows[1],
+                "prev",
+                "next",
+                "PaginationPrevNonReciprocal",
+            ),
+        ] {
+            assert_eq!(
+                issue.rule_id,
+                format!("pagination.{direction}_non_reciprocal")
+            );
+            assert_eq!(format!("{:?}", issue.view), view);
+            assert_eq!(issue.severity, Severity::Warning);
+            assert_eq!(issue.url, row.url);
+            assert!(
+                issue
+                    .message
+                    .contains(&format!("captured {opposite} relation"))
+            );
+            let target = if direction == "next" {
+                &row.rel_next
+            } else {
+                &row.rel_prev
+            };
+            assert!(issue.message.contains(target.as_deref().unwrap()));
+        }
+    }
+
+    #[test]
+    fn pagination_loops_emit_directional_errors_with_declared_targets() {
+        let page = |path: &str, next: Option<&str>, prev: Option<&str>| {
+            let mut row = CrawlRecord::pending(format!("https://example.test/{path}"), 0);
+            row.status_code = Some(200);
+            row.content_type = Some("text/html".into());
+            row.rel_next = next.map(|path| format!("https://example.test/{path}"));
+            row.rel_prev = prev.map(|path| format!("https://example.test/{path}"));
+            row
+        };
+        let mut incomplete = page("incomplete", Some("a"), Some("prev#section"));
+        incomplete.indexability_status = "Response body incomplete".into();
+        let rows = [
+            page("a", Some("b#section"), None),
+            page("b", Some("a"), None),
+            page("enter", Some("a"), None),
+            page("prev", None, Some("prev#section")),
+            page("linear-a", Some("linear-b"), None),
+            page("linear-b", None, Some("linear-a")),
+            incomplete,
+        ];
+        let issues = analyze_records(&rows);
+        let loops: Vec<_> = issues
+            .iter()
+            .filter(|issue| {
+                issue.rule_id.starts_with("pagination.") && issue.rule_id.ends_with("_loop")
+            })
+            .collect();
+        assert_eq!(loops.len(), 4);
+        for (issue, row) in loops.iter().zip(&rows[..4]) {
+            let (direction, view, target) = if row.rel_next.is_some() {
+                (
+                    "next",
+                    "PaginationNextLoop",
+                    row.rel_next.as_deref().unwrap(),
+                )
+            } else {
+                (
+                    "prev",
+                    "PaginationPrevLoop",
+                    row.rel_prev.as_deref().unwrap(),
+                )
+            };
+            assert_eq!(issue.rule_id, format!("pagination.{direction}_loop"));
+            assert_eq!(format!("{:?}", issue.view), view);
+            assert_eq!(issue.severity, Severity::Error);
+            assert_eq!(issue.url, row.url);
+            assert!(issue.message.contains("path enters a loop"));
+            assert!(issue.message.contains(target));
+        }
+    }
+
+    #[test]
+    fn pagination_emits_directional_typed_issues_only_for_known_failed_targets() {
+        let mut source = CrawlRecord::pending("https://example.test/source".into(), 0);
+        source.status_code = Some(200);
+        source.content_type = Some("text/html".into());
+        source.rel_next = Some("https://example.test/missing#next".into());
+        source.rel_prev = Some("https://example.test/failed".into());
+        let mut missing = CrawlRecord::pending("https://example.test/missing".into(), 0);
+        missing.status_code = Some(404);
+        let mut failed = CrawlRecord::pending("https://example.test/failed".into(), 0);
+        failed.error = Some("Connection refused".into());
+        let mut unknown = source.clone();
+        unknown.url = "https://example.test/unknown-source".into();
+        unknown.final_url = unknown.url.clone();
+        unknown.rel_next = Some("https://example.test/unknown".into());
+        unknown.rel_prev = Some("https://example.test/blocked".into());
+        let mut blocked = CrawlRecord::pending("https://example.test/blocked".into(), 0);
+        blocked.error = Some("Blocked by robots.txt".into());
+        let mut incomplete = source.clone();
+        incomplete.indexability_status = "Response body incomplete".into();
+        let issues = analyze_records(&[
+            source.clone(),
+            missing,
+            failed,
+            unknown,
+            blocked,
+            incomplete,
+        ]);
+        let pagination: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.rule_id.starts_with("pagination."))
+            .collect();
+        assert_eq!(pagination.len(), 2);
+        for (issue, direction, target) in [
+            (pagination[0], "next", source.rel_next),
+            (pagination[1], "prev", source.rel_prev),
+        ] {
+            assert_eq!(issue.rule_id, format!("pagination.{direction}_to_error"));
+            assert_eq!(
+                format!("{:?}", issue.view),
+                if direction == "next" {
+                    "PaginationNextToError"
+                } else {
+                    "PaginationPrevToError"
+                }
+            );
+            assert_eq!(issue.severity, Severity::Error);
+            assert_eq!(issue.url, source.url);
+            assert!(issue.message.contains(target.as_deref().unwrap()));
+        }
+    }
+
+    #[test]
+    fn canonical_target_diagnostics_emit_typed_source_issues() {
+        let page = |path: &str, target: &str| {
+            let mut record = CrawlRecord::pending(format!("https://example.test/{path}"), 0);
+            record.status_code = Some(200);
+            record.content_type = Some("text/html".into());
+            record.canonical = Some(format!("https://example.test/{target}"));
+            record
+        };
+        let mut error = page("missing", "missing");
+        error.status_code = Some(404);
+        let mut blocked = CrawlRecord::pending("https://example.test/blocked".into(), 0);
+        blocked.error = Some("Blocked by robots.txt".into());
+        let records = vec![
+            page("unknown-source", "unseen"),
+            page("error-source", "missing"),
+            error,
+            page("blocked-source", "blocked"),
+            blocked,
+            page("a", "b"),
+            page("b", "a"),
+            page("self", "self"),
+        ];
+        let issues = analyze_records(&records);
+        for (rule, paths, severity) in [
+            (
+                "canonical.uncrawled",
+                vec!["unknown-source"],
+                Severity::Info,
+            ),
+            ("canonical.to_error", vec!["error-source"], Severity::Error),
+            (
+                "canonical.non_indexable",
+                vec!["blocked-source"],
+                Severity::Warning,
+            ),
+            ("canonical.chain", vec!["a", "b"], Severity::Warning),
+            ("canonical.loop", vec!["a", "b"], Severity::Error),
+        ] {
+            let matching = issues
+                .iter()
+                .filter(|issue| issue.rule_id == rule)
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), paths.len(), "{rule}");
+            for (issue, path) in matching.into_iter().zip(paths) {
+                assert_eq!(issue.url, format!("https://example.test/{path}"));
+                assert_eq!(issue.severity, severity);
+                assert!(
+                    issue.message.contains(
+                        records
+                            .iter()
+                            .find(|record| record.final_url == issue.url)
+                            .unwrap()
+                            .canonical
+                            .as_ref()
+                            .unwrap()
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
     fn on_page_issues_require_successful_html() {
         let mut page = CrawlRecord::pending("https://example.com/page".to_string(), 0);
         page.status_code = Some(200);
@@ -653,6 +1100,47 @@ mod tests {
             IssueView::NearDuplicate,
         ] {
             assert!(!issues.iter().any(|issue| issue.view == view), "{view:?}");
+        }
+    }
+
+    #[test]
+    fn exact_body_duplicates_emit_typed_info_without_confusing_list_aliases() {
+        let mut first = CrawlRecord::pending("https://example.test/a".into(), 0);
+        first.status_code = Some(200);
+        first.content_type = Some("text/html".into());
+        first.response_hash = Some("identical-body-hash".into());
+        let mut repeated = first.clone();
+        repeated.final_url.push_str("#section");
+        repeated.storage_key = "list:2:https://example.test/a".into();
+        assert!(
+            analyze_records(&[first.clone(), repeated.clone()])
+                .iter()
+                .all(|issue| issue.rule_id != "content.exact_duplicate")
+        );
+
+        let mut second = first.clone();
+        second.url = "https://example.test/b".into();
+        second.final_url = second.url.clone();
+        second.indexability = "Non-indexable".into();
+        second.word_count = 100;
+        second.js_rendered = true;
+        let mut failed = first.clone();
+        failed.final_url = "https://example.test/failed".into();
+        failed.status_code = Some(404);
+        let mut incomplete = first.clone();
+        incomplete.final_url = "https://example.test/incomplete".into();
+        incomplete.indexability_status = "Response body incomplete".into();
+        let issues = analyze_records(&[first, second, repeated, failed, incomplete]);
+        let exact = issues
+            .iter()
+            .filter(|issue| issue.rule_id == "content.exact_duplicate")
+            .collect::<Vec<_>>();
+        assert_eq!(exact.len(), 3);
+        for issue in exact {
+            assert_eq!(issue.severity, Severity::Info);
+            assert_eq!(issue.view, IssueView::ExactDuplicate);
+            assert!(issue.message.contains("identical-body-hash"));
+            assert!(issue.message.contains("response body"));
         }
     }
 

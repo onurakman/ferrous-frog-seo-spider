@@ -1,18 +1,30 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod content;
+#[cfg(test)]
+mod export_tests;
+mod pagespeed;
+mod serp;
+#[cfg(test)]
+mod session_tests;
+mod sessions;
 mod updates;
+mod window_state;
 
 use ferrous_frog_analysis::analyze_records;
 use ferrous_frog_crawler_core::{
-    CrawlConfig, CrawlControl, CrawlerEvent, RobotsTxtBatchTestRequest, RobotsTxtBatchTestResult,
-    RobotsTxtDownloadRequest, RobotsTxtDownloadResult, RobotsTxtTestRequest, RobotsTxtTestResult,
-    crawl, download_robots_txt as run_robots_txt_download, test_robots_txt as run_robots_txt_test,
-    test_robots_txt_batch as run_robots_txt_batch_test,
+    CrawlConfig, CrawlControl, CrawlerEvent, RenderingStatus, RobotsTxtBatchTestRequest,
+    RobotsTxtBatchTestResult, RobotsTxtDownloadRequest, RobotsTxtDownloadResult,
+    RobotsTxtTestRequest, RobotsTxtTestResult, crawl,
+    download_robots_txt as run_robots_txt_download, rendering_status,
+    test_robots_txt as run_robots_txt_test, test_robots_txt_batch as run_robots_txt_batch_test,
+    validate_configuration, validate_crawl_start, validate_rendering,
 };
 use ferrous_frog_export::{
-    graph_nodes_to_csv_string, link_edges_to_csv_string, records_to_csv_string,
-    records_to_html_report, records_to_sitemap_xml, records_to_xlsx_bytes,
-    redirect_chains_to_csv_string, sitemap_validation_to_csv_string,
+    audit_workbook_to_writer, graph_nodes_to_csv, link_edges_to_csv, link_edges_to_csv_string,
+    query_to_xlsx_writer, records_to_csv, records_to_csv_string, records_to_html_report,
+    records_to_sitemap_xml, records_to_xlsx_bytes, redirect_chains_to_csv_string,
+    sitemap_validation_to_csv_string,
 };
 use ferrous_frog_integrations::{
     DateRange, MetricRequest, SearchConsoleConfig, SearchConsoleProvider, UrlMetricProvider,
@@ -22,20 +34,22 @@ use ferrous_frog_storage::{
     CrawlPathQuery, CrawlPathResponse, CrawlRecord, CrawlStore, GridQuery, GridResponse,
     ImageAsset, ImageAssetQuery, ImageAssetResponse, Issue, LinkEdge, LinkEdgeQuery,
     LinkEdgeResponse, SearchConsoleMetricRow, SitemapValidationQuery, SitemapValidationResponse,
-    is_broken_record, is_no_response_record, summarize,
+    is_broken_record, is_no_response_record, summarize, validate_grid_query,
 };
 use keyring::{Entry, Error as KeyringError};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use sessions::{CrawlSession, get_session, query_sessions};
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::io::{BufWriter, Cursor, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_window_state::AppHandleExt;
 
 struct AppState {
     store: Mutex<ActiveStore>,
@@ -51,18 +65,6 @@ struct AppState {
 enum StorageMode {
     Memory,
     Database,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CrawlSession {
-    id: String,
-    name: String,
-    start_url: String,
-    database_path: String,
-    created_at_ms: i64,
-    updated_at_ms: i64,
-    is_current: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +97,7 @@ struct ExportFileRequest {
     kind: ExportFileKind,
     query: Option<GridQuery>,
     graph_query: Option<CrawlGraphQuery>,
+    record_ids: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +105,10 @@ struct ExportFileRequest {
 enum ExportFileKind {
     Csv,
     Xlsx,
+    AuditWorkbook,
+    SelectedCsv,
+    QueuedUrlsCsv,
+    ImageAltCsv,
     Sitemap,
     LinkEdgesCsv,
     RedirectChainsCsv,
@@ -130,6 +137,7 @@ struct ImportCrawlArchiveRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CrawlArchiveImportResult {
+    session: CrawlSession,
     records: usize,
     link_edges: usize,
     image_assets: usize,
@@ -236,6 +244,8 @@ struct SearchConsoleMergeResult {
 #[serde(rename_all = "camelCase")]
 struct DatabaseLocation {
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<CrawlSession>,
 }
 
 #[derive(Debug, Serialize)]
@@ -314,53 +324,164 @@ impl UrlTreeNode {
     }
 }
 
+#[tauri::command]
+async fn get_rendering_status() -> RenderingStatus {
+    rendering_status()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn validate_crawl_configuration(config: CrawlConfig) -> Result<(), String> {
+    validate_configuration(&config).map_err(|error| format!("{error:#}"))
+}
+
 #[tauri::command(rename_all = "camelCase")]
 async fn start_crawl(
     app: AppHandle,
     state: State<'_, AppState>,
-    mut config: CrawlConfig,
-    storage_mode: StorageMode,
+    config: CrawlConfig,
     resume: bool,
-) -> Result<(), String> {
+) -> Result<CrawlSession, String> {
+    validate_crawl_start(&config).map_err(|error| format!("{error:#}"))?;
+    validate_rendering(&config.rendering).map_err(|error| error.to_string())?;
     let mut current_task = state.crawl_task.lock().await;
-    if state.exit_confirmed.load(Ordering::SeqCst) {
-        return Err("the application is closing".to_string());
-    }
+    ensure_idle(&state, &current_task)?;
     stop_active_crawl(&state, &mut current_task).await?;
+    let mut current_control = state
+        .control
+        .lock()
+        .map_err(|_| "crawl control lock poisoned".to_string())?;
+    let (session, store, config, conn) =
+        prepare_crawl_session(&state, &app_data_dir(&app)?, config, resume)?;
     let control = CrawlControl::default();
-    {
-        let mut current = state
-            .control
-            .lock()
-            .map_err(|_| "crawl control lock poisoned".to_string())?;
-        *current = Some(control.clone());
-    }
-
-    let store = prepare_store(&app, &state, storage_mode, resume)?;
-    if storage_mode == StorageMode::Database {
-        touch_current_session(&app, &state, &config.start_url)?;
-    }
-    config.resume_from_state = storage_mode == StorageMode::Database && resume;
-    let app_for_task = app.clone();
+    *current_control = Some(control.clone());
+    let session_id = session.id.clone();
     let task = tauri::async_runtime::spawn(async move {
-        let event_app = app_for_task.clone();
+        let progress_conn = Arc::new(Mutex::new(conn));
+        let persistence_error = Arc::new(Mutex::new(None::<String>));
+        let event_conn = progress_conn.clone();
+        let event_error = persistence_error.clone();
+        let event_control = control.clone();
+        let event_session_id = session_id.clone();
+        let event_app = app.clone();
         let emit = move |event: CrawlerEvent| {
+            if let Some(progress) = &event.progress {
+                let result = event_conn
+                    .lock()
+                    .map_err(|_| "session progress lock poisoned".to_string())
+                    .and_then(|conn| {
+                        sessions::save_progress(
+                            &conn,
+                            &event_session_id,
+                            &progress.status,
+                            progress.crawled,
+                        )
+                    });
+                if let Err(error) = result {
+                    *event_error.lock().expect("progress error lock poisoned") = Some(error);
+                    event_control.cancel();
+                }
+            }
             let _ = event_app.emit("crawl-event", event);
         };
-
-        if let Err(error) = crawl(config, store, control, emit).await {
-            let mut event = CrawlerEvent::error(error.to_string());
+        // Observe engine panics as well as returned errors so history never stays "running".
+        let result = tauri::async_runtime::spawn(crawl(config, store, control, emit)).await;
+        let error = match result {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => Some(format!("{error:#}")),
+            Err(error) => Some(format!("crawl task failed: {error}")),
+        }
+        .or_else(|| {
+            persistence_error
+                .lock()
+                .ok()
+                .and_then(|error| error.clone())
+        });
+        if let Some(mut error) = error {
+            let saved = progress_conn
+                .lock()
+                .map_err(|_| "session progress lock poisoned".to_string())
+                .and_then(|conn| sessions::save_status(&conn, &session_id, "failed"));
+            if let Err(save_error) = saved {
+                error.push_str(&format!("; {save_error}"));
+            }
+            let mut event = CrawlerEvent::error(error);
             event.kind = "failed".to_string();
-            let _ = app_for_task.emit("crawl-event", event);
+            let _ = app.emit("crawl-event", event);
         }
     });
     *current_task = Some(task);
+    Ok(session)
+}
 
+fn ensure_idle(
+    state: &AppState,
+    task: &Option<tauri::async_runtime::JoinHandle<()>>,
+) -> Result<(), String> {
+    if state.exit_confirmed.load(Ordering::SeqCst) {
+        return Err("the application is closing".to_string());
+    }
+    if task
+        .as_ref()
+        .is_some_and(|task| !task.inner().is_finished())
+    {
+        return Err("stop the active crawl before changing or comparing saved crawls".to_string());
+    }
     Ok(())
 }
 
+fn prepare_crawl_session(
+    state: &AppState,
+    dir: &Path,
+    mut config: CrawlConfig,
+    resume: bool,
+) -> Result<(CrawlSession, ActiveStore, CrawlConfig, Connection), String> {
+    config.resume_from_state = false;
+    validate_crawl_start(&config).map_err(|error| format!("{error:#}"))?;
+    validate_rendering(&config.rendering).map_err(|error| error.to_string())?;
+    let mut active_store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_string())?;
+    let mut current_id = state
+        .current_session_id
+        .lock()
+        .map_err(|_| "session lock poisoned".to_string())?;
+    let conn = sessions::index_connection(dir)?;
+    let (mut session, store) = if resume {
+        let id = current_id
+            .as_deref()
+            .ok_or("open a saved crawl before resuming")?;
+        let mut session = get_session(&conn, id, Some(id))?;
+        sessions::load_config(&conn, &mut session)?;
+        sessions::validate_resume(&session, &config)?;
+        let store = sessions::open_existing_database(Path::new(&session.database_path))?;
+        let crawled = sessions::resume_count(Path::new(&session.database_path))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
+        sessions::save_config(&tx, id, &config)?;
+        sessions::save_progress(&tx, id, "starting", crawled)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        (get_session(&conn, id, Some(id))?, store)
+    } else {
+        let seed = sessions::seed_url(&config);
+        let name = url::Url::parse(seed)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| "New crawl".to_string());
+        sessions::create_session(&conn, dir, &name, seed, Some(&config), "starting")?
+    };
+    config.resume_from_state = resume;
+    session.config = None;
+    let store = ActiveStore::Sqlite(store);
+    *active_store = store.clone();
+    *current_id = Some(session.id.clone());
+    Ok((session, store, config, conn))
+}
+
 #[tauri::command]
-fn pause_crawl(state: State<'_, AppState>) -> Result<(), String> {
+async fn pause_crawl(state: State<'_, AppState>) -> Result<(), String> {
+    let _task = state.crawl_task.lock().await;
     if let Some(control) = state
         .control
         .lock()
@@ -373,7 +494,8 @@ fn pause_crawl(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn resume_crawl(state: State<'_, AppState>) -> Result<(), String> {
+async fn resume_crawl(state: State<'_, AppState>) -> Result<(), String> {
+    let _task = state.crawl_task.lock().await;
     if let Some(control) = state
         .control
         .lock()
@@ -411,10 +533,19 @@ async fn stop_active_crawl(
 }
 
 #[tauri::command]
-async fn quit_app(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn quit_app(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    page_speed: State<'_, pagespeed::PageSpeedState>,
+) -> Result<(), String> {
+    let page_speed_shutdown = page_speed.begin_shutdown()?;
     let mut task = state.crawl_task.lock().await;
     stop_active_crawl(&state, &mut task).await?;
+    if let Err(error) = app.save_window_state(window_state::FLAGS) {
+        eprintln!("failed to save window position: {error}");
+    }
     state.exit_confirmed.store(true, Ordering::SeqCst);
+    page_speed_shutdown.commit();
     app.exit(0);
     Ok(())
 }
@@ -423,6 +554,12 @@ fn show_main_window(app: &AppHandle) -> Result<(), String> {
     let main = app
         .get_webview_window("main")
         .ok_or("main window is unavailable")?;
+    if !main.is_visible().map_err(|error| error.to_string())? {
+        // A disconnected or rearranged monitor must not leave the title bar unreachable.
+        if let Err(error) = window_state::ensure_reachable(&main) {
+            eprintln!("failed to restore a reachable window position: {error}");
+        }
+    }
     main.show().map_err(|error| error.to_string())?;
     let _ = main.unminimize();
     let _ = main.set_focus();
@@ -433,8 +570,17 @@ fn show_main_window(app: &AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn complete_startup(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn complete_startup(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.frontend_ready.store(true, Ordering::SeqCst);
+    if app.get_webview_window("splashscreen").is_some() {
+        let remaining =
+            Duration::from_millis(2_200).saturating_sub(app.state::<Instant>().elapsed());
+        tokio::time::sleep(remaining).await;
+        // A quit request or the startup fallback may already have revealed the main window.
+        if app.get_webview_window("splashscreen").is_none() {
+            return Ok(());
+        }
+    }
     show_main_window(&app)
 }
 
@@ -469,40 +615,56 @@ async fn download_robots_txt(
 }
 
 #[tauri::command]
+fn validate_result_filters(filters: ferrous_frog_storage::GridFilterGroup) -> Result<(), String> {
+    ferrous_frog_storage::validate_grid_query(&GridQuery {
+        filters: Some(filters),
+        ..GridQuery::default()
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn get_rows(state: State<'_, AppState>, query: GridQuery) -> Result<GridResponse, String> {
     let store = state
         .store
         .lock()
         .map_err(|_| "store lock poisoned".to_string())?
         .clone();
-    tauri::async_runtime::spawn_blocking(move || store.query(query))
+    tauri::async_runtime::spawn_blocking(move || query_store_rows(&store, query))
         .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn get_url_tree(state: State<'_, AppState>, mut query: GridQuery) -> UrlTreeResponse {
+async fn get_url_tree(
+    state: State<'_, AppState>,
+    mut query: GridQuery,
+) -> Result<UrlTreeResponse, String> {
     query.offset = 0;
     query.limit = URL_TREE_RECORD_LIMIT;
-    let response = state
+    let store = state
         .store
         .lock()
-        .expect("store lock poisoned")
-        .query(query);
+        .map_err(|_| "store lock poisoned".to_string())?
+        .clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let response = query_store_rows(&store, query)?;
+        let mut nodes = Vec::new();
+        for record in &response.rows {
+            let segments = url_tree_segments(record);
+            insert_url_tree_record(&mut nodes, &segments, record, 0, "");
+        }
+        sort_url_tree_nodes(&mut nodes);
 
-    let mut nodes = Vec::new();
-    for record in &response.rows {
-        let segments = url_tree_segments(record);
-        insert_url_tree_record(&mut nodes, &segments, record, 0, "");
-    }
-    sort_url_tree_nodes(&mut nodes);
-
-    UrlTreeResponse {
-        nodes,
-        total_urls: response.total,
-        rendered_urls: response.rows.len(),
-        capped: response.total > response.rows.len(),
-    }
+        Ok(UrlTreeResponse {
+            nodes,
+            total_urls: response.total,
+            rendered_urls: response.rows.len(),
+            capped: response.total > response.rows.len(),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -512,51 +674,57 @@ fn get_issues(state: State<'_, AppState>) -> Vec<Issue> {
 }
 
 #[tauri::command]
-fn get_link_edges(state: State<'_, AppState>, query: LinkEdgeQuery) -> LinkEdgeResponse {
-    state
-        .store
-        .lock()
-        .expect("store lock poisoned")
-        .link_edges(query)
+async fn get_link_edges(
+    state: State<'_, AppState>,
+    query: LinkEdgeQuery,
+) -> Result<LinkEdgeResponse, String> {
+    with_store_worker(&state, false, move |store| {
+        query_store_link_edges(store, query)
+    })
+    .await
 }
 
 #[tauri::command]
-fn get_image_assets(state: State<'_, AppState>, query: ImageAssetQuery) -> ImageAssetResponse {
-    state
-        .store
-        .lock()
-        .expect("store lock poisoned")
-        .image_assets(query)
+async fn get_image_assets(
+    state: State<'_, AppState>,
+    query: ImageAssetQuery,
+) -> Result<ImageAssetResponse, String> {
+    with_store_worker(&state, false, move |store| query_store_images(store, query)).await
 }
 
 #[tauri::command]
-fn get_anchor_texts(state: State<'_, AppState>, query: LinkEdgeQuery) -> AnchorTextResponse {
-    state
-        .store
-        .lock()
-        .expect("store lock poisoned")
-        .anchor_texts(query)
+async fn get_anchor_texts(
+    state: State<'_, AppState>,
+    query: LinkEdgeQuery,
+) -> Result<AnchorTextResponse, String> {
+    with_store_worker(&state, false, move |store| {
+        query_store_anchor_texts(store, query)
+    })
+    .await
 }
 
 #[tauri::command]
-fn get_sitemap_validation(
+async fn get_sitemap_validation(
     state: State<'_, AppState>,
     query: SitemapValidationQuery,
-) -> SitemapValidationResponse {
-    state
-        .store
-        .lock()
-        .expect("store lock poisoned")
-        .sitemap_validation(query)
+) -> Result<SitemapValidationResponse, String> {
+    with_store_worker(&state, false, move |store| {
+        query_store_sitemap_validation(store, query)
+    })
+    .await
 }
 
 #[tauri::command]
-fn get_crawl_graph(state: State<'_, AppState>, query: CrawlGraphQuery) -> CrawlGraph {
-    state
-        .store
-        .lock()
-        .expect("store lock poisoned")
-        .crawl_graph(query)
+async fn get_crawl_graph(
+    state: State<'_, AppState>,
+    query: CrawlGraphQuery,
+) -> Result<CrawlGraph, String> {
+    with_store_worker(&state, false, move |store| {
+        store
+            .try_crawl_graph(query)
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -583,89 +751,163 @@ fn list_crawl_sessions(
 }
 
 #[tauri::command]
-fn create_crawl_session(
+async fn create_crawl_session(
     app: AppHandle,
     state: State<'_, AppState>,
     request: CreateSessionRequest,
 ) -> Result<CrawlSession, String> {
-    let name = request.name.trim();
-    if name.is_empty() {
-        return Err("session name is required".to_string());
-    }
-    let id = format!("session-{}", now_ms());
-    let database_path = sessions_dir(&app)?.join(format!("{id}.sqlite3"));
-    let database_path_string = database_path.to_string_lossy().into_owned();
-    let now = now_ms();
-    let conn = session_index_connection(&app)?;
-    conn.execute(
-        "INSERT INTO crawl_sessions (
-            id,
-            name,
-            start_url,
-            database_path,
-            created_at_ms,
-            updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            &id,
-            name,
-            request.start_url.trim(),
-            &database_path_string,
-            now,
-            now
-        ],
-    )
-    .map_err(|error| error.to_string())?;
-    let session = get_session(&conn, &id, Some(&id))?;
-    *state
-        .current_session_id
-        .lock()
-        .map_err(|_| "session lock poisoned".to_string())? = Some(id);
-    Ok(session)
-}
-
-#[tauri::command]
-fn open_crawl_session(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    session_id: String,
-) -> Result<CrawlSession, String> {
-    let conn = session_index_connection(&app)?;
-    let session = get_session(&conn, &session_id, Some(&session_id))?;
-    let store = ActiveStore::sqlite(&session.database_path)
-        .map_err(|error| format!("failed to open crawl session: {error}"))?;
-    *state
+    let task = state.crawl_task.lock().await;
+    ensure_idle(&state, &task)?;
+    let mut store = state
         .store
         .lock()
-        .map_err(|_| "store lock poisoned".to_string())? = store;
-    *state
-        .current_session_id
-        .lock()
-        .map_err(|_| "session lock poisoned".to_string())? = Some(session_id);
-    Ok(session)
-}
-
-#[tauri::command]
-fn delete_crawl_session(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    session_id: String,
-) -> Result<(), String> {
-    let conn = session_index_connection(&app)?;
-    let session = get_session(&conn, &session_id, None)?;
-    conn.execute("DELETE FROM crawl_sessions WHERE id = ?1", [&session_id])
-        .map_err(|error| error.to_string())?;
-    let _ = fs::remove_file(&session.database_path);
+        .map_err(|_| "store lock poisoned".to_string())?;
     let mut current = state
         .current_session_id
         .lock()
         .map_err(|_| "session lock poisoned".to_string())?;
-    if current.as_deref() == Some(session_id.as_str()) {
+    let dir = app_data_dir(&app)?;
+    let conn = sessions::index_connection(&dir)?;
+    let config = CrawlConfig {
+        start_url: request.start_url.trim().to_string(),
+        ..CrawlConfig::default()
+    };
+    validate_configuration(&config).map_err(|error| format!("{error:#}"))?;
+    let (session, database) = sessions::create_session(
+        &conn,
+        &dir,
+        &request.name,
+        &config.start_url,
+        Some(&config),
+        "ready",
+    )?;
+    *store = ActiveStore::Sqlite(database);
+    *current = Some(session.id.clone());
+    Ok(session)
+}
+
+#[tauri::command]
+async fn open_crawl_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<CrawlSession, String> {
+    let task = state.crawl_task.lock().await;
+    ensure_idle(&state, &task)?;
+    activate_session(&state, &session_index_connection(&app)?, &session_id)
+}
+
+fn activate_session(
+    state: &AppState,
+    conn: &Connection,
+    session_id: &str,
+) -> Result<CrawlSession, String> {
+    let mut active_store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_string())?;
+    let mut current = state
+        .current_session_id
+        .lock()
+        .map_err(|_| "session lock poisoned".to_string())?;
+    let mut session = get_session(conn, session_id, Some(session_id))?;
+    sessions::load_config(conn, &mut session)?;
+    let store = sessions::open_existing_database(Path::new(&session.database_path))?;
+    sessions::refresh_legacy_metadata(conn, &mut session)?;
+    *active_store = ActiveStore::Sqlite(store);
+    *current = Some(session_id.to_string());
+    Ok(session)
+}
+
+#[tauri::command]
+async fn delete_crawl_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let task = state.crawl_task.lock().await;
+    ensure_idle(&state, &task)?;
+    delete_session(&state, &session_index_connection(&app)?, &session_id)
+}
+
+fn delete_session(state: &AppState, conn: &Connection, session_id: &str) -> Result<(), String> {
+    let session = get_session(conn, session_id, None)?;
+    let mut active_store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_string())?;
+    let mut current = state
+        .current_session_id
+        .lock()
+        .map_err(|_| "session lock poisoned".to_string())?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    tx.execute("DELETE FROM crawl_sessions WHERE id = ?1", [session_id])
+        .map_err(|error| error.to_string())?;
+    let path = Path::new(&session.database_path);
+    // Stage removal so a failed index commit can restore the database at its original path.
+    let staged_path =
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => return Err(
+                "the saved database path is a directory; restore the crawl file before deleting it"
+                    .to_string(),
+            ),
+            Ok(_) => {
+                let suffix: String = tx
+                    .query_row("SELECT lower(hex(randomblob(8)))", [], |row| row.get(0))
+                    .map_err(|error| error.to_string())?;
+                Some(path.with_extension(format!("deleting-{suffix}")))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "could not read crawl database {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+    let release_current = current.as_deref() == Some(session_id) && staged_path.is_some();
+    if release_current {
+        // Windows cannot rename an open SQLite file. The store lock blocks new readers.
+        *active_store = ActiveStore::memory();
+    }
+    let mut renamed = false;
+    let remove = || -> Result<(), String> {
+        if let Some(staged) = &staged_path {
+            fs::rename(path, staged).map_err(|error| format!("could not remove crawl database {}: {error}; retry after pending queries finish", path.display()))?;
+            renamed = true;
+        }
+        tx.commit()
+            .map_err(|error| format!("failed to delete saved card: {error}"))
+    };
+    if let Err(error) = remove() {
+        if renamed && let Some(staged) = &staged_path {
+            fs::rename(staged, path).map_err(|restore_error| {
+                format!(
+                    "{error}; restore the preserved database from {}: {restore_error}",
+                    staged.display()
+                )
+            })?;
+        }
+        if release_current {
+            *active_store = ActiveStore::Sqlite(sessions::open_existing_database(path).map_err(
+                |restore_error| format!("{error}; could not reopen saved crawl: {restore_error}"),
+            )?);
+        }
+        return Err(error);
+    }
+    if current.as_deref() == Some(session_id) {
         *current = None;
-        *state
-            .store
-            .lock()
-            .map_err(|_| "store lock poisoned".to_string())? = ActiveStore::memory();
+        *active_store = ActiveStore::memory();
+    }
+    if let Some(staged) = staged_path
+        && let Err(error) = fs::remove_file(&staged)
+    {
+        eprintln!(
+            "saved card removed; database cleanup can be retried at {}: {error}",
+            staged.display()
+        );
     }
     Ok(())
 }
@@ -679,36 +921,61 @@ fn get_database_location(
         path: active_database_path(&app, &state)?
             .to_string_lossy()
             .into_owned(),
+        session: None,
     })
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn open_database_path(
+async fn open_database_path(
+    app: AppHandle,
     state: State<'_, AppState>,
     path: String,
 ) -> Result<DatabaseLocation, String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
+    let task = state.crawl_task.lock().await;
+    ensure_idle(&state, &task)?;
+    let database_path = PathBuf::from(path.trim());
+    if path.trim().is_empty() {
         return Err("database path is required".to_string());
     }
-    let database_path = PathBuf::from(trimmed);
-    if let Some(parent) = database_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create database directory: {error}"))?;
+    let conn = session_index_connection(&app)?;
+    let session = activate_database_path(&state, &conn, &database_path)?;
+    Ok(DatabaseLocation {
+        path: session.database_path.clone(),
+        session: Some(session),
+    })
+}
+
+fn activate_database_path(
+    state: &AppState,
+    conn: &Connection,
+    path: &Path,
+) -> Result<CrawlSession, String> {
+    let database_path = fs::canonicalize(path)
+        .map_err(|error| format!("crawl database is unavailable: {error}"))?;
+    let mut known = query_sessions(conn, None)?.into_iter().find(|session| {
+        fs::canonicalize(&session.database_path).is_ok_and(|path| path == database_path)
+    });
+    if let Some(session) = &mut known {
+        sessions::load_config(conn, session)?;
     }
-    let store = ActiveStore::sqlite(&database_path)
-        .map_err(|error| format!("failed to open database path: {error}"))?;
-    *state
+    let mut store = state
         .store
         .lock()
-        .map_err(|_| "store lock poisoned".to_string())? = store;
-    *state
+        .map_err(|_| "store lock poisoned".to_string())?;
+    let mut current = state
         .current_session_id
         .lock()
-        .map_err(|_| "session lock poisoned".to_string())? = None;
-    Ok(DatabaseLocation {
-        path: database_path.to_string_lossy().into_owned(),
-    })
+        .map_err(|_| "session lock poisoned".to_string())?;
+    let database = sessions::open_existing_database(&database_path)?;
+    let mut session = match known {
+        Some(session) => session,
+        None => sessions::register_database(conn, &database_path)?,
+    };
+    sessions::refresh_legacy_metadata(conn, &mut session)?;
+    session.is_current = true;
+    *store = ActiveStore::Sqlite(database);
+    *current = Some(session.id.clone());
+    Ok(session)
 }
 
 #[tauri::command]
@@ -872,6 +1139,8 @@ async fn merge_search_console_metrics(
     state: State<'_, AppState>,
     request: MergeSearchConsoleMetricsRequest,
 ) -> Result<SearchConsoleMergeResult, String> {
+    let task = state.crawl_task.lock().await;
+    ensure_idle(&state, &task)?;
     let site_url = get_integration_setting(&app, GSC_SITE_URL_SETTING)?
         .ok_or_else(|| "Google Search Console site URL is not configured".to_string())?;
     let access_token = read_search_console_access_token()?
@@ -926,34 +1195,26 @@ async fn merge_search_console_metrics(
 
 #[tauri::command]
 fn export_csv(state: State<'_, AppState>, query: GridQuery) -> Result<String, String> {
-    let records = state
+    let store = state
         .store
         .lock()
-        .map_err(|_| "store lock poisoned".to_string())?
-        .query(query)
-        .rows;
+        .map_err(|_| "store lock poisoned".to_string())?;
+    let records = query_store_rows(&store, query)?.rows;
     records_to_csv_string(&records).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-fn export_xlsx(state: State<'_, AppState>, query: GridQuery) -> Result<Vec<u8>, String> {
-    let records = state
-        .store
-        .lock()
-        .map_err(|_| "store lock poisoned".to_string())?
-        .query(query)
-        .rows;
-    records_to_xlsx_bytes(&records).map_err(|error| error.to_string())
+async fn export_xlsx(state: State<'_, AppState>, query: GridQuery) -> Result<Vec<u8>, String> {
+    xlsx_window_bytes(&state, query).await
 }
 
 #[tauri::command]
 fn export_sitemap(state: State<'_, AppState>, query: GridQuery) -> Result<String, String> {
-    let records = state
+    let store = state
         .store
         .lock()
-        .map_err(|_| "store lock poisoned".to_string())?
-        .query(query)
-        .rows;
+        .map_err(|_| "store lock poisoned".to_string())?;
+    let records = query_store_rows(&store, query)?.rows;
     Ok(records_to_sitemap_xml(&records))
 }
 
@@ -1055,13 +1316,14 @@ fn write_grid_csv_stream(
     mut query: GridQuery,
     file: &mut fs::File,
 ) -> Result<usize, String> {
+    validate_grid_query(&query).map_err(|error| error.to_string())?;
     query.offset = 0;
     query.limit = EXPORT_STREAM_PAGE_SIZE;
     let mut row_count = 0;
     let mut wrote_header = false;
 
     loop {
-        let response = store.query(query.clone());
+        let response = query_store_rows(store, query.clone())?;
         let chunk_len = response.rows.len();
         let csv = records_to_csv_string(&response.rows).map_err(|error| error.to_string())?;
         write_csv_chunk(file, &csv, !wrote_header)?;
@@ -1086,7 +1348,7 @@ fn write_link_edges_csv_stream(store: &ActiveStore, file: &mut fs::File) -> Resu
     let mut wrote_header = false;
 
     loop {
-        let response = store.link_edges(query.clone());
+        let response = query_store_link_edges(store, query.clone())?;
         let chunk_len = response.edges.len();
         let csv = link_edges_to_csv_string(&response.edges).map_err(|error| error.to_string())?;
         write_csv_chunk(file, &csv, !wrote_header)?;
@@ -1147,7 +1409,7 @@ fn write_sitemap_validation_csv_stream(
     let mut wrote_header = false;
 
     loop {
-        let response = store.sitemap_validation(query.clone());
+        let response = query_store_sitemap_validation(store, query.clone())?;
         let chunk_len = response.rows.len();
         let csv =
             sitemap_validation_to_csv_string(&response.rows).map_err(|error| error.to_string())?;
@@ -1168,6 +1430,7 @@ fn write_sitemap_xml_stream(
     mut query: GridQuery,
     file: &mut fs::File,
 ) -> Result<usize, String> {
+    validate_grid_query(&query).map_err(|error| error.to_string())?;
     query.offset = 0;
     query.limit = EXPORT_STREAM_PAGE_SIZE;
     file.write_all(
@@ -1179,7 +1442,7 @@ fn write_sitemap_xml_stream(
 
     let mut row_count = 0;
     loop {
-        let response = store.query(query.clone());
+        let response = query_store_rows(store, query.clone())?;
         let chunk_len = response.rows.len();
         for record in response
             .rows
@@ -1232,13 +1495,541 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+async fn with_store_worker<T: Send + 'static>(
+    state: &AppState,
+    require_idle: bool,
+    work: impl FnOnce(&ActiveStore) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    // Keep lifecycle changes waiting asynchronously while the worker reads this crawl.
+    let task = state.crawl_task.lock().await;
+    if require_idle
+        && task
+            .as_ref()
+            .is_some_and(|task| !task.inner().is_finished())
+    {
+        return Err("stop or complete the active crawl before exporting this report".into());
+    }
+    if state.exit_confirmed.load(Ordering::SeqCst) {
+        return Err("the application is closing".into());
+    }
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_string())?
+        .clone();
+    let result = tauri::async_runtime::spawn_blocking(move || work(&store))
+        .await
+        .map_err(|error| format!("background worker failed: {error}"))?;
+    drop(task);
+    result
+}
+
+fn write_atomic_export(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> Result<usize, String>,
+) -> Result<ExportFileResult, String> {
+    let directory = path.parent().ok_or("export directory is missing")?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|error| format!("failed to create export file: {error}"))?;
+    let row_count = write(file.as_file_mut())?;
+    file.as_file()
+        .sync_all()
+        .map_err(|error| format!("failed to flush export file: {error}"))?;
+    file.persist_noclobber(path).map_err(|error| {
+        format!("failed to save export file (existing exports are preserved): {error}")
+    })?;
+    Ok(ExportFileResult {
+        path: path.to_string_lossy().into_owned(),
+        row_count,
+    })
+}
+
+async fn export_audit_workbook(
+    state: &AppState,
+    path: PathBuf,
+) -> Result<ExportFileResult, String> {
+    with_store_worker(state, true, move |store| {
+        write_atomic_export(&path, |file| {
+            audit_workbook_to_writer(|query| query_store_rows(store, query), file)
+        })
+    })
+    .await
+}
+
+async fn export_crawl_archive_file(
+    state: &AppState,
+    path: PathBuf,
+    timestamp: i64,
+) -> Result<ExportFileResult, String> {
+    with_store_worker(state, true, move |store| {
+        write_atomic_export(&path, |file| {
+            write_crawl_archive_stream(store, timestamp, &mut BufWriter::new(file))
+        })
+    })
+    .await
+}
+
+fn write_crawl_archive_stream(
+    store: &ActiveStore,
+    timestamp: i64,
+    writer: &mut impl Write,
+) -> Result<usize, String> {
+    write!(writer, "{{\n  \"schemaVersion\": {CRAWL_ARCHIVE_SCHEMA_VERSION},\n  \"exportedAtMs\": {timestamp},\n  \"records\": ")
+        .map_err(|error| error.to_string())?;
+    let row_count = match store {
+        ActiveStore::Memory(memory) => {
+            // ponytail: keep one Memory snapshot in insertion order; add a raw record visitor
+            // if large headless archives need bounded hydration. Grid paging repeats full audits.
+            let records = memory.records();
+            serde_json::to_writer(&mut *writer, &records).map_err(|error| error.to_string())?;
+            records.len()
+        }
+        ActiveStore::Sqlite(_) => write_archive_array(writer, "records", |offset| {
+            let response = query_store_rows(
+                store,
+                GridQuery {
+                    offset,
+                    limit: EXPORT_STREAM_PAGE_SIZE,
+                    ..GridQuery::default()
+                },
+            )?;
+            Ok((response.rows, response.total))
+        })?,
+    };
+    writer
+        .write_all(b",\n  \"linkEdges\": ")
+        .map_err(|error| error.to_string())?;
+    write_archive_array(writer, "link edges", |offset| {
+        let response = query_store_link_edges(
+            store,
+            LinkEdgeQuery {
+                offset,
+                limit: EXPORT_STREAM_PAGE_SIZE,
+                ..LinkEdgeQuery::default()
+            },
+        )?;
+        Ok((response.edges, response.total))
+    })?;
+    writer
+        .write_all(b",\n  \"imageAssets\": ")
+        .map_err(|error| error.to_string())?;
+    write_archive_array(writer, "image assets", |offset| {
+        let response = query_store_images(
+            store,
+            ImageAssetQuery {
+                offset,
+                limit: EXPORT_STREAM_PAGE_SIZE,
+                ..ImageAssetQuery::default()
+            },
+        )?;
+        Ok((response.images, response.total))
+    })?;
+    // ponytail: hydrate the whole frontier; extend its visitor with seen/crawled metadata
+    // if large resume snapshots need bounded memory.
+    let frontier = match store {
+        ActiveStore::Memory(memory) => memory.load_frontier_state(),
+        ActiveStore::Sqlite(sqlite) => sqlite
+            .try_load_frontier_state()
+            .map_err(|error| error.to_string())?,
+    };
+    writer
+        .write_all(b",\n  \"frontierState\": ")
+        .map_err(|error| error.to_string())?;
+    serde_json::to_writer(&mut *writer, &frontier).map_err(|error| error.to_string())?;
+    writer
+        .write_all(b"\n}\n")
+        .map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())?;
+    Ok(row_count)
+}
+
+fn write_archive_array<T: Serialize>(
+    writer: &mut impl Write,
+    name: &str,
+    mut read_page: impl FnMut(usize) -> Result<(Vec<T>, usize), String>,
+) -> Result<usize, String> {
+    writer.write_all(b"[").map_err(|error| error.to_string())?;
+    let mut offset = 0;
+    let mut expected_total = None;
+    loop {
+        let (rows, current_total) = read_page(offset)?;
+        let total = *expected_total.get_or_insert(current_total);
+        // The idle worker prevents app writes. Count checks also catch external cardinality
+        // changes, but cannot guarantee a snapshot against same-count external edits.
+        if current_total != total
+            || rows.len() != total.saturating_sub(offset).min(EXPORT_STREAM_PAGE_SIZE)
+        {
+            return Err(format!(
+                "crawl archive {name} changed or ended early while exporting; retry the export"
+            ));
+        }
+        for (index, row) in rows.iter().enumerate() {
+            if offset + index != 0 {
+                writer.write_all(b",").map_err(|error| error.to_string())?;
+            }
+            writer.write_all(b"\n").map_err(|error| error.to_string())?;
+            serde_json::to_writer(&mut *writer, row).map_err(|error| error.to_string())?;
+        }
+        offset += rows.len();
+        if offset == total {
+            writer
+                .write_all(b"\n]")
+                .map_err(|error| error.to_string())?;
+            return Ok(offset);
+        }
+    }
+}
+
+fn query_store_rows(store: &ActiveStore, query: GridQuery) -> Result<GridResponse, String> {
+    validate_grid_query(&query).map_err(|error| error.to_string())?;
+    match store {
+        ActiveStore::Memory(store) => Ok(store.query(query)),
+        ActiveStore::Sqlite(store) => store.try_query(query).map_err(|error| error.to_string()),
+    }
+}
+
+fn query_store_images(
+    store: &ActiveStore,
+    query: ImageAssetQuery,
+) -> Result<ImageAssetResponse, String> {
+    match store {
+        ActiveStore::Memory(store) => Ok(store.image_assets(query)),
+        ActiveStore::Sqlite(store) => store
+            .try_image_assets(query)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn query_store_link_edges(
+    store: &ActiveStore,
+    query: LinkEdgeQuery,
+) -> Result<LinkEdgeResponse, String> {
+    match store {
+        ActiveStore::Memory(store) => Ok(store.link_edges(query)),
+        ActiveStore::Sqlite(store) => store
+            .try_link_edges(query)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn query_store_anchor_texts(
+    store: &ActiveStore,
+    query: LinkEdgeQuery,
+) -> Result<AnchorTextResponse, String> {
+    match store {
+        ActiveStore::Memory(store) => Ok(store.anchor_texts(query)),
+        ActiveStore::Sqlite(store) => store
+            .try_anchor_texts(query)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+fn query_store_sitemap_validation(
+    store: &ActiveStore,
+    query: SitemapValidationQuery,
+) -> Result<SitemapValidationResponse, String> {
+    match store {
+        ActiveStore::Memory(store) => Ok(store.sitemap_validation(query)),
+        ActiveStore::Sqlite(store) => store
+            .try_sitemap_validation(query)
+            .map_err(|error| error.to_string()),
+    }
+}
+
+async fn export_xlsx_file(
+    state: &AppState,
+    path: PathBuf,
+    query: GridQuery,
+) -> Result<ExportFileResult, String> {
+    validate_grid_query(&query).map_err(|error| error.to_string())?;
+    with_store_worker(state, true, move |store| {
+        write_atomic_export(&path, |file| {
+            query_to_xlsx_writer(query, |page| query_store_rows(store, page), file)
+        })
+    })
+    .await
+}
+
+async fn xlsx_window_bytes(state: &AppState, query: GridQuery) -> Result<Vec<u8>, String> {
+    if query.limit > EXPORT_STREAM_PAGE_SIZE {
+        return Err(
+            "XLSX byte responses are limited to 10,000 rows; use export_file for larger exports"
+                .into(),
+        );
+    }
+    with_store_worker(state, false, move |store| {
+        records_to_xlsx_bytes(&query_store_rows(store, query)?.rows)
+            .map_err(|error| error.to_string())
+    })
+    .await
+}
+
+fn selected_records(store: &ActiveStore, ids: &[u64]) -> Result<Vec<CrawlRecord>, String> {
+    if !(1..=1_000).contains(&ids.len()) {
+        return Err("select between 1 and 1,000 rows".into());
+    }
+    let mut unique = HashSet::new();
+    if ids
+        .iter()
+        .any(|id| *id == 0 || *id > 9_007_199_254_740_991 || !unique.insert(*id))
+    {
+        return Err("selected row IDs must be unique positive safe integers".into());
+    }
+    let records = store
+        .try_records_by_ids(ids)
+        .map_err(|error| error.to_string())?;
+    if records.len() != ids.len() {
+        return Err(
+            "one or more selected rows no longer exist in this crawl; refresh the results".into(),
+        );
+    }
+    Ok(records)
+}
+
+async fn export_selected_csv_file(
+    state: &AppState,
+    path: PathBuf,
+    ids: Vec<u64>,
+) -> Result<ExportFileResult, String> {
+    with_store_worker(state, false, move |store| {
+        write_atomic_export(&path, |file| {
+            let records = selected_records(store, &ids)?;
+            records_to_csv(&records, file).map_err(|error| error.to_string())?;
+            Ok(records.len())
+        })
+    })
+    .await
+}
+
+async fn selected_csv_text(state: &AppState, ids: Vec<u64>) -> Result<String, String> {
+    with_store_worker(state, false, move |store| {
+        let records = selected_records(store, &ids)?;
+        let mut bytes = vec![0; 4 * 1024 * 1024];
+        let mut cursor = Cursor::new(bytes.as_mut_slice());
+        records_to_csv(&records, &mut cursor).map_err(|error| match error.kind() {
+            csv::ErrorKind::Io(error) if error.kind() == std::io::ErrorKind::WriteZero => {
+                "selected CSV exceeds the 4 MiB clipboard limit; export the selected rows to a file"
+                    .into()
+            }
+            _ => error.to_string(),
+        })?;
+        let length = cursor.position() as usize;
+        bytes.truncate(length);
+        String::from_utf8(bytes).map_err(|error| error.to_string())
+    })
+    .await
+}
+
 #[tauri::command(rename_all = "camelCase")]
-fn export_file(
+async fn export_selected_csv(
+    state: State<'_, AppState>,
+    record_ids: Vec<u64>,
+) -> Result<String, String> {
+    selected_csv_text(&state, record_ids).await
+}
+
+async fn export_queued_urls_file(
+    state: &AppState,
+    path: PathBuf,
+) -> Result<ExportFileResult, String> {
+    with_store_worker(state, false, move |store| {
+        write_atomic_export(&path, |file| {
+            let mut writer = csv::Writer::from_writer(file);
+            writer
+                .write_record([
+                    "url",
+                    "depth",
+                    "from_sitemap",
+                    "storage_key",
+                    "list_position",
+                    "list_duplicate_index",
+                ])
+                .map_err(|error| error.to_string())?;
+            let count = store
+                .try_visit_frontier(|item| {
+                    writer
+                        .write_record([
+                            item.url.clone(),
+                            item.depth.to_string(),
+                            item.from_sitemap.to_string(),
+                            item.storage_key.clone(),
+                            item.list_position
+                                .map(|value| value.to_string())
+                                .unwrap_or_default(),
+                            item.list_duplicate_index.to_string(),
+                        ])
+                        .map_err(std::io::Error::other)
+                })
+                .map_err(|error| error.to_string())?;
+            writer.flush().map_err(|error| error.to_string())?;
+            Ok(count)
+        })
+    })
+    .await
+}
+
+async fn export_image_alt_file(
+    state: &AppState,
+    path: PathBuf,
+) -> Result<ExportFileResult, String> {
+    with_store_worker(state, true, move |store| {
+        write_atomic_export(&path, |file| {
+            let mut writer = csv::Writer::from_writer(file);
+            writer
+                .write_record([
+                    "page_url",
+                    "image_url",
+                    "alt_text",
+                    "alt_len",
+                    "missing_alt",
+                    "alt_too_long",
+                    "source_position",
+                    "width",
+                    "height",
+                    "size_bytes",
+                    "oversized",
+                ])
+                .map_err(|error| error.to_string())?;
+            let mut query = ImageAssetQuery {
+                limit: EXPORT_STREAM_PAGE_SIZE,
+                ..ImageAssetQuery::default()
+            };
+            let mut expected_total = None;
+            loop {
+                let response = query_store_images(store, query.clone())?;
+                let total = *expected_total.get_or_insert(response.total);
+                if response.total != total
+                    || response.images.len() != (total - query.offset).min(query.limit)
+                {
+                    return Err("image assets changed while exporting; retry the export".into());
+                }
+                for image in &response.images {
+                    writer
+                        .serialize((
+                            &image.page_url,
+                            &image.image_url,
+                            &image.alt_text,
+                            image.alt_len,
+                            image.missing_alt,
+                            image.alt_too_long,
+                            image.source_position,
+                            image.width,
+                            image.height,
+                            image.size_bytes,
+                            image.oversized,
+                        ))
+                        .map_err(|error| error.to_string())?;
+                }
+                query.offset += response.images.len();
+                if query.offset == total {
+                    writer.flush().map_err(|error| error.to_string())?;
+                    return Ok(total);
+                }
+            }
+        })
+    })
+    .await
+}
+
+async fn export_graph_file(
+    state: &AppState,
+    path: PathBuf,
+    query: CrawlGraphQuery,
+    kind: ExportFileKind,
+) -> Result<ExportFileResult, String> {
+    with_store_worker(state, false, move |store| {
+        write_atomic_export(&path, |file| {
+            let graph = store
+                .try_crawl_graph(query)
+                .map_err(|error| error.to_string())?;
+            match kind {
+                ExportFileKind::GraphJson => {
+                    serde_json::to_writer_pretty(file, &graph)
+                        .map_err(|error| error.to_string())?;
+                    Ok(graph.nodes.len())
+                }
+                ExportFileKind::GraphNodesCsv => {
+                    graph_nodes_to_csv(&graph.nodes, file).map_err(|error| error.to_string())?;
+                    Ok(graph.nodes.len())
+                }
+                ExportFileKind::GraphEdgesCsv => {
+                    link_edges_to_csv(&graph.edges, file).map_err(|error| error.to_string())?;
+                    Ok(graph.edges.len())
+                }
+                _ => unreachable!("graph exporter only accepts graph formats"),
+            }
+        })
+    })
+    .await
+}
+
+fn validate_export_request(request: &ExportFileRequest) -> Result<(), String> {
+    if matches!(
+        request.kind,
+        ExportFileKind::Csv | ExportFileKind::Xlsx | ExportFileKind::Sitemap
+    ) && let Some(query) = &request.query
+    {
+        validate_grid_query(query).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn export_file(
     app: AppHandle,
     state: State<'_, AppState>,
     request: ExportFileRequest,
 ) -> Result<ExportFileResult, String> {
+    validate_export_request(&request)?;
     let timestamp = now_ms();
+    if matches!(&request.kind, ExportFileKind::AuditWorkbook) {
+        let path = export_path(&app, &format!("ferrous-frog-audit-{timestamp}.xlsx"))?;
+        return export_audit_workbook(&state, path).await;
+    }
+    if matches!(&request.kind, ExportFileKind::CrawlArchive) {
+        let path = export_path(
+            &app,
+            &format!("ferrous-frog-crawl-archive-{timestamp}.ffcrawl.json"),
+        )?;
+        return export_crawl_archive_file(&state, path, timestamp).await;
+    }
+    if matches!(&request.kind, ExportFileKind::Xlsx) {
+        let path = export_path(&app, &format!("ferrous-frog-export-{timestamp}.xlsx"))?;
+        return export_xlsx_file(
+            &state,
+            path,
+            request.query.unwrap_or_else(export_grid_query),
+        )
+        .await;
+    }
+    if matches!(&request.kind, ExportFileKind::SelectedCsv) {
+        let path = export_path(&app, &format!("ferrous-frog-selected-{timestamp}.csv"))?;
+        return export_selected_csv_file(&state, path, request.record_ids.unwrap_or_default())
+            .await;
+    }
+    if matches!(&request.kind, ExportFileKind::QueuedUrlsCsv) {
+        let path = export_path(&app, &format!("ferrous-frog-queued-{timestamp}.csv"))?;
+        return export_queued_urls_file(&state, path).await;
+    }
+    if matches!(&request.kind, ExportFileKind::ImageAltCsv) {
+        let path = export_path(&app, &format!("ferrous-frog-image-alt-{timestamp}.csv"))?;
+        return export_image_alt_file(&state, path).await;
+    }
+    if let Some(filename) = match &request.kind {
+        ExportFileKind::GraphJson => Some(format!("ferrous-frog-graph-{timestamp}.json")),
+        ExportFileKind::GraphNodesCsv => Some(format!("ferrous-frog-graph-nodes-{timestamp}.csv")),
+        ExportFileKind::GraphEdgesCsv => Some(format!("ferrous-frog-graph-edges-{timestamp}.csv")),
+        _ => None,
+    } {
+        let path = export_path(&app, &filename)?;
+        return export_graph_file(
+            &state,
+            path,
+            request.graph_query.unwrap_or_default(),
+            request.kind,
+        )
+        .await;
+    }
     if let Some(result) = stream_export_file(&app, &state, &request, timestamp)? {
         return Ok(result);
     }
@@ -1249,6 +2040,15 @@ fn export_file(
             .lock()
             .map_err(|_| "store lock poisoned".to_string())?;
         match request.kind {
+            ExportFileKind::AuditWorkbook
+            | ExportFileKind::CrawlArchive
+            | ExportFileKind::Xlsx
+            | ExportFileKind::SelectedCsv
+            | ExportFileKind::QueuedUrlsCsv
+            | ExportFileKind::ImageAltCsv
+            | ExportFileKind::GraphJson
+            | ExportFileKind::GraphNodesCsv
+            | ExportFileKind::GraphEdgesCsv => unreachable!("scoped export returned earlier"),
             ExportFileKind::Csv => {
                 let records = store
                     .query(request.query.unwrap_or_else(export_grid_query))
@@ -1258,18 +2058,6 @@ fn export_file(
                 (
                     format!("ferrous-frog-export-{timestamp}.csv"),
                     csv.into_bytes(),
-                    row_count,
-                )
-            }
-            ExportFileKind::Xlsx => {
-                let records = store
-                    .query(request.query.unwrap_or_else(export_grid_query))
-                    .rows;
-                let row_count = records.len();
-                let bytes = records_to_xlsx_bytes(&records).map_err(|error| error.to_string())?;
-                (
-                    format!("ferrous-frog-export-{timestamp}.xlsx"),
-                    bytes,
                     row_count,
                 )
             }
@@ -1350,71 +2138,6 @@ fn export_file(
                     row_count,
                 )
             }
-            ExportFileKind::GraphJson => {
-                let graph = store.crawl_graph(request.graph_query.unwrap_or_default());
-                let row_count = graph.nodes.len();
-                let bytes = serde_json::to_vec_pretty(&graph).map_err(|error| error.to_string())?;
-                (
-                    format!("ferrous-frog-graph-{timestamp}.json"),
-                    bytes,
-                    row_count,
-                )
-            }
-            ExportFileKind::GraphNodesCsv => {
-                let graph = store.crawl_graph(request.graph_query.unwrap_or_default());
-                let row_count = graph.nodes.len();
-                let csv =
-                    graph_nodes_to_csv_string(&graph.nodes).map_err(|error| error.to_string())?;
-                (
-                    format!("ferrous-frog-graph-nodes-{timestamp}.csv"),
-                    csv.into_bytes(),
-                    row_count,
-                )
-            }
-            ExportFileKind::GraphEdgesCsv => {
-                let graph = store.crawl_graph(request.graph_query.unwrap_or_default());
-                let row_count = graph.edges.len();
-                let csv =
-                    link_edges_to_csv_string(&graph.edges).map_err(|error| error.to_string())?;
-                (
-                    format!("ferrous-frog-graph-edges-{timestamp}.csv"),
-                    csv.into_bytes(),
-                    row_count,
-                )
-            }
-            ExportFileKind::CrawlArchive => {
-                let records = store.records();
-                let link_edges = store
-                    .link_edges(LinkEdgeQuery {
-                        offset: 0,
-                        limit: 1_000_000,
-                        ..LinkEdgeQuery::default()
-                    })
-                    .edges;
-                let image_assets = store
-                    .image_assets(ImageAssetQuery {
-                        offset: 0,
-                        limit: 1_000_000,
-                        ..ImageAssetQuery::default()
-                    })
-                    .images;
-                let row_count = records.len();
-                let archive = CrawlArchive {
-                    schema_version: CRAWL_ARCHIVE_SCHEMA_VERSION,
-                    exported_at_ms: timestamp,
-                    records,
-                    link_edges,
-                    image_assets,
-                    frontier_state: store.load_frontier_state(),
-                };
-                let bytes =
-                    serde_json::to_vec_pretty(&archive).map_err(|error| error.to_string())?;
-                (
-                    format!("ferrous-frog-crawl-archive-{timestamp}.ffcrawl.json"),
-                    bytes,
-                    row_count,
-                )
-            }
         }
     };
 
@@ -1427,62 +2150,129 @@ fn export_file(
 }
 
 #[tauri::command(rename_all = "camelCase")]
-fn import_crawl_archive(
+async fn import_crawl_archive(
     app: AppHandle,
     state: State<'_, AppState>,
     request: ImportCrawlArchiveRequest,
 ) -> Result<CrawlArchiveImportResult, String> {
+    let task = state.crawl_task.lock().await;
+    ensure_idle(&state, &task)?;
     let bytes = fs::read(request.path.trim())
         .map_err(|error| format!("failed to read crawl archive: {error}"))?;
     let archive: CrawlArchive = serde_json::from_slice(&bytes)
         .map_err(|error| format!("invalid crawl archive: {error}"))?;
+    let _ = request.storage_mode; // Older clients still send this preference.
+    import_archive_into_session(&state, &app_data_dir(&app)?, archive)
+}
+
+fn import_archive_into_session(
+    state: &AppState,
+    dir: &Path,
+    archive: CrawlArchive,
+) -> Result<CrawlArchiveImportResult, String> {
     if archive.schema_version != CRAWL_ARCHIVE_SCHEMA_VERSION {
         return Err(format!(
             "unsupported crawl archive schema version {}",
             archive.schema_version
         ));
     }
-
-    let store = prepare_store(&app, &state, request.storage_mode, false)?;
-    let record_count = archive.records.len();
-    let link_edge_count = archive.link_edges.len();
-    let image_asset_count = archive.image_assets.len();
-    let frontier_item_count = archive
-        .frontier_state
-        .as_ref()
-        .map(|state| state.queued.len())
-        .unwrap_or(0);
-
-    for record in archive.records {
-        store.upsert(record);
-    }
-    for edge in archive.link_edges {
-        store.add_link_edge(edge);
-    }
-
-    let mut image_assets_by_page = HashMap::<String, Vec<ImageAsset>>::new();
-    for image in archive.image_assets {
-        image_assets_by_page
-            .entry(image.page_url.clone())
-            .or_default()
-            .push(image);
-    }
-    for (page_url, images) in image_assets_by_page {
-        store.add_image_assets(&page_url, images);
-    }
-
-    if let Some(frontier_state) = archive.frontier_state {
-        store.save_frontier_state(frontier_state);
+    let mut active_store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_string())?;
+    let mut current = state
+        .current_session_id
+        .lock()
+        .map_err(|_| "session lock poisoned".to_string())?;
+    let conn = sessions::index_connection(dir)?;
+    let start_url = archive
+        .records
+        .first()
+        .map(|record| record.url.as_str())
+        .or_else(|| {
+            archive
+                .frontier_state
+                .as_ref()?
+                .queued
+                .first()
+                .map(|item| item.url.as_str())
+        })
+        .unwrap_or_default();
+    let mode = if archive
+        .records
+        .iter()
+        .any(|record| record.list_position.is_some())
+        || archive.frontier_state.as_ref().is_some_and(|frontier| {
+            frontier
+                .queued
+                .iter()
+                .any(|item| item.list_position.is_some())
+        }) {
+        "list"
     } else {
-        store.clear_frontier_state();
-    }
-
-    Ok(CrawlArchiveImportResult {
-        records: record_count,
-        link_edges: link_edge_count,
-        image_assets: image_asset_count,
-        frontier_items: frontier_item_count,
-    })
+        "spider"
+    };
+    let (session, store) =
+        sessions::create_session(&conn, dir, "Imported crawl", start_url, None, "importing")?;
+    let mut result = CrawlArchiveImportResult {
+        session: session.clone(),
+        records: archive.records.len(),
+        link_edges: archive.link_edges.len(),
+        image_assets: archive.image_assets.len(),
+        frontier_items: archive
+            .frontier_state
+            .as_ref()
+            .map(|state| state.queued.len())
+            .unwrap_or(0),
+    };
+    let import = || -> Result<(), String> {
+        for record in archive.records {
+            store
+                .try_upsert(record)
+                .map_err(|error| error.to_string())?;
+        }
+        for edge in archive.link_edges {
+            store
+                .try_add_link_edge(edge)
+                .map_err(|error| error.to_string())?;
+        }
+        let mut images_by_page = HashMap::<String, Vec<ImageAsset>>::new();
+        for image in archive.image_assets {
+            images_by_page
+                .entry(image.page_url.clone())
+                .or_default()
+                .push(image);
+        }
+        for (page_url, images) in images_by_page {
+            store
+                .try_add_image_assets(&page_url, images)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(frontier) = archive.frontier_state {
+            store
+                .try_save_frontier_state(frontier)
+                .map_err(|error| error.to_string())?;
+        }
+        conn.execute(
+            "UPDATE crawl_sessions SET mode = ?1 WHERE id = ?2",
+            params![mode, session.id],
+        )
+        .map_err(|error| error.to_string())?;
+        sessions::save_progress(&conn, &session.id, "imported", result.records)
+    };
+    let session = match import().and_then(|()| get_session(&conn, &session.id, Some(&session.id))) {
+        Ok(session) => session,
+        Err(error) => {
+            drop(store);
+            let _ = conn.execute("DELETE FROM crawl_sessions WHERE id = ?1", [&session.id]);
+            let _ = fs::remove_file(&session.database_path);
+            return Err(format!("failed to import crawl archive: {error}"));
+        }
+    };
+    result.session = session.clone();
+    *active_store = ActiveStore::Sqlite(store);
+    *current = Some(session.id);
+    Ok(result)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1507,6 +2297,40 @@ fn compare_crawl_archive(
         .map_err(|_| "store lock poisoned".to_string())?
         .records();
     Ok(compare_records(&archive.records, &current_records))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn compare_crawl_sessions(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    baseline_session_id: String,
+    current_session_id: String,
+) -> Result<CrawlComparisonResponse, String> {
+    let task = state.crawl_task.lock().await;
+    let active_id = if task
+        .as_ref()
+        .is_some_and(|task| !task.inner().is_finished())
+    {
+        state
+            .current_session_id
+            .lock()
+            .map_err(|_| "session lock poisoned".to_string())?
+            .clone()
+    } else {
+        None
+    };
+    let dir = app_data_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = sessions::index_connection(&dir)?;
+        sessions::compare_sessions(
+            &conn,
+            &baseline_session_id,
+            &current_session_id,
+            active_id.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1690,30 +2514,6 @@ fn metric_delta(label: &str, previous: usize, current: usize) -> ComparisonMetri
     }
 }
 
-fn prepare_store(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
-    storage_mode: StorageMode,
-    resume: bool,
-) -> Result<ActiveStore, String> {
-    let store = match storage_mode {
-        StorageMode::Memory => ActiveStore::memory(),
-        StorageMode::Database => ActiveStore::sqlite(active_database_path(app, state)?)
-            .map_err(|error| format!("failed to open database store: {error}"))?,
-    };
-
-    if !resume {
-        store.clear();
-    }
-
-    *state
-        .store
-        .lock()
-        .map_err(|_| "store lock poisoned".to_string())? = store.clone();
-
-    Ok(store)
-}
-
 fn active_database_path(app: &AppHandle, state: &State<'_, AppState>) -> Result<PathBuf, String> {
     let current_session_id = state
         .current_session_id
@@ -1738,112 +2538,14 @@ fn database_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("ferrous-frog-current.sqlite3"))
 }
 
-fn sessions_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
+fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
         .app_data_dir()
-        .map_err(|error| format!("failed to resolve app data directory: {error}"))?
-        .join("sessions");
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("failed to create sessions directory: {error}"))?;
-    Ok(dir)
+        .map_err(|error| format!("failed to resolve app data directory: {error}"))
 }
 
 fn session_index_connection(app: &AppHandle) -> Result<Connection, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("failed to resolve app data directory: {error}"))?;
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("failed to create app data directory: {error}"))?;
-    let conn = Connection::open(dir.join("ferrous-frog-sessions.sqlite3"))
-        .map_err(|error| error.to_string())?;
-    conn.execute_batch(
-        "
-        CREATE TABLE IF NOT EXISTS crawl_sessions (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            start_url TEXT NOT NULL,
-            database_path TEXT NOT NULL,
-            created_at_ms INTEGER NOT NULL,
-            updated_at_ms INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_crawl_sessions_updated_at
-            ON crawl_sessions(updated_at_ms DESC);
-
-        CREATE TABLE IF NOT EXISTS config_profiles (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            config_json TEXT NOT NULL,
-            created_at_ms INTEGER NOT NULL,
-            updated_at_ms INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_config_profiles_updated_at
-            ON config_profiles(updated_at_ms DESC);
-
-        CREATE TABLE IF NOT EXISTS integration_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at_ms INTEGER NOT NULL
-        );
-        ",
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(conn)
-}
-
-fn query_sessions(
-    conn: &Connection,
-    current_session_id: Option<&str>,
-) -> Result<Vec<CrawlSession>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, name, start_url, database_path, created_at_ms, updated_at_ms
-             FROM crawl_sessions
-             ORDER BY updated_at_ms DESC, name ASC",
-        )
-        .map_err(|error| error.to_string())?;
-    let rows = stmt
-        .query_map([], |row| session_from_row(row, current_session_id))
-        .map_err(|error| error.to_string())?;
-    let mut sessions = Vec::new();
-    for row in rows {
-        sessions.push(row.map_err(|error| error.to_string())?);
-    }
-    Ok(sessions)
-}
-
-fn get_session(
-    conn: &Connection,
-    session_id: &str,
-    current_session_id: Option<&str>,
-) -> Result<CrawlSession, String> {
-    conn.query_row(
-        "SELECT id, name, start_url, database_path, created_at_ms, updated_at_ms
-         FROM crawl_sessions
-         WHERE id = ?1",
-        [session_id],
-        |row| session_from_row(row, current_session_id),
-    )
-    .optional()
-    .map_err(|error| error.to_string())?
-    .ok_or_else(|| "crawl session not found".to_string())
-}
-
-fn session_from_row(
-    row: &rusqlite::Row<'_>,
-    current_session_id: Option<&str>,
-) -> rusqlite::Result<CrawlSession> {
-    let id: String = row.get(0)?;
-    Ok(CrawlSession {
-        is_current: current_session_id == Some(id.as_str()),
-        id,
-        name: row.get(1)?,
-        start_url: row.get(2)?,
-        database_path: row.get(3)?,
-        created_at_ms: row.get(4)?,
-        updated_at_ms: row.get(5)?,
-    })
+    sessions::index_connection(&app_data_dir(app)?)
 }
 
 fn query_config_profiles(conn: &Connection) -> Result<Vec<ConfigProfile>, String> {
@@ -1955,30 +2657,6 @@ fn search_console_credential_status(
         token_saved: token_status.1,
         message: token_status.2,
     })
-}
-
-fn touch_current_session(
-    app: &AppHandle,
-    state: &State<'_, AppState>,
-    start_url: &str,
-) -> Result<(), String> {
-    let Some(session_id) = state
-        .current_session_id
-        .lock()
-        .map_err(|_| "session lock poisoned".to_string())?
-        .clone()
-    else {
-        return Ok(());
-    };
-    let conn = session_index_connection(app)?;
-    conn.execute(
-        "UPDATE crawl_sessions
-         SET start_url = ?1, updated_at_ms = ?2
-         WHERE id = ?3",
-        params![start_url, now_ms(), session_id],
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -2175,6 +2853,12 @@ fn export_path(app: &AppHandle, filename: &str) -> Result<PathBuf, String> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(window_state::FLAGS)
+                .with_denylist(&["splashscreen"])
+                .build(),
+        )
         .manage(AppState {
             store: Mutex::new(ActiveStore::memory()),
             control: Mutex::new(None),
@@ -2183,8 +2867,16 @@ fn main() {
             frontend_ready: AtomicBool::new(false),
             exit_confirmed: AtomicBool::new(false),
         })
+        .manage(pagespeed::PageSpeedState::default())
         .setup(|app| {
+            // Start the splash minimum after Tauri has created its windows.
+            app.manage(Instant::now());
             let app = app.handle().clone();
+            if let Err(error) =
+                session_index_connection(&app).and_then(|conn| sessions::mark_interrupted(&conn))
+            {
+                eprintln!("failed to recover saved crawl history: {error}");
+            }
             tauri::async_runtime::spawn(async move {
                 // Keep the main window reachable if the frontend cannot finish startup.
                 tokio::time::sleep(Duration::from_secs(12)).await;
@@ -2195,10 +2887,17 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            content::preview_content_area,
+            content::preview_custom_extractor,
             updates::check_for_updates,
+            get_rendering_status,
+            serp::measure_serp_snippet,
+            serp::import_serp_snippets,
+            serp::export_serp_snippets,
             complete_startup,
             quit_app,
             start_crawl,
+            validate_crawl_configuration,
             pause_crawl,
             resume_crawl,
             stop_crawl,
@@ -2206,6 +2905,7 @@ fn main() {
             test_robots_txt_batch,
             download_robots_txt,
             get_rows,
+            validate_result_filters,
             get_url_tree,
             get_issues,
             get_link_edges,
@@ -2226,11 +2926,17 @@ fn main() {
             load_config_profile,
             delete_config_profile,
             get_search_console_credential_status,
+            pagespeed::get_page_speed_credential_status,
+            pagespeed::save_page_speed_api_key,
+            pagespeed::clear_page_speed_api_key,
+            pagespeed::run_page_speed,
+            pagespeed::cancel_page_speed,
             save_search_console_credentials,
             clear_search_console_credentials,
             test_search_console_credentials,
             merge_search_console_metrics,
             export_csv,
+            export_selected_csv,
             export_xlsx,
             export_sitemap,
             export_link_edges_csv,
@@ -2239,6 +2945,7 @@ fn main() {
             export_file,
             import_crawl_archive,
             compare_crawl_archive,
+            compare_crawl_sessions,
             open_external_url
         ])
         .build(tauri::generate_context!())
@@ -2273,6 +2980,35 @@ fn main() {
 mod lifecycle_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn history_exposes_legacy_session_metadata_without_config() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE crawl_sessions (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, start_url TEXT NOT NULL,
+                database_path TEXT NOT NULL, created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+             );
+             INSERT INTO crawl_sessions VALUES (
+                'old', 'Old crawl', 'https://example.test/', '/missing.sqlite3', 1, 2
+             );",
+        )
+        .unwrap();
+        sessions::initialize_index(&conn).unwrap();
+        let sessions = query_sessions(&conn, None).unwrap();
+        let value = serde_json::to_value(&sessions[0]).unwrap();
+        assert_eq!(value["mode"], "spider");
+        assert_eq!(value["status"], "unavailable");
+        assert_eq!(
+            conn.query_row("SELECT status FROM crawl_sessions", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            "unknown"
+        );
+        assert!(value["crawled"].is_null());
+        assert!(value.get("config").is_none());
+    }
 
     #[tokio::test]
     async fn stopping_waits_for_crawl_cleanup_before_returning() {

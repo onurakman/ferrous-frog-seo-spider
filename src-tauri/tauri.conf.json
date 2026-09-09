@@ -15,8 +15,8 @@
         "label": "splashscreen",
         "title": "Starting Ferrous Frog",
         "url": "splash.html",
-        "width": 400,
-        "height": 280,
+        "width": 520,
+        "height": 340,
         "center": true,
         "resizable": false,
         "decorations": false
@@ -24,6 +24,7 @@
       {
         "label": "main",
         "visible": false,
+        "center": true,
         "title": "Ferrous Frog SEO Spider",
         "width": 1280,
         "height": 840,

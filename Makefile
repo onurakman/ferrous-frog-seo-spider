@@ -55,8 +55,13 @@ check-tauri: ## Check the Tauri app crate.
 	cargo check -p ferrous-frog-app --locked
 
 .PHONY: check-js-rendering
-check-js-rendering: ## Check the desktop app with the optional Chrome CDP backend.
+check-js-rendering: ## Check the optional Chrome CDP backend and test browser discovery.
 	cargo check -p ferrous-frog-app --features js-rendering --locked
+	cargo test -p ferrous-frog-crawler-core --features js-rendering rendering::tests --locked
+
+.PHONY: test-rendering
+test-rendering: check-js-rendering ## Verify browser HTTP politeness, nested requests and pause/stop with Chrome.
+	cargo test -p ferrous-frog-crawler-core --features js-rendering chrome_rendering_ --locked -- --ignored
 
 .PHONY: check-versions
 check-versions: ## Verify that Rust, npm, Tauri and release versions agree.
@@ -75,14 +80,15 @@ test: ## Run all Rust tests.
 	cargo test --workspace --locked
 
 .PHONY: test-ui
-test-ui: ## Exercise the React workspace in headless Chrome with Tauri IPC fixtures.
+test-ui: build-web ## Exercise the React workspace and production shell in headless Chrome.
+	node scripts/check-crawl-graph.mjs
 	node scripts/smoke-ui.mjs
 
 BENCH_URLS ?= 1000000
 
 .PHONY: bench-synthetic
-bench-synthetic: ## Run the ignored SQLite synthetic URL benchmark. Override with BENCH_URLS=10000.
-	BENCH_URLS=$(BENCH_URLS) cargo test -p ferrous-frog-storage sqlite_large_synthetic_storage_benchmark -- --ignored --nocapture
+bench-synthetic: ## Run the release-mode SQLite synthetic benchmark. Override with BENCH_URLS=10000.
+	BENCH_URLS=$(BENCH_URLS) cargo test -p ferrous-frog-storage --release --locked sqlite_large_synthetic_storage_benchmark -- --ignored --nocapture
 
 .PHONY: fmt
 fmt: ## Format Rust source.
@@ -94,7 +100,7 @@ fmt-check: ## Check Rust formatting.
 
 .PHONY: verify ci
 verify: ci ## Run the same checks as GitHub Actions (Chrome required).
-ci: check-versions test-release fmt-check lint test build-web test-ui check-js-rendering ## Run all CI checks.
+ci: check-versions test-release fmt-check lint test build-web test-ui test-rendering ## Run all CI checks.
 
 .PHONY: clean
 clean: ## Remove generated build outputs.

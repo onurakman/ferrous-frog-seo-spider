@@ -1,15 +1,19 @@
 use csv::Writer;
 use ferrous_frog_storage::{
-    CrawlRecord, GraphNode, LinkEdge, SitemapValidationRow, is_broken_record,
-    is_success_html_record, is_success_record, summarize,
+    CrawlRecord, CrawlSummary, GraphNode, GridQuery, GridResponse, IssueView, LinkEdge,
+    SitemapValidationRow, is_broken_record, is_success_html_record, is_success_record, summarize,
+    validate_grid_query,
 };
 use minijinja::{Environment, context};
-use rust_xlsxwriter::{Workbook, XlsxError};
+use rust_xlsxwriter::{Format, Workbook, Worksheet, XlsxError};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
-const HEADERS: [&str; 89] = [
+#[cfg(test)]
+mod workbook_tests;
+
+const HEADERS: [&str; 91] = [
     "id",
     "url",
     "final_url",
@@ -99,6 +103,8 @@ const HEADERS: [&str; 89] = [
     "search_console_impressions",
     "search_console_ctr",
     "search_console_average_position",
+    "title_count",
+    "meta_description_count",
 ];
 
 const LINK_EDGE_HEADERS: [&str; 13] = [
@@ -313,6 +319,14 @@ pub fn records_to_csv<W: Write>(records: &[CrawlRecord], writer: W) -> csv::Resu
                 .search_console_average_position
                 .map(|value| format!("{value:.4}"))
                 .unwrap_or_default(),
+            record
+                .title_count
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .meta_description_count
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
         ])?;
     }
 
@@ -478,6 +492,9 @@ pub fn sitemap_validation_to_csv_string(rows: &[SitemapValidationRow]) -> csv::R
 }
 
 pub fn records_to_xlsx_bytes(records: &[CrawlRecord]) -> Result<Vec<u8>, XlsxError> {
+    if records.len() > EXCEL_DATA_ROW_LIMIT {
+        return Err(XlsxError::RowColumnLimitError);
+    }
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
     worksheet.set_name("Crawl Results")?;
@@ -487,170 +504,668 @@ pub fn records_to_xlsx_bytes(records: &[CrawlRecord]) -> Result<Vec<u8>, XlsxErr
     }
 
     for (index, record) in records.iter().enumerate() {
-        let row = (index + 1) as u32;
-        worksheet.write_number(row, 0, record.id as f64)?;
-        worksheet.write_string(row, 1, &record.url)?;
-        worksheet.write_string(row, 2, &record.final_url)?;
-        worksheet.write_string(row, 3, format!("{:?}", record.classification))?;
-        if let Some(status_code) = record.status_code {
-            worksheet.write_number(row, 4, f64::from(status_code))?;
-        }
-        worksheet.write_string(row, 5, &record.status_text)?;
-        worksheet.write_string(row, 6, record.content_type.as_deref().unwrap_or_default())?;
-        worksheet.write_string(row, 7, &record.indexability)?;
-        worksheet.write_string(row, 8, &record.indexability_status)?;
-        worksheet.write_number(row, 9, record.response_time_ms as f64)?;
-        if let Some(value) = record.dns_lookup_time_ms {
-            worksheet.write_number(row, 10, value as f64)?;
-        }
-        if let Some(value) = record.ttfb_ms {
-            worksheet.write_number(row, 11, value as f64)?;
-        }
-        if let Some(value) = record.download_time_ms {
-            worksheet.write_number(row, 12, value as f64)?;
-        }
-        if let Some(value) = record.total_network_time_ms {
-            worksheet.write_number(row, 13, value as f64)?;
-        }
-        if let Some(value) = record.transfer_rate_bytes_per_sec {
-            worksheet.write_number(row, 14, value as f64)?;
-        }
-        worksheet.write_number(row, 15, f64::from(record.resolved_ip_count))?;
-        worksheet.write_number(row, 16, record.size_bytes as f64)?;
-        worksheet.write_string(row, 17, record.response_hash.as_deref().unwrap_or_default())?;
-        worksheet.write_number(row, 18, record.word_count as f64)?;
-        worksheet.write_number(row, 19, record.text_to_code_ratio)?;
-        worksheet.write_string(
-            row,
-            20,
-            record
-                .simhash
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        )?;
-        if let Some(cluster_id) = record.near_duplicate_cluster_id {
-            worksheet.write_number(row, 21, cluster_id as f64)?;
-        }
-        worksheet.write_number(row, 22, record.depth as f64)?;
-        worksheet.write_string(
-            row,
-            23,
-            record.redirect_target.as_deref().unwrap_or_default(),
-        )?;
-        worksheet.write_string(row, 24, record.title.as_deref().unwrap_or_default())?;
-        worksheet.write_number(row, 25, record.title_len as f64)?;
-        worksheet.write_string(
-            row,
-            26,
-            record.meta_description.as_deref().unwrap_or_default(),
-        )?;
-        worksheet.write_number(row, 27, record.meta_description_len as f64)?;
-        worksheet.write_string(row, 28, record.meta_robots.as_deref().unwrap_or_default())?;
-        worksheet.write_string(row, 29, record.x_robots_tag.as_deref().unwrap_or_default())?;
-        worksheet.write_string(row, 30, record.h1.as_deref().unwrap_or_default())?;
-        worksheet.write_number(row, 31, record.h1_len as f64)?;
-        worksheet.write_number(row, 32, record.h1_count as f64)?;
-        worksheet.write_string(row, 33, record.h2.as_deref().unwrap_or_default())?;
-        worksheet.write_number(row, 34, record.h2_len as f64)?;
-        worksheet.write_number(row, 35, record.h2_count as f64)?;
-        worksheet.write_string(row, 36, record.canonical.as_deref().unwrap_or_default())?;
-        worksheet.write_number(row, 37, record.canonical_count as f64)?;
-        worksheet.write_number(row, 38, f64::from(record.image_count))?;
-        worksheet.write_number(row, 39, f64::from(record.images_missing_alt))?;
-        worksheet.write_number(row, 40, f64::from(record.images_alt_too_long))?;
-        worksheet.write_number(row, 41, f64::from(record.mixed_content_count))?;
-        worksheet.write_number(row, 42, f64::from(record.insecure_form_count))?;
-        worksheet.write_string(row, 43, record.hsts_header.to_string())?;
-        worksheet.write_string(row, 44, record.content_security_policy_header.to_string())?;
-        worksheet.write_string(row, 45, record.x_frame_options_header.to_string())?;
-        worksheet.write_string(row, 46, record.x_content_type_options_header.to_string())?;
-        worksheet.write_string(row, 47, record.viewport.to_string())?;
-        worksheet.write_string(row, 48, record.amphtml.as_deref().unwrap_or_default())?;
-        worksheet.write_string(row, 49, record.rel_next.as_deref().unwrap_or_default())?;
-        worksheet.write_string(row, 50, record.rel_prev.as_deref().unwrap_or_default())?;
-        worksheet.write_number(row, 51, f64::from(record.hreflang_count))?;
-        worksheet.write_number(row, 52, f64::from(record.hreflang_invalid_count))?;
-        worksheet.write_string(row, 53, record.hreflang_missing_self_reference.to_string())?;
-        worksheet.write_number(row, 54, f64::from(record.json_ld_count))?;
-        worksheet.write_number(row, 55, f64::from(record.json_ld_invalid_count))?;
-        worksheet.write_number(row, 56, f64::from(record.structured_data_error_count))?;
-        worksheet.write_number(row, 57, f64::from(record.structured_data_warning_count))?;
-        worksheet.write_string(
-            row,
-            58,
-            serde_json::to_string(&record.structured_data_issues).unwrap_or_default(),
-        )?;
-        worksheet.write_number(row, 59, f64::from(record.open_graph_count))?;
-        worksheet.write_number(row, 60, f64::from(record.twitter_card_count))?;
-        worksheet.write_number(row, 61, f64::from(record.deprecated_html_tag_count))?;
-        worksheet.write_number(row, 62, f64::from(record.duplicate_id_count))?;
-        worksheet.write_string(row, 63, record.js_rendered.to_string())?;
-        worksheet.write_string(row, 64, record.rendered_dom_changed.to_string())?;
-        worksheet.write_number(row, 65, f64::from(record.rendered_word_count_delta))?;
-        worksheet.write_number(row, 66, f64::from(record.rendered_link_count_delta))?;
-        worksheet.write_number(row, 67, f64::from(record.inlink_count))?;
-        worksheet.write_number(row, 68, f64::from(record.outlink_count))?;
-        worksheet.write_number(row, 69, f64::from(record.internal_outlink_count))?;
-        worksheet.write_number(row, 70, f64::from(record.external_outlink_count))?;
-        worksheet.write_string(
-            row,
-            71,
-            serde_json::to_string(&record.custom_extractions).unwrap_or_default(),
-        )?;
-        worksheet.write_string(
-            row,
-            72,
-            serde_json::to_string(&record.custom_searches).unwrap_or_default(),
-        )?;
-        worksheet.write_string(row, 73, record.error.as_deref().unwrap_or_default())?;
-        worksheet.write_boolean(row, 74, record.in_sitemap)?;
-        worksheet.write_string(row, 75, &record.storage_key)?;
-        if let Some(list_position) = record.list_position {
-            worksheet.write_number(row, 76, f64::from(list_position))?;
-        }
-        worksheet.write_number(row, 77, f64::from(record.list_duplicate_index))?;
-        worksheet.write_string(
-            row,
-            78,
-            record
-                .first_inlink_source_url
-                .as_deref()
-                .unwrap_or_default(),
-        )?;
-        worksheet.write_string(
-            row,
-            79,
-            record
-                .first_inlink_anchor_text
-                .as_deref()
-                .unwrap_or_default(),
-        )?;
-        if let Some(source_position) = record.first_inlink_source_position {
-            worksheet.write_number(row, 80, f64::from(source_position))?;
-        }
-        if let Some(value) = record.tcp_connect_time_ms {
-            worksheet.write_number(row, 81, value as f64)?;
-        }
-        if let Some(value) = record.tls_handshake_time_ms {
-            worksheet.write_number(row, 82, value as f64)?;
-        }
-        worksheet.write_number(row, 83, f64::from(record.title_pixel_width))?;
-        worksheet.write_number(row, 84, f64::from(record.meta_description_pixel_width))?;
-        if let Some(value) = record.search_console_clicks {
-            worksheet.write_number(row, 85, value)?;
-        }
-        if let Some(value) = record.search_console_impressions {
-            worksheet.write_number(row, 86, value)?;
-        }
-        if let Some(value) = record.search_console_ctr {
-            worksheet.write_number(row, 87, value)?;
-        }
-        if let Some(value) = record.search_console_average_position {
-            worksheet.write_number(row, 88, value)?;
-        }
+        write_xlsx_record(worksheet, (index + 1) as u32, record)?;
     }
 
     workbook.save_to_buffer()
+}
+
+fn write_xlsx_record(
+    worksheet: &mut Worksheet,
+    row: u32,
+    record: &CrawlRecord,
+) -> Result<(), XlsxError> {
+    worksheet.write_number(row, 0, record.id as f64)?;
+    worksheet.write_string(row, 1, &record.url)?;
+    worksheet.write_string(row, 2, &record.final_url)?;
+    worksheet.write_string(row, 3, format!("{:?}", record.classification))?;
+    if let Some(status_code) = record.status_code {
+        worksheet.write_number(row, 4, f64::from(status_code))?;
+    }
+    worksheet.write_string(row, 5, &record.status_text)?;
+    worksheet.write_string(row, 6, record.content_type.as_deref().unwrap_or_default())?;
+    worksheet.write_string(row, 7, &record.indexability)?;
+    worksheet.write_string(row, 8, &record.indexability_status)?;
+    worksheet.write_number(row, 9, record.response_time_ms as f64)?;
+    if let Some(value) = record.dns_lookup_time_ms {
+        worksheet.write_number(row, 10, value as f64)?;
+    }
+    if let Some(value) = record.ttfb_ms {
+        worksheet.write_number(row, 11, value as f64)?;
+    }
+    if let Some(value) = record.download_time_ms {
+        worksheet.write_number(row, 12, value as f64)?;
+    }
+    if let Some(value) = record.total_network_time_ms {
+        worksheet.write_number(row, 13, value as f64)?;
+    }
+    if let Some(value) = record.transfer_rate_bytes_per_sec {
+        worksheet.write_number(row, 14, value as f64)?;
+    }
+    worksheet.write_number(row, 15, f64::from(record.resolved_ip_count))?;
+    worksheet.write_number(row, 16, record.size_bytes as f64)?;
+    worksheet.write_string(row, 17, record.response_hash.as_deref().unwrap_or_default())?;
+    worksheet.write_number(row, 18, record.word_count as f64)?;
+    worksheet.write_number(row, 19, record.text_to_code_ratio)?;
+    worksheet.write_string(
+        row,
+        20,
+        record
+            .simhash
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    )?;
+    if let Some(cluster_id) = record.near_duplicate_cluster_id {
+        worksheet.write_number(row, 21, cluster_id as f64)?;
+    }
+    worksheet.write_number(row, 22, record.depth as f64)?;
+    worksheet.write_string(
+        row,
+        23,
+        record.redirect_target.as_deref().unwrap_or_default(),
+    )?;
+    worksheet.write_string(row, 24, record.title.as_deref().unwrap_or_default())?;
+    worksheet.write_number(row, 25, record.title_len as f64)?;
+    worksheet.write_string(
+        row,
+        26,
+        record.meta_description.as_deref().unwrap_or_default(),
+    )?;
+    worksheet.write_number(row, 27, record.meta_description_len as f64)?;
+    worksheet.write_string(row, 28, record.meta_robots.as_deref().unwrap_or_default())?;
+    worksheet.write_string(row, 29, record.x_robots_tag.as_deref().unwrap_or_default())?;
+    worksheet.write_string(row, 30, record.h1.as_deref().unwrap_or_default())?;
+    worksheet.write_number(row, 31, record.h1_len as f64)?;
+    worksheet.write_number(row, 32, record.h1_count as f64)?;
+    worksheet.write_string(row, 33, record.h2.as_deref().unwrap_or_default())?;
+    worksheet.write_number(row, 34, record.h2_len as f64)?;
+    worksheet.write_number(row, 35, record.h2_count as f64)?;
+    worksheet.write_string(row, 36, record.canonical.as_deref().unwrap_or_default())?;
+    worksheet.write_number(row, 37, record.canonical_count as f64)?;
+    worksheet.write_number(row, 38, f64::from(record.image_count))?;
+    worksheet.write_number(row, 39, f64::from(record.images_missing_alt))?;
+    worksheet.write_number(row, 40, f64::from(record.images_alt_too_long))?;
+    worksheet.write_number(row, 41, f64::from(record.mixed_content_count))?;
+    worksheet.write_number(row, 42, f64::from(record.insecure_form_count))?;
+    worksheet.write_string(row, 43, record.hsts_header.to_string())?;
+    worksheet.write_string(row, 44, record.content_security_policy_header.to_string())?;
+    worksheet.write_string(row, 45, record.x_frame_options_header.to_string())?;
+    worksheet.write_string(row, 46, record.x_content_type_options_header.to_string())?;
+    worksheet.write_string(row, 47, record.viewport.to_string())?;
+    worksheet.write_string(row, 48, record.amphtml.as_deref().unwrap_or_default())?;
+    worksheet.write_string(row, 49, record.rel_next.as_deref().unwrap_or_default())?;
+    worksheet.write_string(row, 50, record.rel_prev.as_deref().unwrap_or_default())?;
+    worksheet.write_number(row, 51, f64::from(record.hreflang_count))?;
+    worksheet.write_number(row, 52, f64::from(record.hreflang_invalid_count))?;
+    worksheet.write_string(row, 53, record.hreflang_missing_self_reference.to_string())?;
+    worksheet.write_number(row, 54, f64::from(record.json_ld_count))?;
+    worksheet.write_number(row, 55, f64::from(record.json_ld_invalid_count))?;
+    worksheet.write_number(row, 56, f64::from(record.structured_data_error_count))?;
+    worksheet.write_number(row, 57, f64::from(record.structured_data_warning_count))?;
+    worksheet.write_string(
+        row,
+        58,
+        serde_json::to_string(&record.structured_data_issues).unwrap_or_default(),
+    )?;
+    worksheet.write_number(row, 59, f64::from(record.open_graph_count))?;
+    worksheet.write_number(row, 60, f64::from(record.twitter_card_count))?;
+    worksheet.write_number(row, 61, f64::from(record.deprecated_html_tag_count))?;
+    worksheet.write_number(row, 62, f64::from(record.duplicate_id_count))?;
+    worksheet.write_string(row, 63, record.js_rendered.to_string())?;
+    worksheet.write_string(row, 64, record.rendered_dom_changed.to_string())?;
+    worksheet.write_number(row, 65, f64::from(record.rendered_word_count_delta))?;
+    worksheet.write_number(row, 66, f64::from(record.rendered_link_count_delta))?;
+    worksheet.write_number(row, 67, f64::from(record.inlink_count))?;
+    worksheet.write_number(row, 68, f64::from(record.outlink_count))?;
+    worksheet.write_number(row, 69, f64::from(record.internal_outlink_count))?;
+    worksheet.write_number(row, 70, f64::from(record.external_outlink_count))?;
+    worksheet.write_string(
+        row,
+        71,
+        serde_json::to_string(&record.custom_extractions).unwrap_or_default(),
+    )?;
+    worksheet.write_string(
+        row,
+        72,
+        serde_json::to_string(&record.custom_searches).unwrap_or_default(),
+    )?;
+    worksheet.write_string(row, 73, record.error.as_deref().unwrap_or_default())?;
+    worksheet.write_boolean(row, 74, record.in_sitemap)?;
+    worksheet.write_string(row, 75, &record.storage_key)?;
+    if let Some(list_position) = record.list_position {
+        worksheet.write_number(row, 76, f64::from(list_position))?;
+    }
+    worksheet.write_number(row, 77, f64::from(record.list_duplicate_index))?;
+    worksheet.write_string(
+        row,
+        78,
+        record
+            .first_inlink_source_url
+            .as_deref()
+            .unwrap_or_default(),
+    )?;
+    worksheet.write_string(
+        row,
+        79,
+        record
+            .first_inlink_anchor_text
+            .as_deref()
+            .unwrap_or_default(),
+    )?;
+    if let Some(source_position) = record.first_inlink_source_position {
+        worksheet.write_number(row, 80, f64::from(source_position))?;
+    }
+    if let Some(value) = record.tcp_connect_time_ms {
+        worksheet.write_number(row, 81, value as f64)?;
+    }
+    if let Some(value) = record.tls_handshake_time_ms {
+        worksheet.write_number(row, 82, value as f64)?;
+    }
+    worksheet.write_number(row, 83, f64::from(record.title_pixel_width))?;
+    worksheet.write_number(row, 84, f64::from(record.meta_description_pixel_width))?;
+    if let Some(value) = record.search_console_clicks {
+        worksheet.write_number(row, 85, value)?;
+    }
+    if let Some(value) = record.search_console_impressions {
+        worksheet.write_number(row, 86, value)?;
+    }
+    if let Some(value) = record.search_console_ctr {
+        worksheet.write_number(row, 87, value)?;
+    }
+    if let Some(value) = record.search_console_average_position {
+        worksheet.write_number(row, 88, value)?;
+    }
+    if let Some(value) = record.title_count {
+        worksheet.write_number(row, 89, value as f64)?;
+    }
+    if let Some(value) = record.meta_description_count {
+        worksheet.write_number(row, 90, value as f64)?;
+    }
+    Ok(())
+}
+
+const XLSX_PAGE_SIZE: usize = 10_000;
+const EXCEL_DATA_ROW_LIMIT: usize = 1_048_575;
+
+/// Export every row matching the filters, ignoring the grid window's offset/limit.
+/// The caller must keep the crawl stable while pages are read.
+pub fn query_to_xlsx_writer<W: Write + Send>(
+    mut query: GridQuery,
+    mut fetch: impl FnMut(GridQuery) -> Result<GridResponse, String>,
+    writer: W,
+) -> Result<usize, String> {
+    validate_grid_query(&query).map_err(|error| error.to_string())?;
+    query.offset = 0;
+    query.limit = 0;
+    let initial = fetch(query.clone())?;
+    if initial.total > EXCEL_DATA_ROW_LIMIT {
+        return Err(
+            "XLSX exceeds Excel's 1,048,575 data rows per worksheet; narrow the filters or use CSV"
+                .into(),
+        );
+    }
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet_with_constant_memory();
+    worksheet
+        .set_name("Crawl Results")
+        .map_err(|error| error.to_string())?;
+    for (column, header) in HEADERS.iter().enumerate() {
+        worksheet
+            .write_string(0, column as u16, *header)
+            .map_err(|error| error.to_string())?;
+    }
+    while query.offset < initial.total {
+        query.limit = XLSX_PAGE_SIZE.min(initial.total - query.offset);
+        let response = fetch(query.clone())?;
+        if response.total != initial.total
+            || response.summary.total != initial.summary.total
+            || response.rows.is_empty()
+            || response.rows.len() > query.limit
+        {
+            return Err("crawl changed during XLSX export; stop the crawl and retry".into());
+        }
+        for record in response.rows {
+            query.offset += 1;
+            write_xlsx_record(worksheet, query.offset as u32, &record)
+                .map_err(|error| format!("XLSX row {}: {error}", query.offset))?;
+        }
+    }
+    workbook
+        .save_to_writer(writer)
+        .map_err(|error| error.to_string())?;
+    Ok(initial.total)
+}
+
+type AuditSheet = (
+    &'static str,
+    &'static [(&'static str, IssueView)],
+    &'static [&'static str],
+);
+const AUDIT_SHEETS: [AuditSheet; 7] = [
+    (
+        "URLs",
+        &[("", IssueView::All)],
+        &[
+            "id",
+            "url",
+            "final_url",
+            "status_code",
+            "content_type",
+            "indexability",
+            "indexability_status",
+            "title",
+            "meta_description",
+            "h1",
+            "canonical",
+            "depth",
+            "inlink_count",
+            "outlink_count",
+            "response_time_ms",
+            "error",
+        ],
+    ),
+    (
+        "Broken Links",
+        &[("Broken URL", IssueView::BrokenLinks)],
+        &[
+            "id",
+            "url",
+            "final_url",
+            "status_code",
+            "issue",
+            "status_text",
+            "error",
+            "inlink_count",
+            "first_inlink_source_url",
+            "first_inlink_anchor_text",
+        ],
+    ),
+    (
+        "Redirects",
+        &[("Redirect", IssueView::Status3xx)],
+        &[
+            "id",
+            "url",
+            "final_url",
+            "status_code",
+            "issue",
+            "redirect_target",
+            "redirect_chain",
+            "error",
+        ],
+    ),
+    (
+        "Titles",
+        &[
+            ("Missing title", IssueView::TitleMissing),
+            ("Duplicate title", IssueView::TitleDuplicate),
+            ("Multiple titles", IssueView::TitleMultiple),
+            ("Title too short", IssueView::TitleTooShort),
+            ("Title too long", IssueView::TitleTooLong),
+            ("Title too narrow", IssueView::TitlePixelTooNarrow),
+            ("Title too wide", IssueView::TitlePixelTooWide),
+            ("Title matches H1", IssueView::TitleSameAsH1),
+        ],
+        &[
+            "id",
+            "url",
+            "final_url",
+            "status_code",
+            "issue",
+            "title",
+            "title_len",
+            "title_pixel_width",
+            "h1",
+            "title_count",
+        ],
+    ),
+    (
+        "Descriptions",
+        &[
+            ("Missing description", IssueView::MetaMissing),
+            ("Duplicate description", IssueView::MetaDuplicate),
+            ("Multiple descriptions", IssueView::MetaMultiple),
+            ("Description too short", IssueView::MetaTooShort),
+            ("Description too long", IssueView::MetaTooLong),
+            ("Description too narrow", IssueView::MetaPixelTooNarrow),
+            ("Description too wide", IssueView::MetaPixelTooWide),
+        ],
+        &[
+            "id",
+            "url",
+            "final_url",
+            "status_code",
+            "issue",
+            "meta_description",
+            "meta_description_len",
+            "meta_description_pixel_width",
+            "meta_description_count",
+        ],
+    ),
+    (
+        "Canonicals",
+        &[
+            ("Missing canonical", IssueView::CanonicalMissing),
+            ("Multiple canonicals", IssueView::CanonicalMultiple),
+        ],
+        &[
+            "id",
+            "url",
+            "final_url",
+            "status_code",
+            "issue",
+            "canonical",
+            "canonical_count",
+            "indexability",
+            "indexability_status",
+        ],
+    ),
+    (
+        "Content",
+        &[("Exact duplicate response body", IssueView::ExactDuplicate)],
+        &[
+            "id",
+            "url",
+            "final_url",
+            "status_code",
+            "issue",
+            "response_hash",
+            "size_bytes",
+            "content_type",
+            "word_count",
+            "indexability",
+        ],
+    ),
+];
+
+/// Export the entire crawl through bounded, typed storage queries.
+///
+/// The caller must keep the crawl stable for the duration of the export. The
+/// return value counts source records once; metadata tabs have one row per
+/// matching issue. Each sheet is limited to 1,048,575 data rows plus its header.
+/// Counts are checked before writing, and oversized reports are rejected in full.
+pub fn audit_workbook_to_writer<W: Write + Send>(
+    mut query: impl FnMut(GridQuery) -> Result<GridResponse, String>,
+    writer: W,
+) -> Result<usize, String> {
+    let initial = query(GridQuery {
+        limit: 0,
+        ..GridQuery::default()
+    })?;
+    let summary = initial.summary;
+    let mut counts = Vec::new();
+    for (name, views, _) in AUDIT_SHEETS {
+        let mut sheet_counts = Vec::new();
+        let mut total = 0usize;
+        for (_, view) in views {
+            let count = if *view == IssueView::All {
+                initial.total
+            } else {
+                let response = query(GridQuery {
+                    limit: 0,
+                    view: view.clone(),
+                    ..GridQuery::default()
+                })?;
+                if response.summary.total != summary.total {
+                    return Err(
+                        "crawl changed during audit export; stop the crawl and retry".into(),
+                    );
+                }
+                response.total
+            };
+            total = total.saturating_add(count);
+            if total > EXCEL_DATA_ROW_LIMIT {
+                return Err(format!(
+                    "{name} exceeds Excel's 1,048,575 data rows per worksheet; use a smaller crawl or filtered exports"
+                ));
+            }
+            sheet_counts.push(count);
+        }
+        counts.push(sheet_counts);
+    }
+
+    let mut workbook = Workbook::new();
+    write_workbook_summary(workbook.add_worksheet(), &summary, &counts)
+        .map_err(|error| error.to_string())?;
+    for ((name, views, headers), sheet_counts) in AUDIT_SHEETS.iter().zip(&counts) {
+        let worksheet = workbook.add_worksheet_with_constant_memory();
+        prepare_workbook_sheet(worksheet, name, headers).map_err(|error| error.to_string())?;
+        let mut row = 0usize;
+        for ((issue, view), &count) in views.iter().zip(sheet_counts) {
+            let mut offset = 0;
+            while offset < count {
+                let response = query(GridQuery {
+                    offset,
+                    limit: XLSX_PAGE_SIZE.min(count - offset),
+                    view: view.clone(),
+                    ..GridQuery::default()
+                })?;
+                if response.total != count
+                    || response.summary.total != summary.total
+                    || response.rows.is_empty()
+                    || response.rows.len() > count - offset
+                {
+                    return Err(
+                        "crawl changed during audit export; stop the crawl and retry".into(),
+                    );
+                }
+                offset += response.rows.len();
+                for record in response.rows {
+                    row += 1;
+                    write_workbook_record(worksheet, row as u32, name, issue, &record)
+                        .map_err(|error| format!("{name} row {row}: {error}"))?;
+                }
+            }
+        }
+        worksheet
+            .autofilter(0, 0, row as u32, headers.len() as u16 - 1)
+            .map_err(|error| error.to_string())?;
+    }
+    workbook
+        .save_to_writer(writer)
+        .map_err(|error| error.to_string())?;
+    Ok(initial.total)
+}
+
+fn prepare_workbook_sheet(
+    worksheet: &mut Worksheet,
+    name: &str,
+    headers: &[&str],
+) -> Result<(), XlsxError> {
+    worksheet.set_name(name)?;
+    worksheet.set_freeze_panes(1, 3)?;
+    worksheet.set_column_range_width(1, 2, 48)?;
+    worksheet.set_column_range_width(4, headers.len() as u16 - 1, 24)?;
+    if name == "Content" {
+        worksheet.set_column_width(5, 68)?;
+    }
+    let header_format = Format::new().set_bold();
+    for (column, header) in headers.iter().enumerate() {
+        worksheet.write_string_with_format(0, column as u16, *header, &header_format)?;
+    }
+    Ok(())
+}
+
+fn write_workbook_summary(
+    worksheet: &mut Worksheet,
+    summary: &CrawlSummary,
+    counts: &[Vec<usize>],
+) -> Result<(), XlsxError> {
+    worksheet.set_name("Summary")?;
+    worksheet.set_column_width(0, 28)?;
+    worksheet.set_column_width(1, 100)?;
+    worksheet.write_string_with_format(0, 0, "Metric", &Format::new().set_bold())?;
+    worksheet.write_string_with_format(0, 1, "Value", &Format::new().set_bold())?;
+    let metrics = [
+        ("Crawl records", summary.total),
+        ("Internal URLs", summary.internal),
+        ("External URLs", summary.external),
+        ("Successful URLs", summary.success),
+        ("Redirected URLs", summary.redirects),
+        ("Client error URLs", summary.client_errors),
+        ("Server error URLs", summary.server_errors),
+        ("No response URLs", summary.no_response),
+        ("Broken URLs", summary.broken),
+        ("Indexable URLs", summary.indexable),
+        ("Non-indexable URLs", summary.non_indexable),
+        ("Exact duplicate records", summary.exact_duplicates),
+    ];
+    let mut row = 0;
+    for (label, count) in metrics {
+        row += 1;
+        worksheet.write_string(row, 0, label)?;
+        worksheet.write_number(row, 1, count as f64)?;
+    }
+    for ((name, _, _), counts) in AUDIT_SHEETS.iter().zip(counts) {
+        row += 1;
+        worksheet.write_string(row, 0, format!("{name} rows"))?;
+        worksheet.write_number(row, 1, counts.iter().sum::<usize>() as f64)?;
+    }
+    for (label, value) in [
+        ("Scope", "Entire crawl; grid filters are not applied."),
+        (
+            "Audit rows",
+            "Titles, Descriptions and Canonicals contain one row per matching issue; a URL can appear more than once.",
+        ),
+        (
+            "Broken Links",
+            "Broken URL records, including HTTP errors and failed requests; not individual link edges.",
+        ),
+        (
+            "Redirects",
+            "Redirect URL records, including followed chains and unfollowed redirects; one row per source record.",
+        ),
+        (
+            "Content",
+            "Complete 2xx HTML records sharing a response hash across at least two distinct normalized final URLs; matching List occurrences are retained.",
+        ),
+        (
+            "Response hashes",
+            "BLAKE3 of downloaded decoded response-body bytes, before lossy UTF-8 conversion, rendering, or content selectors.",
+        ),
+    ] {
+        row += 1;
+        worksheet.write_string(row, 0, label)?;
+        worksheet.write_string(row, 1, value)?;
+    }
+    Ok(())
+}
+
+fn write_workbook_record(
+    worksheet: &mut Worksheet,
+    row: u32,
+    sheet: &str,
+    issue: &str,
+    record: &CrawlRecord,
+) -> Result<(), XlsxError> {
+    worksheet.write_number(row, 0, record.id as f64)?;
+    worksheet.write_string(row, 1, &record.url)?;
+    worksheet.write_string(row, 2, &record.final_url)?;
+    if let Some(code) = record.status_code {
+        worksheet.write_number(row, 3, f64::from(code))?;
+    }
+    if sheet != "URLs" {
+        worksheet.write_string(row, 4, issue)?;
+    }
+    match sheet {
+        "URLs" => {
+            worksheet.write_string(row, 4, record.content_type.as_deref().unwrap_or_default())?;
+            worksheet.write_string(row, 5, &record.indexability)?;
+            worksheet.write_string(row, 6, &record.indexability_status)?;
+            worksheet.write_string(row, 7, record.title.as_deref().unwrap_or_default())?;
+            worksheet.write_string(
+                row,
+                8,
+                record.meta_description.as_deref().unwrap_or_default(),
+            )?;
+            worksheet.write_string(row, 9, record.h1.as_deref().unwrap_or_default())?;
+            worksheet.write_string(row, 10, record.canonical.as_deref().unwrap_or_default())?;
+            worksheet.write_number(row, 11, record.depth as f64)?;
+            worksheet.write_number(row, 12, f64::from(record.inlink_count))?;
+            worksheet.write_number(row, 13, f64::from(record.outlink_count))?;
+            worksheet.write_number(row, 14, record.response_time_ms as f64)?;
+            worksheet.write_string(row, 15, record.error.as_deref().unwrap_or_default())?;
+        }
+        "Broken Links" => {
+            worksheet.write_string(row, 5, &record.status_text)?;
+            worksheet.write_string(row, 6, record.error.as_deref().unwrap_or_default())?;
+            worksheet.write_number(row, 7, f64::from(record.inlink_count))?;
+            worksheet.write_string(
+                row,
+                8,
+                record
+                    .first_inlink_source_url
+                    .as_deref()
+                    .unwrap_or_default(),
+            )?;
+            worksheet.write_string(
+                row,
+                9,
+                record
+                    .first_inlink_anchor_text
+                    .as_deref()
+                    .unwrap_or_default(),
+            )?;
+        }
+        "Redirects" => {
+            worksheet.write_string(
+                row,
+                5,
+                record.redirect_target.as_deref().unwrap_or_default(),
+            )?;
+            let chain = record
+                .redirect_chain
+                .iter()
+                .map(|hop| {
+                    format!(
+                        "{} {} -> {}",
+                        hop.status_code,
+                        hop.url,
+                        hop.location.as_deref().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            worksheet.write_string(row, 6, chain)?;
+            worksheet.write_string(row, 7, record.error.as_deref().unwrap_or_default())?;
+        }
+        "Titles" => {
+            worksheet.write_string(row, 5, record.title.as_deref().unwrap_or_default())?;
+            worksheet.write_number(row, 6, record.title_len as f64)?;
+            worksheet.write_number(row, 7, f64::from(record.title_pixel_width))?;
+            worksheet.write_string(row, 8, record.h1.as_deref().unwrap_or_default())?;
+            if let Some(count) = record.title_count {
+                worksheet.write_number(row, 9, count as f64)?;
+            }
+        }
+        "Descriptions" => {
+            worksheet.write_string(
+                row,
+                5,
+                record.meta_description.as_deref().unwrap_or_default(),
+            )?;
+            worksheet.write_number(row, 6, record.meta_description_len as f64)?;
+            worksheet.write_number(row, 7, f64::from(record.meta_description_pixel_width))?;
+            if let Some(count) = record.meta_description_count {
+                worksheet.write_number(row, 8, count as f64)?;
+            }
+        }
+        "Canonicals" => {
+            worksheet.write_string(row, 5, record.canonical.as_deref().unwrap_or_default())?;
+            worksheet.write_number(row, 6, record.canonical_count as f64)?;
+            worksheet.write_string(row, 7, &record.indexability)?;
+            worksheet.write_string(row, 8, &record.indexability_status)?;
+        }
+        "Content" => {
+            worksheet.write_string(row, 5, record.response_hash.as_deref().unwrap_or_default())?;
+            worksheet.write_number(row, 6, record.size_bytes as f64)?;
+            worksheet.write_string(row, 7, record.content_type.as_deref().unwrap_or_default())?;
+            worksheet.write_number(row, 8, record.word_count as f64)?;
+            worksheet.write_string(row, 9, &record.indexability)?;
+        }
+        _ => unreachable!("workbook sheet names are fixed"),
+    }
+    Ok(())
 }
 
 pub fn records_to_sitemap_xml(records: &[CrawlRecord]) -> String {
@@ -1279,6 +1794,13 @@ fn metadata_issues(
     let mut issues = Vec::new();
     let title = record.title.as_deref().unwrap_or("").trim();
     let meta = record.meta_description.as_deref().unwrap_or("").trim();
+
+    if let Some(count) = record.title_count.filter(|count| *count > 1) {
+        issues.push(format!("Multiple titles ({count} tags)"));
+    }
+    if let Some(count) = record.meta_description_count.filter(|count| *count > 1) {
+        issues.push(format!("Multiple meta descriptions ({count} tags)"));
+    }
 
     if title.is_empty() {
         issues.push("Missing title".to_string());

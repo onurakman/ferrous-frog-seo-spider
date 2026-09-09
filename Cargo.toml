@@ -32,11 +32,13 @@ chromiumoxide = "0.9.1"
 csv = "1.4.0"
 futures = "0.3.32"
 governor = "0.10.4"
+httpdate = "1.0.3"
 keyring = "4.1.1"
 minijinja = "2.20.0"
+psl = "2.1.231"
 reqwest = { version = "0.13.4", default-features = false, features = ["brotli", "charset", "cookies", "deflate", "gzip", "http2", "json", "rustls"] }
 regex = "1.12.4"
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "functions"] }
 rustls = "0.23.40"
 rustls-pki-types = "1.14.1"
 rustls-platform-verifier = "0.7.0"
@@ -50,6 +52,8 @@ sxd-xpath = "0.4.2"
 tauri = "2.11.2"
 tauri-build = "2.6.2"
 tauri-plugin-opener = "2.5.4"
+tauri-plugin-window-state = "2.4.1"
+tempfile = "3.27.0"
 texting_robots = "0.2.2"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

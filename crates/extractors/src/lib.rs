@@ -5,6 +5,12 @@ use sxd_document::parser;
 use sxd_xpath::{Context, Factory, Value};
 use thiserror::Error;
 
+#[cfg(test)]
+mod preview_tests;
+
+const PREVIEW_MAX_VALUES: usize = 100;
+const PREVIEW_MAX_VALUE_CHARS: usize = 2_000;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ExtractorKind {
     #[serde(rename = "cssText")]
@@ -44,6 +50,14 @@ pub struct ExtractionResult {
     pub values: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractionPreview {
+    pub values: Vec<String>,
+    pub values_truncated: bool,
+    pub text_truncated: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
@@ -55,6 +69,8 @@ pub struct SearchResult {
 
 #[derive(Debug, Error)]
 pub enum ExtractionError {
+    #[error("{0}")]
+    PreviewLimit(&'static str),
     #[error("invalid CSS selector for extractor '{name}': {message}")]
     Css { name: String, message: String },
     #[error("invalid regex for extractor '{name}': {source}")]
@@ -75,12 +91,7 @@ pub fn run_extractors(
     let mut results = Vec::with_capacity(extractors.len());
 
     for extractor in extractors {
-        let values = match extractor.kind {
-            ExtractorKind::CssText => css_text_values(&document, extractor)?,
-            ExtractorKind::CssAttribute => css_attribute_values(&document, extractor)?,
-            ExtractorKind::XPath => xpath_values(html, extractor)?,
-            ExtractorKind::Regex => regex_values(html, extractor)?,
-        };
+        let values = extract_values(html, &document, extractor, false)?.values;
         results.push(ExtractionResult {
             name: extractor.name.clone(),
             values,
@@ -88,6 +99,55 @@ pub fn run_extractors(
     }
 
     Ok(results)
+}
+
+/// Preview one rule without retaining more than 100 values of 2,000 characters each.
+/// Limits apply only to previews; normal crawl extraction remains unchanged.
+pub fn preview_extractor(
+    html: &str,
+    extractor: &CustomExtractor,
+) -> Result<ExtractionPreview, ExtractionError> {
+    if html.len() > 512 * 1024 {
+        return Err(ExtractionError::PreviewLimit(
+            "Preview HTML exceeds the 512 KiB limit.",
+        ));
+    }
+    for (value, limit, message) in [
+        (
+            extractor.name.as_str(),
+            200,
+            "Preview extractor name exceeds the 200 character limit.",
+        ),
+        (
+            extractor.pattern.as_str(),
+            2_000,
+            "Preview extractor pattern exceeds the 2,000 character limit.",
+        ),
+        (
+            extractor.attribute.as_deref().unwrap_or_default(),
+            200,
+            "Preview extractor attribute exceeds the 200 character limit.",
+        ),
+    ] {
+        if value.chars().nth(limit).is_some() {
+            return Err(ExtractionError::PreviewLimit(message));
+        }
+    }
+    extract_values(html, &Html::parse_document(html), extractor, true)
+}
+
+fn extract_values(
+    html: &str,
+    document: &Html,
+    extractor: &CustomExtractor,
+    preview: bool,
+) -> Result<ExtractionPreview, ExtractionError> {
+    match extractor.kind {
+        ExtractorKind::CssText => css_text_values(document, extractor, preview),
+        ExtractorKind::CssAttribute => css_attribute_values(document, extractor, preview),
+        ExtractorKind::XPath => xpath_values(html, extractor, preview),
+        ExtractorKind::Regex => regex_values(html, extractor, preview),
+    }
 }
 
 pub fn run_searches(
@@ -119,30 +179,36 @@ fn run_search(html: &str, search: &CustomSearch) -> Result<SearchResult, Extract
 fn css_text_values(
     document: &Html,
     extractor: &CustomExtractor,
-) -> Result<Vec<String>, ExtractionError> {
+    preview: bool,
+) -> Result<ExtractionPreview, ExtractionError> {
     let selector = parse_selector(extractor)?;
     let values = document
         .select(&selector)
-        .map(|node| normalize_whitespace(node.text().collect::<Vec<_>>().join(" ")))
+        .map(|node| extraction_text(node.text(), preview))
         .filter(|value| !value.is_empty());
-    Ok(limit_matches(values, extractor.all_matches))
+    Ok(collect_values(values, extractor.all_matches, preview))
 }
 
 fn css_attribute_values(
     document: &Html,
     extractor: &CustomExtractor,
-) -> Result<Vec<String>, ExtractionError> {
+    preview: bool,
+) -> Result<ExtractionPreview, ExtractionError> {
     let selector = parse_selector(extractor)?;
     let attribute = extractor.attribute.as_deref().unwrap_or_default();
     let values = document
         .select(&selector)
         .filter_map(|node| node.value().attr(attribute))
-        .map(normalize_whitespace)
+        .map(|value| extraction_text(std::iter::once(value), preview))
         .filter(|value| !value.is_empty());
-    Ok(limit_matches(values, extractor.all_matches))
+    Ok(collect_values(values, extractor.all_matches, preview))
 }
 
-fn regex_values(html: &str, extractor: &CustomExtractor) -> Result<Vec<String>, ExtractionError> {
+fn regex_values(
+    html: &str,
+    extractor: &CustomExtractor,
+    preview: bool,
+) -> Result<ExtractionPreview, ExtractionError> {
     let regex = Regex::new(&extractor.pattern).map_err(|source| ExtractionError::Regex {
         name: extractor.name.clone(),
         source,
@@ -151,9 +217,19 @@ fn regex_values(html: &str, extractor: &CustomExtractor) -> Result<Vec<String>, 
         captures
             .get(1)
             .or_else(|| captures.get(0))
-            .map(|match_value| match_value.as_str().to_string())
+            .map(|match_value| {
+                if preview {
+                    match_value
+                        .as_str()
+                        .chars()
+                        .take(PREVIEW_MAX_VALUE_CHARS + 1)
+                        .collect()
+                } else {
+                    match_value.as_str().to_string()
+                }
+            })
     });
-    Ok(limit_matches(values, extractor.all_matches))
+    Ok(collect_values(values, extractor.all_matches, preview))
 }
 
 fn regex_search_values(
@@ -239,7 +315,11 @@ fn snippet(html: &str, start: usize, end: usize) -> String {
     normalize_whitespace(&html[prefix_start..suffix_end])
 }
 
-fn xpath_values(html: &str, extractor: &CustomExtractor) -> Result<Vec<String>, ExtractionError> {
+fn xpath_values(
+    html: &str,
+    extractor: &CustomExtractor,
+    preview: bool,
+) -> Result<ExtractionPreview, ExtractionError> {
     let package = parser::parse(html).map_err(|error| ExtractionError::XPathDocument {
         name: extractor.name.clone(),
         message: error.to_string(),
@@ -264,23 +344,29 @@ fn xpath_values(html: &str, extractor: &CustomExtractor) -> Result<Vec<String>, 
                 name: extractor.name.clone(),
                 message: error.to_string(),
             })?;
-    let values = match value {
-        Value::Nodeset(nodeset) => nodeset
-            .document_order()
-            .iter()
-            .map(|node| normalize_whitespace(node.string_value()))
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>(),
-        Value::String(value) => vec![normalize_whitespace(value)],
-        Value::Number(value) => vec![value.to_string()],
-        Value::Boolean(value) => vec![value.to_string()],
+    let value = match value {
+        Value::Nodeset(nodeset) => {
+            return Ok(collect_values(
+                nodeset
+                    .document_order()
+                    .iter()
+                    .map(|node| {
+                        extraction_text(std::iter::once(node.string_value().as_str()), preview)
+                    })
+                    .filter(|value| !value.is_empty()),
+                extractor.all_matches,
+                preview,
+            ));
+        }
+        Value::String(value) => extraction_text(std::iter::once(value.as_str()), preview),
+        Value::Number(value) => value.to_string(),
+        Value::Boolean(value) => value.to_string(),
     };
-
-    Ok(if extractor.all_matches {
-        values
-    } else {
-        values.into_iter().take(1).collect()
-    })
+    Ok(collect_values(
+        std::iter::once(value),
+        extractor.all_matches,
+        preview,
+    ))
 }
 
 fn parse_selector(extractor: &CustomExtractor) -> Result<Selector, ExtractionError> {
@@ -290,12 +376,43 @@ fn parse_selector(extractor: &CustomExtractor) -> Result<Selector, ExtractionErr
     })
 }
 
-fn limit_matches(values: impl Iterator<Item = String>, all_matches: bool) -> Vec<String> {
-    if all_matches {
-        values.collect()
+fn collect_values(
+    mut values: impl Iterator<Item = String>,
+    all_matches: bool,
+    preview: bool,
+) -> ExtractionPreview {
+    let limit = if !all_matches {
+        1
+    } else if preview {
+        PREVIEW_MAX_VALUES
     } else {
-        values.take(1).collect()
+        usize::MAX
+    };
+    let mut result = ExtractionPreview::default();
+    for mut value in values.by_ref().take(limit) {
+        if preview && let Some((end, _)) = value.char_indices().nth(PREVIEW_MAX_VALUE_CHARS) {
+            value.truncate(end);
+            result.text_truncated = true;
+        }
+        result.values.push(value);
     }
+    result.values_truncated = preview && all_matches && values.next().is_some();
+    result
+}
+
+fn extraction_text<'a>(parts: impl Iterator<Item = &'a str>, preview: bool) -> String {
+    let characters = parts
+        .flat_map(str::split_whitespace)
+        .enumerate()
+        .flat_map(|(index, word)| (index > 0).then_some(' ').into_iter().chain(word.chars()));
+    // One extra character detects truncation without collecting a whole large CSS match.
+    characters
+        .take(if preview {
+            PREVIEW_MAX_VALUE_CHARS + 1
+        } else {
+            usize::MAX
+        })
+        .collect()
 }
 
 fn normalize_whitespace(value: impl AsRef<str>) -> String {
