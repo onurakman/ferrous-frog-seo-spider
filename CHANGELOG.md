@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/onurakman/ferrous-frog-seo-spider/compare/v0.3.1...v0.4.0) (2026-09-12)
+
+
+### Features
+
+* expand configuration, automation, integrations and AI assistance ([44d9f1f](https://github.com/onurakman/ferrous-frog-seo-spider/commit/44d9f1f06d4513f88e167eff92f4e75759d77591))
+
 ## [0.3.1](https://github.com/onurakman/ferrous-frog-seo-spider/compare/v0.3.0...v0.3.1) (2026-09-09)
 
 
