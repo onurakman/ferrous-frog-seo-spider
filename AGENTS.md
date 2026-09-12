@@ -36,7 +36,8 @@ Target workspace layout:
 |   |-- extractors/
 |   |-- storage/
 |   |-- integrations/
-|   `-- export/
+|   |-- export/
+|   `-- cli/
 |-- src-tauri/
 |-- src/
 |-- AGENTS.md

@@ -309,7 +309,56 @@ function setupFixture(mockIPC, emit) {
       return { path: args.path };
     }
     if (cmd === "get_search_console_credential_status") return { tokenSaved: false, keyringAvailable: true };
+    const googleStatus = () => ({ clientConfigured: Boolean(window.testGoogleClient), clientId: window.testGoogleClient?.clientId ?? null, connected: Boolean(window.testGoogleConnected), refreshable: Boolean(window.testGoogleConnected), expiresAtMs: window.testGoogleConnected ? 1788944400000 : null, scopes: window.testGoogleConnected ? ["https://www.googleapis.com/auth/webmasters.readonly"] : [], keyringAvailable: true, message: null });
+    if (cmd === "get_google_oauth_status") return googleStatus();
+    if (cmd === "save_google_oauth_client") { window.testGoogleClient = args.request; return googleStatus(); }
+    if (cmd === "connect_google_account") { if (!window.testGoogleClient) throw new Error("Save the OAuth client ID and secret before connecting a Google account"); window.testGoogleConnected = true; return googleStatus(); }
+    if (cmd === "disconnect_google_account") { window.testGoogleConnected = false; if (args.clearClient) window.testGoogleClient = undefined; return googleStatus(); }
+    if (cmd === "get_analytics_property") return window.testAnalyticsProperty ?? null;
+    const backlinkStatus = () => ({ endpointTemplate: window.testBacklinks?.endpointTemplate ?? "", headerName: window.testBacklinks?.headerName ?? "", credentialSaved: Boolean(window.testBacklinkCredential), keyringAvailable: true });
+    if (cmd === "get_backlink_settings") return backlinkStatus();
+    if (cmd === "save_backlink_settings") {
+      if (args.request.endpointTemplate && !args.request.endpointTemplate.includes("{url}")) throw new Error("The backlink endpoint must be an HTTP(S) URL template containing {url}");
+      window.testBacklinks = args.request.endpointTemplate ? { endpointTemplate: args.request.endpointTemplate, headerName: args.request.headerName } : undefined;
+      if (args.request.headerValue) window.testBacklinkCredential = args.request.headerValue;
+      return backlinkStatus();
+    }
+    if (cmd === "merge_backlink_metrics") {
+      window.testBacklinkRequest = args.request;
+      for (const record of records) if (record.classification === "internal") { record.backlinkCount = 12; record.referringDomainCount = 4; record.backlinkAuthority = 25.5; }
+      return { requestedUrls: 3, matchedRows: 3, failedUrls: 0, firstError: null };
+    }
+    const aiStatus = () => ({ ...(window.testAiSettings ?? { provider: "anthropic", model: "claude-opus-5", baseUrl: "", requestsPerMinute: 20, maxInputChars: 12000 }), keySaved: Boolean(window.testAiKey), keyringAvailable: true, message: null });
+    if (cmd === "get_ai_status") return aiStatus();
+    if (cmd === "save_ai_settings") { window.testAiSettings = args.settings; return aiStatus(); }
+    if (cmd === "save_ai_api_key") { window.testAiKey = args.request.apiKey; return aiStatus(); }
+    if (cmd === "clear_ai_api_key") { window.testAiKey = undefined; return aiStatus(); }
+    if (cmd === "run_ai_task") {
+      window.testAiRequest = args.request;
+      if (!window.testAiKey) throw new Error("Save an API key for the AI provider in Settings > AI");
+      const row = records.find((record) => record.id === args.request.recordId);
+      row.aiInsights = { ...(row.aiInsights ?? {}), model: "claude-opus-5", updatedAtMs: 1788940800000,
+        ...(args.request.task === "intent" ? { intent: { intent: "informational", confidence: 0.9, rationale: "Explains a process." } } : {}),
+        ...(args.request.task === "metaDescription" ? { metaDescription: { draft: "A concise explanation of the process.", alternatives: ["Alternative draft"] } } : {}),
+        ...(args.request.task === "spelling" ? { spelling: { language: "en", issues: [{ text: "teh", suggestion: "the", kind: "spelling" }] } } : {}) };
+      return row.aiInsights;
+    }
+    if (cmd === "merge_analytics_metrics") {
+      window.testAnalyticsProperty = args.request.propertyId;
+      window.testAnalyticsRequest = args.request;
+      return { propertyId: args.request.propertyId, fetchedRows: 42, matchedRows: 2, sessions: 1234 };
+    }
     if (cmd === "get_page_speed_credential_status") return { keySaved: Boolean(window.testPageSpeedKey) && !window.testPageSpeedInvalidKey, keyringAvailable: !window.testPageSpeedKeyringFailure, message: window.testPageSpeedKeyringFailure ? "Could not access the OS credential store" : window.testPageSpeedInvalidKey ? "The saved PageSpeed API key is invalid; replace or clear it." : null };
+    if (cmd === "get_http_auth_status") return { saved: Boolean(window.testHttpAuth), username: window.testHttpAuth?.username ?? null, keyringAvailable: true, message: null };
+    if (cmd === "save_http_auth_credentials" || cmd === "clear_http_auth_credentials") {
+      window.testHttpAuth = cmd === "save_http_auth_credentials" ? args.request : undefined;
+      return { saved: Boolean(window.testHttpAuth), username: window.testHttpAuth?.username ?? null, keyringAvailable: true, message: null };
+    }
+    if (cmd === "get_form_login_status") return { saved: Boolean(window.testFormLogin), username: window.testFormLogin?.username ?? null, keyringAvailable: true, message: null };
+    if (cmd === "save_form_login_credentials" || cmd === "clear_form_login_credentials") {
+      window.testFormLogin = cmd === "save_form_login_credentials" ? args.request : undefined;
+      return { saved: Boolean(window.testFormLogin), username: window.testFormLogin?.username ?? null, keyringAvailable: true, message: null };
+    }
     if (cmd === "save_page_speed_api_key" || cmd === "clear_page_speed_api_key") {
       if (window.testHoldPageSpeedCredentials) await new Promise((resolve) => { window.testFinishPageSpeedCredentials = resolve; });
       if (window.testPageSpeedKeyringFailure) throw new Error("Could not access the OS credential store");
@@ -331,6 +380,25 @@ function setupFixture(mockIPC, emit) {
         finalUrl: "https://example.test/measured-final", fetchedAt: "2026-09-09T08:00:00.000Z", lighthouseVersion: "13.0.0",
         performanceScore: 0.92, accessibilityScore: null, bestPracticesScore: 0, seoScore: 1, lcpMs: 1234, cls: 0, tbtMs: 0 };
       return row.pageSpeed;
+    }
+    if (cmd === "run_page_speed_bulk") {
+      window.testPageSpeedBulkRequest = args.request;
+      let measured = 0, skipped = 0;
+      for (const id of args.request.recordIds) {
+        const row = records.find((record) => record.id === id);
+        if (args.request.resume && row.pageSpeed?.strategy === args.request.strategy) { skipped++; continue; }
+        row.pageSpeed = { strategy: args.request.strategy, requestedUrl: row.finalUrl, completedAtMs: 1788940800000, performanceScore: 0.8, accessibilityScore: 0.9, bestPracticesScore: 1, seoScore: 1, lcpMs: 1500, cls: 0.01, tbtMs: 10 };
+        measured++;
+      }
+      return { measured, skipped, failed: [], cancelled: false };
+    }
+    if (cmd === "run_field_vitals") {
+      window.testFieldVitalsRequest = args.request;
+      if (window.testFieldVitalsFailure) throw new Error("Chrome UX Report returned HTTP 403");
+      const row = records.find((record) => record.id === args.request.recordId);
+      row.fieldVitals = { formFactor: args.request.formFactor, requestedUrl: row.finalUrl, completedAtMs: 1788940800000, hasData: !window.testFieldVitalsEmpty,
+        lcpMsP75: 2100, clsP75: 0.05, inpMsP75: 180, fcpMsP75: 1400, ttfbMsP75: 600, collectionPeriodStart: "2026-08-15", collectionPeriodEnd: "2026-09-11" };
+      return row.fieldVitals;
     }
     if (cmd === "cancel_page_speed") {
       if (window.testPageSpeedRequest?.requestId !== args.requestId || !window.testCancelPageSpeed) return false;
@@ -363,6 +431,10 @@ function setupFixture(mockIPC, emit) {
     if (cmd === "export_serp_snippets") {
       window.testExportedSnippets = args.snippets;
       return { path: "/tmp/ferrous-frog-snippets.csv", rowCount: args.snippets.length };
+    }
+    if (cmd === "set_audit_thresholds") {
+      window.testAuditThresholds = args.thresholds;
+      return null;
     }
     throw new Error(`Unexpected IPC command in smoke test: ${cmd}`);
   }, { shouldMockEvents: true });
@@ -1216,6 +1288,64 @@ try {
   assert.equal(await evaluate("document.querySelector('[aria-label=\"PageSpeed device\"]').value"), "mobile", "PageSpeed should start with a mobile lab run");
   await click('[data-action="configure-pagespeed"]');
   await until("document.querySelector('.settings-section[data-settings-section=\"integrations\"]:not([hidden]) .page-speed-settings')", "PageSpeed must link directly to its credential controls");
+  await fill('[aria-label="Google OAuth client ID"]', "1234.apps.googleusercontent.com");
+  await fill('[aria-label="Google OAuth client secret"]', "GOCSPX-fixture");
+  await click('[data-action="save-google-client"]');
+  await until("document.querySelector('.google-account-settings')?.textContent.includes('Client saved, not connected') && document.querySelector('[aria-label=\"Google OAuth client secret\"]').value === ''", "Saving the OAuth client must clear the secret draft and report the state");
+  assert.ok(!JSON.stringify(await evaluate("localStorage")).includes("GOCSPX"), "OAuth secrets must never reach browser storage");
+  await click('[data-action="connect-google"]');
+  await until("document.querySelector('.google-account-settings')?.textContent.includes('Connected (auto-refresh)')", "Connecting must report the refreshable token");
+  await fill('[aria-label="Google Analytics property ID"]', "properties/987654");
+  await click('[data-action="merge-analytics"]');
+  await until("document.querySelector('[data-analytics-result]')?.textContent.includes('42') && document.querySelector('.notice-bar')?.textContent.includes('Merged 2 Google Analytics rows')", "GA4 merges must report fetched and matched rows");
+  assert.deepEqual(await evaluate("({ property: testAnalyticsRequest.propertyId, dates: [typeof testAnalyticsRequest.startDate, typeof testAnalyticsRequest.endDate] })"), { property: "properties/987654", dates: ["string", "string"] }, "GA4 requests must carry the property and date range");
+  await click('[data-action="disconnect-google"]');
+  await until("document.querySelector('.google-account-settings')?.textContent.includes('Client saved, not connected')", "Disconnecting must keep the client");
+  await click('[data-action="clear-google-client"]');
+  await until("document.querySelector('.google-account-settings')?.textContent.includes('No OAuth client saved')", "Removing the client must reset the status");
+  await fill('[aria-label="Backlink endpoint template"]', "https://api.example.test/backlinks");
+  await click('[data-action="save-backlink-settings"]');
+  await until("document.querySelector('[role=\"alert\"]')?.textContent.includes('{url}')", "Templates without a URL placeholder must be rejected");
+  await click('[aria-label="Dismiss error"]');
+  await fill('[aria-label="Backlink endpoint template"]', "https://api.example.test/backlinks?target={url}");
+  await fill('[aria-label="Backlink credential header name"]', "X-Api-Key");
+  await fill('[aria-label="Backlink credential header value"]', "backlink-secret");
+  await click('[data-action="save-backlink-settings"]');
+  await until("document.querySelector('.backlink-settings')?.textContent.includes('Endpoint saved') && document.querySelector('.backlink-settings').textContent.includes('Credential saved') && document.querySelector('[aria-label=\"Backlink credential header value\"]').value === ''", "Saving the backlink endpoint must report the state and clear the credential draft");
+  assert.ok(!JSON.stringify(await evaluate("localStorage")).includes("backlink-secret"), "Backlink credentials must never reach browser storage");
+  await fill('[aria-label="Backlink URL limit"]', "250");
+  await click('[data-action="merge-backlinks"]');
+  await until("document.querySelector('[data-backlink-result]')?.textContent.includes('3') && document.querySelector('.notice-bar')?.textContent.includes('Merged backlink metrics for 3 of 3 URLs')", "Backlink merges must report requested and matched rows");
+  assert.equal(await evaluate("testBacklinkRequest.maxUrls"), 250, "Backlink runs must carry the URL limit");
+  await settingsTab("AI");
+  await select("AI provider", "openAiCompatible");
+  await fill('[aria-label="AI model"]', "local-model");
+  await fill('[aria-label="AI base URL"]', "http://127.0.0.1:11434/v1");
+  await click('[data-action="save-ai-settings"]');
+  await until("testAiSettings?.provider === 'openAiCompatible' && testAiSettings.model === 'local-model' && testAiSettings.baseUrl === 'http://127.0.0.1:11434/v1'", "AI settings must save provider, model and base URL");
+  await fill('[aria-label="AI API key"]', "sk-fixture-ai");
+  await click('[data-action="save-ai-key"]');
+  await until("document.querySelector('.ai-settings')?.textContent.includes('AI API key saved') && document.querySelector('[aria-label=\"AI API key\"]').value === ''", "Saving the AI key must clear the draft and report the state");
+  assert.ok(!JSON.stringify(await evaluate("localStorage")).includes("sk-fixture-ai"), "AI keys must never reach browser storage");
+  await click('[title="Close settings"]');
+  await click('.data-table tbody tr:not(.virtual-spacer)');
+  await click('#detail-tab-ai');
+  await until("document.querySelector('#detail-panel-ai')?.textContent.includes('No AI results yet')", "Rows without AI results must show an empty state");
+  await click('[data-action="run-ai-intent"]');
+  await until("document.querySelector('#detail-panel-ai')?.textContent.includes('informational (90%)')", "Intent classification must render with its confidence");
+  await click('[data-action="run-ai-metaDescription"]');
+  await until("document.querySelector('#detail-panel-ai')?.textContent.includes('A concise explanation of the process.') && document.querySelector('#detail-panel-ai').textContent.includes('informational (90%)')", "Meta description drafts must render beside earlier results");
+  await click('[data-action="run-ai-spelling"]');
+  await until("document.querySelector('#detail-panel-ai')?.textContent.includes('“teh” → “the”')", "Spelling issues must render with suggestions");
+  assert.deepEqual(await evaluate("testAiRequest.task"), "spelling", "AI requests must carry the task");
+  await click('[data-action="configure-ai"]');
+  await until("document.querySelector('.settings-section[data-settings-section=\"ai\"]:not([hidden])')", "The AI panel must link to its settings");
+  await click('[data-action="clear-ai-key"]');
+  await until("document.querySelector('.ai-settings')?.textContent.includes('No saved AI API key')", "Clearing the AI key must update the status");
+  await click('[title="Close settings"]');
+  await click('#detail-tab-pagespeed');
+  await click('[data-action="configure-pagespeed"]');
+  await until("document.querySelector('.settings-section[data-settings-section=\"integrations\"]:not([hidden])')", "PageSpeed settings must reopen after the AI flow");
   await fill('[aria-label="PageSpeed API key"]', 'fixture-pagespeed-secret');
   await click('[data-action="save-pagespeed-key"]');
   await until("document.querySelector('.page-speed-settings')?.textContent.includes('API key saved') && document.querySelector('[aria-label=\"PageSpeed API key\"]').value === ''", "Saving a key must clear the password input and return status only");
@@ -1295,11 +1425,36 @@ try {
   await evaluate("testHoldPageSpeed = false; testEmit({ kind: 'started' })");
   await click('#detail-tab-pagespeed');
   assert.ok(await evaluate("document.querySelector('[data-action=\"run-pagespeed\"]').disabled"), "PageSpeed must not start while crawling");
+  assert.ok(await evaluate("document.querySelector('[data-action=\"run-field-vitals\"]').disabled"), "Field data must not start while crawling");
   await evaluate("testEmit({ kind: 'finished' })");
+  await until("document.querySelector('.field-vitals-panel')?.textContent.includes('No field data fetched yet')", "Rows without field data must show an actionable empty state");
+  await select("Field data form factor", "desktop");
+  await click('[data-action="run-field-vitals"]');
+  await until("document.querySelector('.field-vitals-panel')?.textContent.includes('Desktop · Field data') && document.querySelector('.field-vitals-panel').textContent.includes('2,100 ms')", "Field data must render p75 metrics for the chosen form factor");
+  assert.deepEqual(await evaluate("testFieldVitalsRequest"), { recordId: await evaluate("testFieldVitalsRequest.recordId"), formFactor: "desktop" }, "Field data requests must carry the selected form factor");
+  assert.ok(await evaluate("document.querySelector('.field-vitals-panel').textContent.includes('2026-08-15 to 2026-09-11')"), "Field data must show its collection period");
+  await evaluate("testFieldVitalsEmpty = true");
+  await click('[data-action="run-field-vitals"]');
+  await until("document.querySelector('.field-vitals-panel')?.textContent.includes('no field data for this URL')", "Missing CrUX records must be explained instead of showing blanks");
+  await evaluate("testFieldVitalsEmpty = false; testFieldVitalsFailure = true");
+  await click('[data-action="run-field-vitals"]');
+  await until("document.querySelector('[role=\"alert\"]')?.textContent.includes('HTTP 403')", "Field data failures must stay visible");
+  await click('[aria-label="Dismiss error"]');
+  await evaluate("testFieldVitalsFailure = false");
+  assert.ok(await evaluate("document.querySelector('[data-action=\"run-pagespeed-selected\"]').textContent.includes('1 selected')"), "Bulk PageSpeed must count the selected rows");
+  await evaluate("[...document.querySelectorAll('.page-speed-categories input')].find((input) => input.nextSibling.textContent === 'Accessibility').click()");
+  await selectGridRow(1, { ctrlKey: true });
+  await until("!document.querySelector('[data-action=\"run-pagespeed-selected\"]').disabled", "Selecting rows must enable the bulk measurement");
+  await click('[data-action="run-pagespeed-selected"]');
+  await until("document.querySelector('.notice-bar')?.textContent.includes('PageSpeed bulk run: 1 measured, 1 already measured, 0 failed.')", "Bulk PageSpeed must summarize measured, skipped and failed rows");
+  assert.deepEqual(await evaluate("({ count: testPageSpeedBulkRequest.recordIds.length, strategy: testPageSpeedBulkRequest.strategy, categories: testPageSpeedBulkRequest.categories, resume: testPageSpeedBulkRequest.resume })"),
+    { count: 2, strategy: "desktop", categories: ["performance", "bestPractices", "seo"], resume: true }, "Bulk requests must carry the selection, device, chosen categories and resume flag");
+  await evaluate("[...document.querySelectorAll('.page-speed-categories input')].find((input) => input.nextSibling.textContent === 'Accessibility').click()");
+  await click('.data-table tbody tr:not(.virtual-spacer)');
   await until("!document.querySelector('[data-action=\"run-pagespeed\"]').disabled", "PageSpeed must become available again after crawl completion");
   await evaluate("window.__TAURI_INTERNALS__.invoke('get_rows', { query: { offset: 0, limit: 1 } }).then(({ rows }) => testEmit({ kind: 'record', record: { ...rows[0], pageSpeed: { ...rows[0].pageSpeed, performanceScore: 100, lcpMs: -1, completedAtMs: 9e18, fetchedAt: 'invalid-date' } } }))");
   await until("document.querySelector('.page-speed-scores dd')?.textContent === 'Not available' && document.querySelector('.page-speed-metrics dd')?.textContent === 'Not available'", "Malformed imported snapshots must not display impossible scores or negative lab metrics");
-  assert.ok(await evaluate("!document.querySelector('.page-speed-result time')"), "Invalid imported timestamps must not crash or invent a measurement date");
+  assert.ok(await evaluate("!document.querySelector('.page-speed-panel .page-speed-result time')"), "Invalid imported timestamps must not crash or invent a measurement date");
   await evaluate("window.__TAURI_INTERNALS__.invoke('get_rows', { query: { offset: 0, limit: 1 } }).then(({ rows }) => testEmit({ kind: 'record', record: rows[0] }))");
   await until("document.querySelector('.page-speed-scores dd')?.textContent === '92'", "The regular saved result must render after malformed evidence is replaced");
   const pageSpeedViewport = await evaluate("({ width: innerWidth, height: innerHeight })");
@@ -1609,7 +1764,66 @@ try {
   await toggleSetting('Canonical targets');
   await toggleSetting('Hreflang targets');
   await applySettings();
-  assert.deepEqual((await savedSettings()).config.referenceLinks, { canonical: true, hreflang: true, pagination: false, amp: false }, 'Reference types must save independently');
+  assert.deepEqual((await savedSettings()).config.referenceLinks, { canonical: true, hreflang: true, pagination: false, amp: false, metaRefresh: false, iframe: false }, 'Reference types must save independently');
+  await settingsTab('Thresholds');
+  await markSetting("Title maximum");
+  await fill(setting("Title maximum"), "50");
+  await applySettings();
+  assert.equal((await savedSettings()).config.thresholds.titleMaxChars, 50, 'Thresholds must save with the configuration');
+  await until("window.testAuditThresholds?.titleMaxChars === 50", 'Applied thresholds must reach the engine before rows reload');
+  await click('.settings-section:not([hidden]) .settings-action-button');
+  await until(`document.querySelector(${JSON.stringify(setting("Title maximum"))}).value === '60'`, 'Reset must restore default thresholds in the draft');
+  await applySettings();
+  await settingsTab('HTTP headers');
+  await fill('[aria-label="HTTP auth username"]', "frog");
+  await fill('[aria-label="HTTP auth password"]', "fixture-secret");
+  await click('[data-action="save-http-auth"]');
+  await until("document.querySelector('.http-auth-settings')?.textContent.includes('Credentials saved for frog') && document.querySelector('[aria-label=\"HTTP auth password\"]').value === ''", 'Saving credentials must report the username and clear the password draft');
+  assert.deepEqual(await evaluate("window.testHttpAuth"), { username: "frog", password: "fixture-secret" }, 'Credentials must go to the OS store command, not the configuration');
+  await toggleSetting("Send saved credentials to the starting origin");
+  await applySettings();
+  assert.deepEqual((await savedSettings()).config.httpAuth, { enabled: true }, 'Only the enabled flag may persist with the configuration');
+  assert.ok(!JSON.stringify(await savedSettings()).includes('fixture-secret'), 'Saved settings must never contain the password');
+  await click('[data-action="clear-http-auth"]');
+  await until("document.querySelector('.http-auth-settings.http-auth-settings')?.textContent.includes('No saved credentials')", 'Clearing credentials must update the status');
+  await fill('[aria-label="Form login username"]', "member");
+  await fill('[aria-label="Form login password"]', "form-secret");
+  await click('[data-action="save-form-login"]');
+  await until("document.querySelector('.form-login-settings')?.textContent.includes('Credentials saved for member')", 'Form login credentials must report the username');
+  assert.deepEqual(await evaluate("window.testFormLogin"), { username: "member", password: "form-secret" }, 'Form credentials must go to the OS store command');
+  await toggleSetting("Log in with the saved form credentials before crawling");
+  await click('[data-action="apply-settings"]');
+  await until("document.querySelector('.settings-validation-error')?.textContent.includes('highlighted')", 'Enabling form login without a URL must be rejected natively');
+  await fill('[aria-label="Form login URL"]', "https://example.test/login");
+  await fill('[aria-label="Form login extra fields"]', "remember=1\n\nnext=/account");
+  await applySettings();
+  assert.deepEqual((await savedSettings()).config.formLogin, { enabled: true, url: "https://example.test/login", usernameField: "username", passwordField: "password", extraFields: [{ name: "remember", value: "1" }, { name: "next", value: "/account" }] }, 'Form login settings must persist without secrets');
+  assert.ok(!JSON.stringify(await savedSettings()).includes('form-secret'), 'Saved settings must never contain the form password');
+  await toggleSetting("Log in with the saved form credentials before crawling");
+  await applySettings();
+  await settingsTab('Automation');
+  await select("Automatic export preset", "audit");
+  await fill('[aria-label="Completion webhook URL"]', "https://hooks.example.test/crawl");
+  await toggleSetting("Desktop notification on completion");
+  await applySettings();
+  assert.deepEqual((await savedSettings()).config.automation, { exportPreset: "audit", webhookUrl: "https://hooks.example.test/crawl", notifyOnCompletion: true }, 'Automation choices must save with the configuration');
+  await fill('[aria-label="Completion webhook URL"]', "not a url");
+  await click('[data-action="apply-settings"]');
+  await until("document.querySelector('.settings-validation-error')?.textContent.includes('highlighted')", 'Invalid webhook URLs must be rejected natively');
+  await fill('[aria-label="Completion webhook URL"]', "");
+  await applySettings();
+  await select("Crawl schedule", "once");
+  await click('[data-action="apply-settings"]');
+  await until("document.querySelector('.settings-validation-error')?.textContent.includes('highlighted')", 'A one-off schedule without a time must be rejected natively');
+  await fill('[aria-label="Scheduled run time"]', "2099-01-01T09:30");
+  await applySettings();
+  assert.deepEqual((await savedSettings()).config.schedule, { mode: "once", runAt: "2099-01-01T09:30", intervalMinutes: 60 }, 'Schedules must save with the configuration');
+  await until("document.querySelector('[data-schedule-status]')?.textContent.startsWith('Next scheduled crawl:')", 'Applied schedules must show the next run');
+  const startCallsBeforeSchedule = await evaluate("testStartCalls");
+  await select("Crawl schedule", "none");
+  await applySettings();
+  await until("document.querySelector('[data-schedule-status]')?.textContent === 'No scheduled crawl.'", 'Turning the schedule off must clear the next run');
+  assert.equal(await evaluate("testStartCalls"), startCallsBeforeSchedule, 'A future schedule must not start a crawl');
   await click('[title="Close settings"]');
   await reloadApp();
   await click('[aria-label="Crawl settings"]');
@@ -1841,7 +2055,7 @@ try {
   await fill('[aria-label="Search settings"]', "missing-setting-name");
   await until("document.querySelector('.settings-search-empty')", "Unmatched settings must offer a clear search action");
   await click('.settings-search-empty button');
-  await until("document.querySelectorAll('.settings-tab-button').length === 12", "Clearing the search must restore all working sections");
+  await until("document.querySelectorAll('.settings-tab-button').length === 15", "Clearing the search must restore all working sections");
   await until("[...document.querySelectorAll('.settings-tabs details')].every((group) => !group.open)", "Clearing search must restore collapsed navigation");
   await evaluate("document.querySelector('.settings-tabs summary').focus()");
   assert.equal(await evaluate("document.activeElement.tagName"), "SUMMARY", "Settings group headers must accept keyboard focus");
@@ -1852,7 +2066,7 @@ try {
   await fill('[aria-label="Search settings"]', "Chrome");
   await until("document.querySelector('.settings-tabs details').open", "A search match must reveal a collapsed group");
   await fill('[aria-label="Search settings"]', "");
-  await until("document.querySelectorAll('.settings-tab-button').length === 12", "Clearing search must restore all sections");
+  await until("document.querySelectorAll('.settings-tab-button').length === 15", "Clearing search must restore all sections");
   assert.ok(await evaluate("[...document.querySelectorAll('.settings-tabs details')].every((group) => !group.open)"), "Search must not leave every group expanded");
   await click('.settings-tabs summary');
   await until("document.querySelector('.settings-tabs details').open", "Settings groups must expand again");
@@ -1884,7 +2098,7 @@ try {
   await fill('[aria-label="Search settings"]', "Chrome");
   await click('[title="Close settings"]');
   await click('[aria-label="Crawl settings"]');
-  await until("document.querySelector('[aria-label=\"Search settings\"]')?.value === '' && document.querySelectorAll('.settings-tab-button').length === 12", "Reopening Settings must clear its search");
+  await until("document.querySelector('[aria-label=\"Search settings\"]')?.value === '' && document.querySelectorAll('.settings-tab-button').length === 15", "Reopening Settings must clear its search");
   assert.ok(await evaluate("[...document.querySelectorAll('.settings-tabs details')].every((group) => !group.open)"), "Reopening Settings must start with collapsed groups");
   await settingsTab("Crawl");
   await markSetting("Threads");
@@ -1893,7 +2107,7 @@ try {
   await fill(setting("Max URLs"), "2345");
   await toggleSetting("Respect robots.txt");
   await settingsTab("Resources");
-  await toggleSetting("Images");
+  await toggleSetting("Crawl Images");
   await settingsTab("HTTP headers");
   await click('[aria-label="Use Ferrous Frog request defaults"]');
   await fill('[aria-label="Request User-Agent"]', 'HeaderFixture/1.0');
@@ -1998,7 +2212,7 @@ try {
   assert.equal((await savedSettings()).config.folderScope, "exactUrl", "List mode must retain the last Spider scope on reload");
   assert.equal(await evaluate("document.querySelector('[aria-label=\"Root URL\"]').value"), "", "An intentionally blank List root must override the older saved URL");
   await settingsTab("Resources");
-  assert.ok(await evaluate("[...document.querySelectorAll('.settings-section:not([hidden]) .checkbox-field')].find((item) => item.textContent.trim() === 'Images').querySelector('[role=\"checkbox\"]').getAttribute('aria-checked') === 'true'"), "Nested resource choices must be restored");
+  assert.ok(await evaluate("[...document.querySelectorAll('.settings-section:not([hidden]) .checkbox-field')].find((item) => item.textContent.trim() === 'Crawl Images').querySelector('[role=\"checkbox\"]').getAttribute('aria-checked') === 'true'"), "Nested resource choices must be restored");
   await settingsTab("HTTP headers");
   assert.equal(await evaluate("document.querySelector('[aria-label=\"Request User-Agent\"]').value"), "HeaderFixture/1.0", "A saved custom agent must survive restart without being replaced by Chrome defaults");
   assert.equal(await evaluate("document.querySelector('[aria-label=\"Header 1 name\"]').value"), "Accept-Language", "Validated header names must be normalized and restored");

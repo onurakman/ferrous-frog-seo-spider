@@ -14,6 +14,7 @@ pub enum IntegrationSource {
     GoogleSearchConsole,
     GoogleAnalytics4,
     PageSpeedInsights,
+    ChromeUxReport,
     BacklinkProvider,
     Custom(String),
 }
@@ -79,6 +80,189 @@ pub struct PageSpeedMetrics {
     pub lighthouse_version: Option<String>,
 }
 
+/// Real-user (field) Core Web Vitals from the Chrome UX Report, distinct from Lighthouse lab runs.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldVitalsMetrics {
+    /// False when CrUX has no record for the URL and form factor.
+    pub has_data: bool,
+    pub lcp_ms_p75: Option<f64>,
+    pub cls_p75: Option<f64>,
+    pub inp_ms_p75: Option<f64>,
+    pub fcp_ms_p75: Option<f64>,
+    pub ttfb_ms_p75: Option<f64>,
+    /// Collection period as ISO dates (`YYYY-MM-DD`).
+    pub collection_period_start: Option<String>,
+    pub collection_period_end: Option<String>,
+    pub normalized_url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FieldFormFactor {
+    Phone,
+    Desktop,
+    Tablet,
+}
+
+impl FieldFormFactor {
+    fn as_api_value(&self) -> &'static str {
+        match self {
+            Self::Phone => "PHONE",
+            Self::Desktop => "DESKTOP",
+            Self::Tablet => "TABLET",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldVitalsConfig {
+    pub api_key: String,
+    pub form_factor: FieldFormFactor,
+}
+
+pub struct FieldVitalsProvider {
+    client: reqwest::Client,
+    config: FieldVitalsConfig,
+}
+
+const MAX_FIELD_VITALS_RESPONSE_BYTES: usize = 1024 * 1024;
+
+impl FieldVitalsProvider {
+    pub fn new(config: FieldVitalsConfig) -> Result<Self, IntegrationError> {
+        if config.api_key.trim().is_empty() {
+            return Err(IntegrationError::NotConfigured(
+                "Chrome UX Report needs a Google API key with the API enabled".to_string(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| IntegrationError::RequestFailed(reqwest_error_message(error)))?;
+        Ok(Self { client, config })
+    }
+
+    pub async fn fetch(&self, url: &str) -> Result<FieldVitalsMetrics, IntegrationError> {
+        let endpoint =
+            url::Url::parse("https://chromeuxreport.googleapis.com/v1/records:queryRecord")
+                .map_err(|error| IntegrationError::InvalidData(error.to_string()))?;
+        self.fetch_url(url, endpoint).await
+    }
+
+    async fn fetch_url(
+        &self,
+        url: &str,
+        mut endpoint: url::Url,
+    ) -> Result<FieldVitalsMetrics, IntegrationError> {
+        if !url::Url::parse(url).is_ok_and(|parsed| {
+            matches!(parsed.scheme(), "http" | "https")
+                && parsed.has_host()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+        }) {
+            return Err(IntegrationError::InvalidData(
+                "Chrome UX Report requires an absolute HTTP or HTTPS URL without credentials"
+                    .to_string(),
+            ));
+        }
+        endpoint
+            .query_pairs_mut()
+            .append_pair("key", self.config.api_key.trim());
+        let body = serde_json::json!({
+            "url": url,
+            "formFactor": self.config.form_factor.as_api_value(),
+        });
+        let response = self
+            .client
+            .post(endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| IntegrationError::RequestFailed(reqwest_error_message(error)))?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_FIELD_VITALS_RESPONSE_BYTES as u64)
+        {
+            return Err(IntegrationError::InvalidData(
+                "Chrome UX Report response exceeds the 1 MiB limit".to_string(),
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| IntegrationError::InvalidData(reqwest_error_message(error)))?;
+        if bytes.len() > MAX_FIELD_VITALS_RESPONSE_BYTES {
+            return Err(IntegrationError::InvalidData(
+                "Chrome UX Report response exceeds the 1 MiB limit".to_string(),
+            ));
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(FieldVitalsMetrics::default());
+        }
+        if !status.is_success() {
+            return Err(IntegrationError::RequestFailed(format!(
+                "Chrome UX Report returned HTTP {status}"
+            )));
+        }
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            IntegrationError::InvalidData(format!(
+                "Chrome UX Report returned invalid JSON at line {}, column {}",
+                error.line(),
+                error.column()
+            ))
+        })?;
+        Ok(field_vitals_from_payload(&payload))
+    }
+}
+
+fn field_vitals_from_payload(payload: &serde_json::Value) -> FieldVitalsMetrics {
+    let record = &payload["record"];
+    let p75 = |metric: &str| -> Option<f64> {
+        let value = &record["metrics"][metric]["percentiles"]["p75"];
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    let date = |key: &str| -> Option<String> {
+        let value = &record["collectionPeriod"][key];
+        Some(format!(
+            "{:04}-{:02}-{:02}",
+            value["year"].as_u64()?,
+            value["month"].as_u64()?,
+            value["day"].as_u64()?
+        ))
+    };
+    let metrics = FieldVitalsMetrics {
+        has_data: record.get("metrics").is_some_and(|m| m.is_object()),
+        lcp_ms_p75: p75("largest_contentful_paint"),
+        cls_p75: p75("cumulative_layout_shift"),
+        inp_ms_p75: p75("interaction_to_next_paint"),
+        fcp_ms_p75: p75("first_contentful_paint"),
+        ttfb_ms_p75: p75("experimental_time_to_first_byte"),
+        collection_period_start: date("firstDate"),
+        collection_period_end: date("lastDate"),
+        normalized_url: record["key"]["url"].as_str().map(str::to_string),
+    };
+    FieldVitalsMetrics {
+        has_data: metrics.has_data
+            && [
+                metrics.lcp_ms_p75,
+                metrics.cls_p75,
+                metrics.inp_ms_p75,
+                metrics.fcp_ms_p75,
+                metrics.ttfb_ms_p75,
+            ]
+            .iter()
+            .any(Option::is_some),
+        ..metrics
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BacklinkMetrics {
@@ -115,6 +299,407 @@ pub trait UrlMetricProvider: Send + Sync {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct AnalyticsConfig {
+    /// Numeric GA4 property ID (the part after `properties/`).
+    pub property_id: String,
+    pub access_token: String,
+}
+
+/// Google Analytics 4 Data API `runReport` per host + page path.
+#[derive(Clone)]
+pub struct GoogleAnalyticsProvider {
+    client: reqwest::Client,
+    config: AnalyticsConfig,
+    endpoint: Option<url::Url>,
+}
+
+impl GoogleAnalyticsProvider {
+    pub fn new(config: AnalyticsConfig) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            config,
+            endpoint: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_endpoint(mut self, endpoint: url::Url) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    fn endpoint(&self) -> Result<url::Url, IntegrationError> {
+        if let Some(endpoint) = &self.endpoint {
+            return Ok(endpoint.clone());
+        }
+        let property = self
+            .config
+            .property_id
+            .trim()
+            .trim_start_matches("properties/");
+        if property.is_empty() || !property.chars().all(|c| c.is_ascii_digit()) {
+            return Err(IntegrationError::NotConfigured(
+                "Google Analytics 4 needs a numeric property ID".to_string(),
+            ));
+        }
+        url::Url::parse(&format!(
+            "https://analyticsdata.googleapis.com/v1beta/properties/{property}:runReport"
+        ))
+        .map_err(|error| IntegrationError::InvalidData(error.to_string()))
+    }
+}
+
+impl UrlMetricProvider for GoogleAnalyticsProvider {
+    fn source(&self) -> IntegrationSource {
+        IntegrationSource::GoogleAnalytics4
+    }
+
+    fn fetch_metrics<'a>(&'a self, request: MetricRequest) -> ProviderFuture<'a, MetricResponse> {
+        Box::pin(async move {
+            let date_range = request.date_range.ok_or_else(|| {
+                IntegrationError::InvalidData(
+                    "Google Analytics 4 requests require a date range".to_string(),
+                )
+            })?;
+            if self.config.access_token.trim().is_empty() {
+                return Err(IntegrationError::NotConfigured(
+                    "Google Analytics 4 access token is empty".to_string(),
+                ));
+            }
+            let endpoint = self.endpoint()?;
+            let body = serde_json::json!({
+                "dateRanges": [{ "startDate": date_range.start_date, "endDate": date_range.end_date }],
+                "dimensions": [{ "name": "hostName" }, { "name": "pagePath" }],
+                "metrics": [{ "name": "sessions" }, { "name": "engagedSessions" }, { "name": "keyEvents" }, { "name": "totalRevenue" }],
+                "limit": "100000",
+                "returnPropertyQuota": false,
+            });
+            let response = self
+                .client
+                .post(endpoint)
+                .bearer_auth(self.config.access_token.trim())
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| IntegrationError::RequestFailed(reqwest_error_message(error)))?;
+            if !response.status().is_success() {
+                return Err(IntegrationError::RequestFailed(format!(
+                    "Google Analytics 4 returned HTTP {}",
+                    response.status()
+                )));
+            }
+            let payload = response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|error| IntegrationError::InvalidData(reqwest_error_message(error)))?;
+            Ok(MetricResponse {
+                source: IntegrationSource::GoogleAnalytics4,
+                rows: analytics_rows_to_metrics(&payload),
+            })
+        })
+    }
+}
+
+fn analytics_rows_to_metrics(payload: &serde_json::Value) -> Vec<UrlMetrics> {
+    let number = |value: &serde_json::Value| {
+        value
+            .get("value")
+            .and_then(|v| v.as_str())
+            .and_then(|text| text.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0)
+    };
+    payload["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let dimensions = row["dimensionValues"].as_array()?;
+            let host = dimensions.first()?.get("value")?.as_str()?.trim();
+            let path = dimensions.get(1)?.get("value")?.as_str()?.trim();
+            if host.is_empty() || path.is_empty() {
+                return None;
+            }
+            let metrics = row["metricValues"].as_array()?;
+            let mut url_metrics = UrlMetrics::new(
+                format!(
+                    "https://{host}{}",
+                    if path.starts_with('/') {
+                        path.to_string()
+                    } else {
+                        format!("/{path}")
+                    }
+                ),
+                IntegrationSource::GoogleAnalytics4,
+            );
+            url_metrics.analytics = Some(AnalyticsMetrics {
+                sessions: metrics.first().map(number).unwrap_or(0.0),
+                engaged_sessions: metrics.get(1).map(number).unwrap_or(0.0),
+                conversions: metrics.get(2).map(number).unwrap_or(0.0),
+                revenue: metrics.get(3).map(number).unwrap_or(0.0),
+            });
+            Some(url_metrics)
+        })
+        .collect()
+}
+
+/// A user-supplied backlink API: a URL template with `{url}` plus an optional header credential.
+/// The endpoint must return JSON with `backlinks`, `referringDomains` and optional `authorityScore`
+/// (snake_case accepted), which keeps commercial providers behind a thin, documented contract.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BacklinkEndpointConfig {
+    pub endpoint_template: String,
+    pub header_name: Option<String>,
+    pub header_value: Option<String>,
+}
+
+pub struct BacklinkEndpointProvider {
+    client: reqwest::Client,
+    config: BacklinkEndpointConfig,
+}
+
+impl BacklinkEndpointProvider {
+    pub fn new(config: BacklinkEndpointConfig) -> Result<Self, IntegrationError> {
+        let template = config.endpoint_template.trim();
+        if !template.contains("{url}")
+            || !url::Url::parse(&template.replace("{url}", "https://example.test/"))
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+        {
+            return Err(IntegrationError::NotConfigured(
+                "The backlink endpoint must be an HTTP(S) URL template containing {url}"
+                    .to_string(),
+            ));
+        }
+        if let Some(name) = config.header_name.as_deref().map(str::trim)
+            && !name.is_empty()
+            && reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+        {
+            return Err(IntegrationError::NotConfigured(format!(
+                "Invalid backlink credential header name: {name}"
+            )));
+        }
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|error| IntegrationError::RequestFailed(reqwest_error_message(error)))?;
+        Ok(Self { client, config })
+    }
+
+    fn request_url(&self, url: &str) -> String {
+        let encoded: String = url::form_urlencoded::byte_serialize(url.as_bytes()).collect();
+        self.config
+            .endpoint_template
+            .trim()
+            .replace("{url}", &encoded)
+    }
+
+    pub async fn fetch_url(&self, url: &str) -> Result<BacklinkMetrics, IntegrationError> {
+        let mut request = self.client.get(self.request_url(url));
+        if let (Some(name), Some(value)) = (
+            self.config.header_name.as_deref().map(str::trim),
+            self.config.header_value.as_deref().map(str::trim),
+        ) && !name.is_empty()
+            && !value.is_empty()
+        {
+            request = request.header(name, value);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| IntegrationError::RequestFailed(reqwest_error_message(error)))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(IntegrationError::RequestFailed(format!(
+                "Backlink endpoint returned HTTP {status}"
+            )));
+        }
+        let payload = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| IntegrationError::InvalidData(reqwest_error_message(error)))?;
+        backlink_metrics_from_payload(&payload).ok_or_else(|| {
+            IntegrationError::InvalidData(
+                "Backlink endpoint response needs numeric backlinks and referringDomains fields"
+                    .to_string(),
+            )
+        })
+    }
+}
+
+fn backlink_metrics_from_payload(payload: &serde_json::Value) -> Option<BacklinkMetrics> {
+    let field = |camel: &str, snake: &str| {
+        let value = payload.get(camel).or_else(|| payload.get(snake))?;
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+    };
+    let backlinks = field("backlinks", "backlinks")?;
+    let referring_domains = field("referringDomains", "referring_domains")?;
+    if !backlinks.is_finite()
+        || !referring_domains.is_finite()
+        || backlinks < 0.0
+        || referring_domains < 0.0
+    {
+        return None;
+    }
+    Some(BacklinkMetrics {
+        referring_domains: referring_domains as u64,
+        backlinks: backlinks as u64,
+        authority_score: field("authorityScore", "authority_score")
+            .filter(|score| score.is_finite()),
+    })
+}
+
+/// Tokens returned by Google's OAuth token endpoint.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthTokens {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in_secs: u64,
+    pub scope: String,
+}
+
+pub const GOOGLE_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+pub const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
+
+pub fn base64url_no_pad(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let buffer = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let bits = u32::from(buffer[0]) << 16 | u32::from(buffer[1]) << 8 | u32::from(buffer[2]);
+        let count = chunk.len() + 1;
+        for index in 0..count {
+            let shift = 18 - 6 * index;
+            output.push(TABLE[((bits >> shift) & 0x3f) as usize] as char);
+        }
+    }
+    output
+}
+
+/// PKCE S256 challenge for a code verifier (RFC 7636).
+pub fn pkce_challenge(verifier: &str) -> String {
+    use sha2::Digest as _;
+    base64url_no_pad(&sha2::Sha256::digest(verifier.as_bytes()))
+}
+
+pub fn google_authorization_url(
+    client_id: &str,
+    redirect_uri: &str,
+    scopes: &[&str],
+    state: &str,
+    code_verifier: &str,
+) -> Result<url::Url, IntegrationError> {
+    let mut url = url::Url::parse(GOOGLE_AUTH_ENDPOINT)
+        .map_err(|error| IntegrationError::InvalidData(error.to_string()))?;
+    url.query_pairs_mut()
+        .append_pair("client_id", client_id.trim())
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("response_type", "code")
+        .append_pair("scope", &scopes.join(" "))
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent")
+        .append_pair("state", state)
+        .append_pair("code_challenge", &pkce_challenge(code_verifier))
+        .append_pair("code_challenge_method", "S256");
+    Ok(url)
+}
+
+async fn google_token_request(
+    token_endpoint: &str,
+    form: &[(&str, &str)],
+) -> Result<OAuthTokens, IntegrationError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| IntegrationError::RequestFailed(reqwest_error_message(error)))?;
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form)
+        .finish();
+    let response = client
+        .post(token_endpoint)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| IntegrationError::RequestFailed(reqwest_error_message(error)))?;
+    let status = response.status();
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| IntegrationError::InvalidData(reqwest_error_message(error)))?;
+    if !status.is_success() {
+        let detail = payload["error_description"]
+            .as_str()
+            .or_else(|| payload["error"].as_str())
+            .unwrap_or("no details");
+        return Err(IntegrationError::RequestFailed(format!(
+            "Google token endpoint returned HTTP {status}: {detail}"
+        )));
+    }
+    let access_token = payload["access_token"]
+        .as_str()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| {
+            IntegrationError::InvalidData("Google token response has no access token".to_string())
+        })?;
+    Ok(OAuthTokens {
+        access_token: access_token.to_string(),
+        refresh_token: payload["refresh_token"].as_str().map(str::to_string),
+        expires_in_secs: payload["expires_in"].as_u64().unwrap_or(3600),
+        scope: payload["scope"].as_str().unwrap_or_default().to_string(),
+    })
+}
+
+pub async fn exchange_google_code(
+    token_endpoint: &str,
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+) -> Result<OAuthTokens, IntegrationError> {
+    google_token_request(
+        token_endpoint,
+        &[
+            ("client_id", client_id.trim()),
+            ("client_secret", client_secret.trim()),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+            ("code_verifier", code_verifier),
+        ],
+    )
+    .await
+}
+
+pub async fn refresh_google_tokens(
+    token_endpoint: &str,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<OAuthTokens, IntegrationError> {
+    google_token_request(
+        token_endpoint,
+        &[
+            ("client_id", client_id.trim()),
+            ("client_secret", client_secret.trim()),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ],
+    )
+    .await
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct SearchConsoleConfig {
     pub site_url: String,
     pub access_token: String,
@@ -137,12 +722,46 @@ impl PageSpeedStrategy {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum PageSpeedCategory {
+    Performance,
+    Accessibility,
+    BestPractices,
+    Seo,
+}
+
+impl PageSpeedCategory {
+    pub const ALL: [PageSpeedCategory; 4] = [
+        PageSpeedCategory::Performance,
+        PageSpeedCategory::Accessibility,
+        PageSpeedCategory::BestPractices,
+        PageSpeedCategory::Seo,
+    ];
+
+    fn as_api_value(&self) -> &'static str {
+        match self {
+            Self::Performance => "performance",
+            Self::Accessibility => "accessibility",
+            Self::BestPractices => "best-practices",
+            Self::Seo => "seo",
+        }
+    }
+}
+
+fn all_page_speed_categories() -> Vec<PageSpeedCategory> {
+    PageSpeedCategory::ALL.to_vec()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PageSpeedConfig {
     pub api_key: Option<String>,
     pub strategy: PageSpeedStrategy,
     pub locale: Option<String>,
+    /// Lighthouse categories to request; an empty list means all four.
+    #[serde(default = "all_page_speed_categories")]
+    pub categories: Vec<PageSpeedCategory>,
 }
 
 #[derive(Clone)]
@@ -278,8 +897,16 @@ impl PageSpeedProvider {
             let mut query = endpoint.query_pairs_mut();
             query.append_pair("url", &url);
             query.append_pair("strategy", self.config.strategy.as_api_value());
-            for category in ["performance", "accessibility", "best-practices", "seo"] {
-                query.append_pair("category", category);
+            let mut categories: Vec<PageSpeedCategory> = if self.config.categories.is_empty() {
+                PageSpeedCategory::ALL.to_vec()
+            } else {
+                self.config.categories.clone()
+            };
+            categories.dedup();
+            for category in PageSpeedCategory::ALL {
+                if categories.contains(&category) {
+                    query.append_pair("category", category.as_api_value());
+                }
             }
             if let Some(locale) = self.config.locale.as_deref()
                 && !locale.trim().is_empty()
@@ -605,6 +1232,12 @@ fn lighthouse_audit_numeric_value(lighthouse: &LighthouseResult, key: &str) -> O
         .and_then(|audit| audit.numeric_value)
 }
 
+pub mod llm;
+
+#[cfg(test)]
+mod field_vitals_tests;
+#[cfg(test)]
+mod google_tests;
 #[cfg(test)]
 mod page_speed_tests;
 

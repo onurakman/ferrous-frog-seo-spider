@@ -2,7 +2,9 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import CrawlHome, { type SavedCrawl } from "./CrawlHome";
 import AdvancedFilters, { type GridFilterGroup } from "./AdvancedFilters";
-import { PageSpeedPanel, PageSpeedSettings, usePageSpeedCredentials, type PageSpeedSnapshot, type PageSpeedStrategy } from "./PageSpeed";
+import { FieldVitalsPanel, PageSpeedPanel, PageSpeedSettings, usePageSpeedCredentials, type FieldFormFactor, type FieldVitalsSnapshot, type PageSpeedCategory, type PageSpeedSnapshot, type PageSpeedStrategy } from "./PageSpeed";
+import { HttpAuthSettings, formLoginCommands, useHttpAuthCredentials } from "./HttpAuth";
+import { isScheduleDue, nextScheduledRun, scheduleStateFor, type ScheduleConfig, type ScheduleState } from "./schedule-model";
 import type { CrawlGraph, GraphLayoutMode, GraphStatusFilter } from "./crawl-graph-model";
 import * as Checkbox from "@radix-ui/react-checkbox";
 import * as Dialog from "./Dialog";
@@ -163,6 +165,8 @@ type IssueView =
   | "renderedDomChanged"
   | "nearDuplicate"
   | "exactDuplicate"
+  | "thinContent"
+  | "lowTextRatio"
   | "brokenLinks"
   | "sitemapOrphan";
 
@@ -238,6 +242,7 @@ type CrawlRecord = {
   xContentTypeOptionsHeader: boolean;
   viewport: boolean;
   amphtml?: string | null;
+  metaKeywords?: string | null;
   relNext?: string | null;
   relPrev?: string | null;
   hreflangCount: number;
@@ -271,7 +276,16 @@ type CrawlRecord = {
   searchConsoleImpressions?: number | null;
   searchConsoleCtr?: number | null;
   searchConsoleAveragePosition?: number | null;
+  analyticsSessions?: number | null;
+  analyticsEngagedSessions?: number | null;
+  analyticsConversions?: number | null;
+  analyticsRevenue?: number | null;
+  backlinkCount?: number | null;
+  referringDomainCount?: number | null;
+  backlinkAuthority?: number | null;
   pageSpeed?: PageSpeedSnapshot | null;
+  fieldVitals?: FieldVitalsSnapshot | null;
+  aiInsights?: AiInsights | null;
   error?: string | null;
 };
 
@@ -617,6 +631,33 @@ type SearchConsoleMergeResult = {
   impressions: number;
 };
 
+type GoogleOAuthStatus = {
+  clientConfigured: boolean;
+  clientId?: string | null;
+  connected: boolean;
+  refreshable: boolean;
+  expiresAtMs?: number | null;
+  scopes: string[];
+  keyringAvailable: boolean;
+  message?: string | null;
+};
+
+type AnalyticsMergeResult = { propertyId: string; fetchedRows: number; matchedRows: number; sessions: number };
+
+type BacklinkSettingsStatus = { endpointTemplate: string; headerName: string; credentialSaved: boolean; keyringAvailable: boolean };
+type BacklinkMergeResult = { requestedUrls: number; matchedRows: number; failedUrls: number; firstError?: string | null };
+
+type AiProvider = "anthropic" | "openAiCompatible";
+type AiStatus = { provider: AiProvider; model: string; baseUrl: string; requestsPerMinute: number; maxInputChars: number; keySaved: boolean; keyringAvailable: boolean; message?: string | null };
+type AiInsights = {
+  intent?: { intent: string; confidence: number; rationale: string } | null;
+  metaDescription?: { draft: string; alternatives: string[] } | null;
+  spelling?: { language?: string | null; issues: { text: string; suggestion: string; kind: string }[] } | null;
+  model: string;
+  updatedAtMs: number;
+};
+type AiTask = "intent" | "metaDescription" | "spelling";
+
 type DatabaseLocation = {
   path: string;
   session?: CrawlSession;
@@ -666,7 +707,10 @@ type SettingsTab =
   | "profiles"
   | "integrations"
   | "rendering"
-  | "extraction";
+  | "extraction"
+  | "thresholds"
+  | "automation"
+  | "ai";
 
 type CrawlConfig = {
   mode: CrawlMode;
@@ -675,9 +719,17 @@ type CrawlConfig = {
   listSitemapUrls: string[];
   sitemap: SitemapConfig;
   content: { includeSelectors: string[]; excludeSelectors: string[] };
-  referenceLinks: { canonical: boolean; hreflang: boolean; pagination: boolean; amp: boolean };
+  thresholds: AuditThresholds;
+  automation: AutomationConfig;
+  httpAuth: { enabled: boolean };
+  formLogin: FormLoginConfig;
+  schedule: ScheduleConfig;
+  referenceLinks: { canonical: boolean; hreflang: boolean; pagination: boolean; amp: boolean; metaRefresh: boolean; iframe: boolean };
   maxUrls: number;
   maxDepth: number;
+  maxFolderDepth: number;
+  maxUrlLength: number;
+  maxLinksPerPage: number;
   concurrency: number;
   requestsPerSecond: number;
   requestDelayMs: number;
@@ -694,6 +746,7 @@ type CrawlConfig = {
   nearDuplicateThreshold: number;
   includeUrlPatterns: string[];
   excludeUrlPatterns: string[];
+  cdnHosts: string[];
   subdomainScope: SubdomainScope;
   folderScope: FolderScope;
   checkLinksOutsideStartFolder: boolean;
@@ -701,6 +754,7 @@ type CrawlConfig = {
   followInternalNofollow: boolean;
   followExternalNofollow: boolean;
   resourceTypes: ResourceTypeConfig;
+  store: StoreConfig;
   querySettings: QuerySettingsConfig;
   customExtractors: CustomExtractor[];
   customSearches: CustomSearch[];
@@ -722,6 +776,59 @@ type ResourceTypeConfig = {
   javascript: boolean;
   external: boolean;
   other: boolean;
+};
+
+type RequestHeader = { name: string; value: string };
+// Form login posted once before crawling; credentials stay in the OS credential store.
+type FormLoginConfig = { enabled: boolean; url: string; usernameField: string; passwordField: string; extraFields: RequestHeader[] };
+const formFieldsToText = (fields: RequestHeader[]) => fields.map((field) => `${field.name}=${field.value}`).join("\n");
+const parseFormFields = (text: string): RequestHeader[] => text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  .map((line) => { const index = line.indexOf("="); return index < 0 ? { name: line, value: "" } : { name: line.slice(0, index).trim(), value: line.slice(index + 1) }; });
+
+// Post-crawl actions run by the desktop app; the engine ignores them.
+type AutomationConfig = { exportPreset: "" | "basic" | "audit" | "full"; webhookUrl: string; notifyOnCompletion: boolean };
+
+// Limits behind the length/width audit views, analysis issues and HTML report.
+type AuditThresholds = {
+  titleMinChars: number;
+  titleMaxChars: number;
+  titleMinPixels: number;
+  titleMaxPixels: number;
+  metaMinChars: number;
+  metaMaxChars: number;
+  metaMinPixels: number;
+  metaMaxPixels: number;
+  h1MaxChars: number;
+  h2MaxChars: number;
+  largeImageBytes: number;
+  thinContentWords: number;
+  minTextRatioPercent: number;
+};
+
+const thresholdFields: [keyof AuditThresholds, string, string][] = [
+  ["titleMinChars", "Title minimum", "characters"],
+  ["titleMaxChars", "Title maximum", "characters"],
+  ["titleMinPixels", "Title minimum width", "pixels"],
+  ["titleMaxPixels", "Title maximum width", "pixels"],
+  ["metaMinChars", "Description minimum", "characters"],
+  ["metaMaxChars", "Description maximum", "characters"],
+  ["metaMinPixels", "Description minimum width", "pixels"],
+  ["metaMaxPixels", "Description maximum width", "pixels"],
+  ["h1MaxChars", "H1 maximum", "characters"],
+  ["h2MaxChars", "H2 maximum", "characters"],
+  ["largeImageBytes", "Large image", "bytes"],
+  ["thinContentWords", "Thin content", "words"],
+  ["minTextRatioPercent", "Minimum text ratio", "percent"],
+];
+
+// Retention for discovered URLs that are not crawled; crawled types are always stored.
+type StoreConfig = {
+  images: boolean;
+  css: boolean;
+  javascript: boolean;
+  other: boolean;
+  internalLinks: boolean;
+  externalLinks: boolean;
 };
 
 type QuerySettingsConfig = {
@@ -821,6 +928,20 @@ const lastUrlStorageKey = "ferrous-frog-last-url";
 const overviewWidthStorageKey = "ferrous-frog-overview-width";
 const urlSegmentsStorageKey = "ferrous-frog-url-segments";
 const settingsStorageKey = "ferrous-frog-settings";
+const scheduleStorageKey = "ferrous-frog-schedule";
+
+function readScheduleState(): ScheduleState | null {
+  try {
+    const raw = window.localStorage.getItem(scheduleStorageKey);
+    return raw ? (JSON.parse(raw) as ScheduleState) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeScheduleState(state: ScheduleState) {
+  try { window.localStorage.setItem(scheduleStorageKey, JSON.stringify(state)); } catch { /* per-viewer convenience only */ }
+}
 const columnLayoutStorageKey = "ferrous-frog-column-layouts";
 const updateReminderKey = "ferrous-frog-update-reminder-until";
 const updateReminderDelay = 24 * 60 * 60 * 1000;
@@ -840,6 +961,7 @@ const detailTabs = [
   { id: "technical", label: "Technical" },
   { id: "custom", label: "Custom data" },
   { id: "pagespeed", label: "PageSpeed" },
+  { id: "ai", label: "AI" },
 ] as const;
 
 const emptySummary: CrawlSummary = {
@@ -925,9 +1047,31 @@ const defaultConfig: CrawlConfig = {
   listSitemapUrls: [],
   sitemap: { enabled: true, discoverFromRobots: true, probeDefault: true, followLinked: true, urls: [] },
   content: { includeSelectors: [], excludeSelectors: [] },
-  referenceLinks: { canonical: false, hreflang: false, pagination: false, amp: false },
+  thresholds: {
+    titleMinChars: 30,
+    titleMaxChars: 60,
+    titleMinPixels: 200,
+    titleMaxPixels: 580,
+    metaMinChars: 70,
+    metaMaxChars: 160,
+    metaMinPixels: 400,
+    metaMaxPixels: 920,
+    h1MaxChars: 70,
+    h2MaxChars: 70,
+    largeImageBytes: 200 * 1024,
+    thinContentWords: 200,
+    minTextRatioPercent: 10,
+  },
+  automation: { exportPreset: "", webhookUrl: "", notifyOnCompletion: false },
+  httpAuth: { enabled: false },
+  formLogin: { enabled: false, url: "", usernameField: "username", passwordField: "password", extraFields: [] },
+  schedule: { mode: "none", runAt: "", intervalMinutes: 60 },
+  referenceLinks: { canonical: false, hreflang: false, pagination: false, amp: false, metaRefresh: false, iframe: false },
   maxUrls: 5000,
   maxDepth: 3,
+  maxFolderDepth: 0,
+  maxUrlLength: 0,
+  maxLinksPerPage: 0,
   concurrency: 8,
   requestsPerSecond: 10,
   requestDelayMs: 100,
@@ -944,6 +1088,7 @@ const defaultConfig: CrawlConfig = {
   nearDuplicateThreshold: 6,
   includeUrlPatterns: [],
   excludeUrlPatterns: [],
+  cdnHosts: [],
   subdomainScope: "includeSubdomains",
   folderScope: "anywhere",
   checkLinksOutsideStartFolder: false,
@@ -957,6 +1102,14 @@ const defaultConfig: CrawlConfig = {
     javascript: false,
     external: false,
     other: false,
+  },
+  store: {
+    images: true,
+    css: true,
+    javascript: true,
+    other: true,
+    internalLinks: true,
+    externalLinks: true,
   },
   querySettings: {
     sortParameters: false,
@@ -981,9 +1134,16 @@ function normalizeCrawlConfig(config: Partial<CrawlConfig>): CrawlConfig {
     listSitemapUrls: cleanPatterns(config.listSitemapUrls),
     sitemap: { ...defaultConfig.sitemap, ...config.sitemap, urls: cleanPatterns(config.sitemap?.urls) },
     content: { includeSelectors: cleanPatterns(config.content?.includeSelectors), excludeSelectors: cleanPatterns(config.content?.excludeSelectors) },
+    thresholds: { ...defaultConfig.thresholds, ...(config.thresholds ?? {}) },
+    automation: { ...defaultConfig.automation, ...(config.automation ?? {}), webhookUrl: (config.automation?.webhookUrl ?? "").trim() },
+    httpAuth: { enabled: config.httpAuth?.enabled ?? false },
+    formLogin: { ...defaultConfig.formLogin, ...(config.formLogin ?? {}), url: (config.formLogin?.url ?? "").trim(),
+      extraFields: (config.formLogin?.extraFields ?? []).map((field) => ({ name: field.name.trim(), value: field.value })).filter((field) => field.name) },
+    schedule: { ...defaultConfig.schedule, ...(config.schedule ?? {}), runAt: (config.schedule?.runAt ?? "").trim() },
     referenceLinks: { ...defaultConfig.referenceLinks, ...config.referenceLinks },
     includeUrlPatterns: cleanPatterns(config.includeUrlPatterns),
     excludeUrlPatterns: cleanPatterns(config.excludeUrlPatterns),
+    cdnHosts: cleanPatterns(config.cdnHosts),
     subdomainScope: config.subdomainScope ?? defaultConfig.subdomainScope,
     folderScope: config.folderScope ?? defaultConfig.folderScope,
     requestHeaders: (config.requestHeaders ?? defaultConfig.requestHeaders).map((header) => ({ name: header.name.trim(), value: header.value })),
@@ -994,6 +1154,7 @@ function normalizeCrawlConfig(config: Partial<CrawlConfig>): CrawlConfig {
       ...defaultConfig.resourceTypes,
       ...(config.resourceTypes ?? {}),
     },
+    store: { ...defaultConfig.store, ...(config.store ?? {}) },
     querySettings: {
       ...defaultConfig.querySettings,
       ...(config.querySettings ?? {}),
@@ -1021,7 +1182,10 @@ function getInitialSettings(): Pick<AppState, "config" | "modeStartUrls" | "stor
     for (const [value, template] of [[saved.config, defaultConfig], [saved.config.resourceTypes ?? {}, defaultConfig.resourceTypes],
       [saved.config.querySettings ?? {}, defaultConfig.querySettings], [saved.config.rendering ?? {}, defaultConfig.rendering],
       [saved.config.sitemap ?? {}, defaultConfig.sitemap], [saved.config.content ?? {}, defaultConfig.content],
-      [saved.config.referenceLinks ?? {}, defaultConfig.referenceLinks]]) {
+      [saved.config.referenceLinks ?? {}, defaultConfig.referenceLinks], [saved.config.store ?? {}, defaultConfig.store],
+      [saved.config.thresholds ?? {}, defaultConfig.thresholds], [saved.config.automation ?? {}, defaultConfig.automation],
+      [saved.config.httpAuth ?? {}, defaultConfig.httpAuth], [saved.config.schedule ?? {}, defaultConfig.schedule],
+      [saved.config.formLogin ?? {}, defaultConfig.formLogin]]) {
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid settings section");
       for (const [key, fallback] of Object.entries(template)) {
         const entry = (value as Record<string, unknown>)[key];
@@ -1031,9 +1195,10 @@ function getInitialSettings(): Pick<AppState, "config" | "modeStartUrls" | "stor
       }
     }
     const config = normalizeCrawlConfig(saved.config);
-    if (![config.listUrls, config.listSitemapUrls, config.sitemap.urls, config.includeUrlPatterns, config.excludeUrlPatterns,
+    if (![config.listUrls, config.listSitemapUrls, config.sitemap.urls, config.includeUrlPatterns, config.excludeUrlPatterns, config.cdnHosts,
       config.querySettings.stripParameterPatterns, config.content.includeSelectors, config.content.excludeSelectors].every((list) => list.every((value) => typeof value === "string")) ||
       !config.requestHeaders.every((header) => typeof header.name === "string" && typeof header.value === "string") ||
+      !config.formLogin.extraFields.every((field) => field && typeof field.name === "string" && typeof field.value === "string") ||
       !config.customExtractors.every((item) => item && typeof item.name === "string" && typeof item.pattern === "string" &&
         ["cssText", "cssAttribute", "xpath", "regex"].includes(item.kind) && typeof item.allMatches === "boolean" &&
         (item.attribute == null || typeof item.attribute === "string")) ||
@@ -1181,6 +1346,8 @@ const views: Array<{ id: IssueView; label: string }> = [
   { id: "renderedDomChanged", label: "Rendered Changes" },
   { id: "nearDuplicate", label: "Near Duplicates" },
   { id: "exactDuplicate", label: "Exact Response Duplicates" },
+  { id: "thinContent", label: "Thin Content" },
+  { id: "lowTextRatio", label: "Low Text Ratio" },
   { id: "brokenLinks", label: "Broken Links" },
   { id: "sitemapOrphan", label: "Sitemap Orphans" },
 ];
@@ -1198,7 +1365,7 @@ const issueGroups: Array<{ label: string; tabLabel?: string; views: IssueView[];
   { label: "Security", views: ["securityMixedContent", "securityInsecureForms", "securityMissingHsts", "securityMissingCsp", "securityMissingXFrameOptions", "securityMissingContentTypeOptions"], columns: ["mixedContentCount", "insecureFormCount", "hstsHeader", "contentSecurityPolicyHeader", "xFrameOptionsHeader", "xContentTypeOptionsHeader"] },
   { label: "International", tabLabel: "Hreflang", views: ["hreflangInvalid", "hreflangMissingSelfReference", "hreflangMissingReturnLink", "hreflangNonCanonicalTarget"], columns: ["hreflangCount", "hreflangInvalidCount", "canonical", "indexability"] },
   { label: "Structured data & HTML", tabLabel: "Markup", views: ["structuredDataInvalid", "structuredDataWarning", "htmlDeprecatedTags", "htmlDuplicateIds"], columns: ["jsonLdInvalidCount", "structuredDataErrorCount", "structuredDataWarningCount", "deprecatedHtmlTagCount", "duplicateIdCount"] },
-  { label: "Content & rendering", tabLabel: "Content", views: ["exactDuplicate", "nearDuplicate", "renderedDomChanged", "mobileMissingViewport"], columns: ["wordCount", "responseHash", "sizeBytes", "nearDuplicateClusterId", "jsRendered", "renderedWordCountDelta", "renderedLinkCountDelta", "viewport"] },
+  { label: "Content & rendering", tabLabel: "Content", views: ["thinContent", "lowTextRatio", "exactDuplicate", "nearDuplicate", "renderedDomChanged", "mobileMissingViewport"], columns: ["wordCount", "textToCodeRatio", "responseHash", "sizeBytes", "nearDuplicateClusterId", "jsRendered", "renderedWordCountDelta", "renderedLinkCountDelta", "viewport"] },
   { label: "Sitemaps", views: ["sitemapOrphan"], columns: ["inSitemap", "canonical", "indexability", "inlinkCount"] },
 ];
 
@@ -1303,6 +1470,9 @@ const nativeColumns: GridColumn[] = [
     grow: 1,
     sortable: true,
   },
+  { kind: "native", key: "metaKeywords", label: "Meta keywords", width: 220, sortable: true },
+  { kind: "native", key: "pageSpeed", label: "PageSpeed (lab)", width: 300, sortable: false },
+  { kind: "native", key: "fieldVitals", label: "Field data (CrUX)", width: 300, sortable: false },
   {
     kind: "native",
     key: "metaDescriptionPixelWidth",
@@ -1366,6 +1536,13 @@ const nativeColumns: GridColumn[] = [
     width: 90,
     sortable: true,
   },
+  { kind: "native", key: "analyticsSessions", label: "GA4 Sessions", width: 100, sortable: true },
+  { kind: "native", key: "analyticsEngagedSessions", label: "GA4 Engaged", width: 100, sortable: true },
+  { kind: "native", key: "analyticsConversions", label: "GA4 Key events", width: 110, sortable: true },
+  { kind: "native", key: "analyticsRevenue", label: "GA4 Revenue", width: 100, sortable: true },
+  { kind: "native", key: "backlinkCount", label: "Backlinks", width: 90, sortable: true },
+  { kind: "native", key: "referringDomainCount", label: "Ref. domains", width: 100, sortable: true },
+  { kind: "native", key: "backlinkAuthority", label: "Authority", width: 90, sortable: true },
   {
     kind: "native",
     key: "inSitemap",
@@ -1422,6 +1599,7 @@ const nativeColumns: GridColumn[] = [
     width: 78,
     sortable: true,
   },
+  { kind: "native", key: "textToCodeRatio", label: "Text ratio", width: 90, sortable: true },
   {
     kind: "native",
     key: "nearDuplicateClusterId",
@@ -1584,14 +1762,14 @@ const settingsTabs: Array<{
     label: "Crawl",
     description: "Limits, robots.txt, and crawl throughput.",
     group: "Spider",
-    keywords: "max URLs crawl depth concurrency speed requests delay timeout retries backoff robots override tester download response body bytes MiB size near duplicate threshold",
+    keywords: "max URLs crawl depth folder depth URL length links per page concurrency speed requests delay timeout retries backoff robots override tester download response body bytes MiB size near duplicate threshold",
   },
   {
     id: "scope",
     label: "Scope",
     description: "List sources and URL include or exclude rules.",
     group: "Spider",
-    keywords: "subdomain host folder nofollow include exclude regex list sitemap file upload duplicates input order",
+    keywords: "subdomain host folder nofollow include exclude regex CDN hosts internal classification list sitemap file upload duplicates input order",
   },
   {
     id: "sitemaps",
@@ -1605,14 +1783,14 @@ const settingsTabs: Array<{
     label: "HTTP headers",
     description: "Browser defaults, User-Agent and request header overrides.",
     group: "Spider",
-    keywords: "custom HTTP request headers user-agent Chrome browser desktop preset defaults Accept Accept-Language origin environment name value",
+    keywords: "custom HTTP request headers user-agent Chrome browser desktop preset defaults Accept Accept-Language origin environment name value authentication basic auth username password credentials login form login cookie session",
   },
   {
     id: "resources",
     label: "Resources",
     description: "Choose which asset and URL types can enter the crawl.",
     group: "Spider",
-    keywords: "HTML images CSS JavaScript external other files canonical hreflang pagination AMP reference link discovery",
+    keywords: "HTML images CSS JavaScript external other files crawl store retain links canonical hreflang pagination AMP meta refresh iframe reference link discovery",
   },
   {
     id: "query",
@@ -1640,7 +1818,7 @@ const settingsTabs: Array<{
     label: "Integrations",
     description: "External metrics and credential status.",
     group: "Workspace",
-    keywords: "API Google Search Console GSC token credentials property site keyring test connection merge clicks impressions CTR position metrics PageSpeed Insights PSI Lighthouse mobile desktop performance LCP TBT CLS",
+    keywords: "API Google account OAuth client ID secret connect Search Console GSC token credentials property site keyring test connection merge clicks impressions CTR position metrics Analytics GA4 sessions engaged key events revenue PageSpeed Insights PSI Lighthouse mobile desktop performance LCP TBT CLS field data CrUX backlinks referring domains authority endpoint template",
   },
   {
     id: "rendering",
@@ -1662,6 +1840,27 @@ const settingsTabs: Array<{
     description: "Create custom CSS, XPath, and regex extraction columns.",
     group: "Analysis",
     keywords: "custom extraction search text CSS selector attribute XPath regex raw HTML rendered visible include exclude snippets",
+  },
+  {
+    id: "thresholds",
+    label: "Thresholds",
+    description: "Character, pixel and image-size limits behind the audit views.",
+    group: "Analysis",
+    keywords: "thresholds limits title meta description length characters pixels width H1 H2 heading large image bytes too short too long",
+  },
+  {
+    id: "automation",
+    label: "Automation",
+    description: "Automatic exports, webhook and notification when a crawl finishes.",
+    group: "Workspace",
+    keywords: "automation auto export preset basic audit full webhook URL notification desktop finished completion schedule scheduled once repeat interval minutes run at",
+  },
+  {
+    id: "ai",
+    label: "AI",
+    description: "LLM provider, model, API key and rate limit for page assistance.",
+    group: "Analysis",
+    keywords: "AI LLM Claude Anthropic OpenAI compatible provider model API key rate limit requests per minute prompt intent meta description spelling grammar",
   },
 ];
 
@@ -2084,8 +2283,29 @@ export default function App() {
     useState<SearchConsoleTestResult>();
   const [searchConsoleMergeResult, setSearchConsoleMergeResult] =
     useState<SearchConsoleMergeResult>();
+  const [googleStatus, setGoogleStatus] = useState<GoogleOAuthStatus>({ clientConfigured: false, connected: false, refreshable: false, scopes: [], keyringAvailable: true });
+  const [googleClientId, setGoogleClientId] = useState("");
+  const [googleClientSecret, setGoogleClientSecret] = useState("");
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const [analyticsPropertyId, setAnalyticsPropertyId] = useState("");
+  const [analyticsMergeResult, setAnalyticsMergeResult] = useState<AnalyticsMergeResult>();
+  const [backlinkStatus, setBacklinkStatus] = useState<BacklinkSettingsStatus>({ endpointTemplate: "", headerName: "", credentialSaved: false, keyringAvailable: true });
+  const [backlinkDraft, setBacklinkDraft] = useState({ endpointTemplate: "", headerName: "", headerValue: "" });
+  const [backlinkMaxUrls, setBacklinkMaxUrls] = useState(500);
+  const [backlinkLoading, setBacklinkLoading] = useState(false);
+  const [backlinkMergeResult, setBacklinkMergeResult] = useState<BacklinkMergeResult>();
+  const [aiStatus, setAiStatus] = useState<AiStatus>();
+  const [aiDraft, setAiDraft] = useState<{ provider: AiProvider; model: string; baseUrl: string; requestsPerMinute: number; maxInputChars: number }>({ provider: "anthropic", model: "claude-opus-5", baseUrl: "", requestsPerMinute: 20, maxInputChars: 12000 });
+  const [aiApiKey, setAiApiKey] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiTaskRunning, setAiTaskRunning] = useState<AiTask>();
   const pageSpeedCredentials = usePageSpeedCredentials(settingsOpen, desktopRuntime);
+  const httpAuthCredentials = useHttpAuthCredentials(settingsOpen, desktopRuntime);
+  const formLoginCredentials = useHttpAuthCredentials(settingsOpen, desktopRuntime, formLoginCommands);
   const [pageSpeedStrategy, setPageSpeedStrategy] = useState<PageSpeedStrategy>("mobile");
+  const [fieldFormFactor, setFieldFormFactor] = useState<FieldFormFactor>("phone");
+  const [pageSpeedCategories, setPageSpeedCategories] = useState<PageSpeedCategory[]>(["performance", "accessibility", "bestPractices", "seo"]);
+  const [pageSpeedBulkStatus, setPageSpeedBulkStatus] = useState<string>();
   const [pageSpeedActive, setPageSpeedActive] = useState<{ requestId: string; url: string }>();
   const pageSpeedRequest = useRef<string | undefined>(undefined);
   const [pageSpeedCancelling, setPageSpeedCancelling] = useState(false);
@@ -2225,8 +2445,23 @@ export default function App() {
     ]);
   }, []);
 
+  const activeThresholds = useAppStore((state) => state.config.thresholds);
+  const [appliedThresholds, setAppliedThresholds] = useState<AuditThresholds | null>(null);
+  useEffect(() => {
+    if (!desktopRuntime) return;
+    let cancelled = false;
+    void invoke("set_audit_thresholds", { thresholds: activeThresholds })
+      .catch((caught) => setError(errorMessage(caught)))
+      .finally(() => {
+        if (!cancelled) setAppliedThresholds(activeThresholds);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [desktopRuntime, activeThresholds, setError]);
+
   const loadRows = useCallback(async () => {
-    if (!desktopRuntime) {
+    if (!desktopRuntime || !appliedThresholds) {
       return;
     }
 
@@ -2261,6 +2496,7 @@ export default function App() {
     }
   }, [
     desktopRuntime,
+    appliedThresholds,
     activeSegment,
     advancedFilters,
     globalSearch,
@@ -2373,6 +2609,15 @@ export default function App() {
       );
       setSearchConsoleStatus(status);
       setSearchConsoleSiteUrl((current) => current || status.siteUrl || "");
+      setGoogleStatus(await invoke<GoogleOAuthStatus>("get_google_oauth_status"));
+      const backlinks = await invoke<BacklinkSettingsStatus>("get_backlink_settings");
+      setBacklinkStatus(backlinks);
+      setBacklinkDraft((current) => ({ ...current, endpointTemplate: current.endpointTemplate || backlinks.endpointTemplate, headerName: current.headerName || backlinks.headerName }));
+      const ai = await invoke<AiStatus>("get_ai_status");
+      setAiStatus(ai);
+      setAiDraft({ provider: ai.provider, model: ai.model, baseUrl: ai.baseUrl, requestsPerMinute: ai.requestsPerMinute, maxInputChars: ai.maxInputChars });
+      const property = await invoke<string | null>("get_analytics_property");
+      setAnalyticsPropertyId((current) => current || property || "");
     } catch (caught) {
       setError(errorMessage(caught));
     }
@@ -2899,6 +3144,28 @@ export default function App() {
     }
   };
 
+  // In-app scheduler: fires only while the desktop app is open and idle.
+  const scheduleConfig = useAppStore((state) => state.config.schedule);
+  const [scheduleState, setScheduleState] = useState<ScheduleState>(() => scheduleStateFor(defaultConfig.schedule, readScheduleState(), Date.now()));
+  useEffect(() => {
+    const next = scheduleStateFor(scheduleConfig, readScheduleState(), Date.now());
+    writeScheduleState(next);
+    setScheduleState(next);
+  }, [scheduleConfig]);
+  const nextScheduledRunMs = nextScheduledRun(scheduleConfig, scheduleState);
+  const onScheduleTick = useEffectEvent(() => {
+    if (!desktopRuntime || running || workspaceBusy || settingsOpen || !isScheduleDue(scheduleConfig, scheduleState, Date.now())) return;
+    const started = { ...scheduleState, lastRunMs: Date.now() };
+    writeScheduleState(started);
+    setScheduleState(started);
+    void startCrawl(true).then(() => setNotice(`Scheduled crawl started at ${new Date(started.lastRunMs).toLocaleString()}`));
+  });
+  useEffect(() => {
+    const first = window.setTimeout(onScheduleTick, 1_500);
+    const timer = window.setInterval(onScheduleTick, 15_000);
+    return () => { window.clearTimeout(first); window.clearInterval(timer); };
+  }, []);
+
   const pauseCrawl = async () => {
     try {
       await invoke("pause_crawl");
@@ -3293,7 +3560,7 @@ export default function App() {
       setPageSpeedActive({ requestId, url: selected.finalUrl });
       setPageSpeedCancelling(false); setNotice(undefined);
       try {
-        const snapshot = await invoke<PageSpeedSnapshot>("run_page_speed", { request: { requestId, recordId, strategy: pageSpeedStrategy } });
+        const snapshot = await invoke<PageSpeedSnapshot>("run_page_speed", { request: { requestId, recordId, strategy: pageSpeedStrategy, categories: pageSpeedCategories } });
         // Selection and filters can change while Google is measuring; update only the original row.
         useAppStore.setState((current) => ({
           rows: current.rows.map((row) => row.id === recordId ? { ...row, pageSpeed: snapshot } : row),
@@ -3307,6 +3574,53 @@ export default function App() {
         pageSpeedRequest.current = undefined;
         setPageSpeedActive(undefined); setPageSpeedCancelling(false);
       }
+    });
+  };
+  const runPageSpeedBulk = async () => {
+    if (!selected || pageSpeedDisabledReason || selectedRecordIds.length === 0) return;
+    const recordIds = [...selectedRecordIds];
+    const requestId = crypto.randomUUID();
+    await runWorkspaceAction(async () => {
+      pageSpeedRequest.current = requestId;
+      setPageSpeedActive({ requestId, url: `${recordIds.length.toLocaleString()} selected rows` });
+      setPageSpeedCancelling(false); setNotice(undefined);
+      setPageSpeedBulkStatus(`Measuring 0 of ${recordIds.length.toLocaleString()} selected rows…`);
+      try {
+        const result = await invoke<{ measured: number; skipped: number; failed: { recordId: number; error: string }[]; cancelled: boolean }>("run_page_speed_bulk",
+          { request: { requestId, recordIds, strategy: pageSpeedStrategy, categories: pageSpeedCategories, resume: true } });
+        await loadRows();
+        const summary = `${result.measured.toLocaleString()} measured, ${result.skipped.toLocaleString()} already measured, ${result.failed.length.toLocaleString()} failed${result.cancelled ? ", cancelled" : ""}.`;
+        setNotice(`PageSpeed bulk run: ${summary}`);
+        if (result.failed.length) setError(`PageSpeed failed for ${result.failed.length.toLocaleString()} row(s): ${result.failed.slice(0, 3).map((item) => item.error).join("; ")}`);
+      } finally {
+        pageSpeedRequest.current = undefined;
+        setPageSpeedActive(undefined); setPageSpeedCancelling(false); setPageSpeedBulkStatus(undefined);
+      }
+    });
+  };
+  useEffect(() => {
+    if (!desktopRuntime) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ requestId: string; completed: number; total: number; recordId: number; error?: string | null }>("page-speed-progress", (event) => {
+      if (disposed || event.payload.requestId !== pageSpeedRequest.current) return;
+      setPageSpeedBulkStatus(`Measuring ${event.payload.completed.toLocaleString()} of ${event.payload.total.toLocaleString()} selected rows…`);
+      const recordId = event.payload.recordId;
+      useAppStore.setState((current) => current.selected?.id === recordId ? { selected: { ...current.selected } } : {});
+    }).then((dispose) => { if (disposed) dispose(); else unlisten = dispose; }).catch(() => undefined);
+    return () => { disposed = true; unlisten?.(); };
+  }, [desktopRuntime]);
+  const runFieldVitals = async () => {
+    if (!selected || pageSpeedDisabledReason) return;
+    const recordId = selected.id;
+    await runWorkspaceAction(async () => {
+      setNotice(undefined);
+      const snapshot = await invoke<FieldVitalsSnapshot>("run_field_vitals", { request: { recordId, formFactor: fieldFormFactor } });
+      useAppStore.setState((current) => ({
+        rows: current.rows.map((row) => row.id === recordId ? { ...row, fieldVitals: snapshot } : row),
+        selected: current.selected?.id === recordId ? { ...current.selected, fieldVitals: snapshot } : current.selected,
+      }));
+      setNotice(snapshot.hasData ? "Field data saved." : "Chrome UX Report has no field data for this URL.");
     });
   };
   const cancelPageSpeed = async () => {
@@ -3588,6 +3902,104 @@ export default function App() {
     } finally {
       setSearchConsoleLoading(false);
     }
+  };
+
+  const runGoogleAction = async (action: () => Promise<GoogleOAuthStatus | void>, message?: string) => {
+    if (!desktopRuntime || googleLoading) return;
+    setGoogleLoading(true);
+    try {
+      const status = await action();
+      if (status) setGoogleStatus(status);
+      if (message) setNotice(message);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
+  const saveGoogleClient = () => runGoogleAction(async () => {
+    const status = await invoke<GoogleOAuthStatus>("save_google_oauth_client", { request: { clientId: googleClientId.trim(), clientSecret: googleClientSecret.trim() } });
+    setGoogleClientId(""); setGoogleClientSecret("");
+    return status;
+  }, "Google OAuth client saved in the OS credential store.");
+  const connectGoogle = () => runGoogleAction(() => invoke<GoogleOAuthStatus>("connect_google_account"), "Google account connected.");
+  const disconnectGoogle = (clearClient: boolean) => runGoogleAction(() => invoke<GoogleOAuthStatus>("disconnect_google_account", { clearClient }), clearClient ? "Google account and OAuth client removed." : "Google account disconnected.");
+  const mergeAnalyticsMetrics = () => runGoogleAction(async () => {
+    setAnalyticsMergeResult(undefined);
+    const result = await invoke<AnalyticsMergeResult>("merge_analytics_metrics", { request: { propertyId: analyticsPropertyId.trim(), startDate: searchConsoleStartDate, endDate: searchConsoleEndDate } });
+    setAnalyticsMergeResult(result);
+    await loadRows();
+    setNotice(`Merged ${result.matchedRows.toLocaleString()} Google Analytics rows into the current crawl.`);
+  });
+
+  const saveBacklinkSettings = async () => {
+    if (!desktopRuntime || backlinkLoading) return;
+    setBacklinkLoading(true);
+    try {
+      const status = await invoke<BacklinkSettingsStatus>("save_backlink_settings", { request: { endpointTemplate: backlinkDraft.endpointTemplate.trim(), headerName: backlinkDraft.headerName.trim(), headerValue: backlinkDraft.headerValue.trim() || null } });
+      setBacklinkStatus(status);
+      setBacklinkDraft({ endpointTemplate: status.endpointTemplate, headerName: status.headerName, headerValue: "" });
+      setNotice(status.endpointTemplate ? "Backlink endpoint saved." : "Backlink endpoint removed.");
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBacklinkLoading(false);
+    }
+  };
+  const mergeBacklinkMetrics = async () => {
+    if (!desktopRuntime || backlinkLoading) return;
+    setBacklinkLoading(true);
+    setBacklinkMergeResult(undefined);
+    try {
+      const result = await invoke<BacklinkMergeResult>("merge_backlink_metrics", { request: { maxUrls: backlinkMaxUrls } });
+      setBacklinkMergeResult(result);
+      await loadRows();
+      setNotice(`Merged backlink metrics for ${result.matchedRows.toLocaleString()} of ${result.requestedUrls.toLocaleString()} URLs${result.failedUrls ? ` (${result.failedUrls.toLocaleString()} failed)` : ""}.`);
+      if (result.firstError) setError(`Backlink lookups failed for ${result.failedUrls.toLocaleString()} URL(s): ${result.firstError}`);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setBacklinkLoading(false);
+    }
+  };
+  const runAiSettingsAction = async (action: () => Promise<AiStatus>, message: string) => {
+    if (!desktopRuntime || aiLoading) return;
+    setAiLoading(true);
+    try {
+      const status = await action();
+      setAiStatus(status);
+      setAiDraft({ provider: status.provider, model: status.model, baseUrl: status.baseUrl, requestsPerMinute: status.requestsPerMinute, maxInputChars: status.maxInputChars });
+      setNotice(message);
+    } catch (caught) {
+      setError(errorMessage(caught));
+    } finally {
+      setAiLoading(false);
+    }
+  };
+  const saveAiSettings = () => runAiSettingsAction(() => invoke<AiStatus>("save_ai_settings", { settings: aiDraft }), "AI settings saved.");
+  const saveAiApiKey = () => runAiSettingsAction(async () => {
+    const status = await invoke<AiStatus>("save_ai_api_key", { request: { apiKey: aiApiKey.trim() } });
+    setAiApiKey("");
+    return status;
+  }, "AI API key saved in the OS credential store.");
+  const clearAiApiKey = () => runAiSettingsAction(() => invoke<AiStatus>("clear_ai_api_key"), "AI API key cleared.");
+  const runAiTask = async (task: AiTask) => {
+    if (!selected || pageSpeedDisabledReason || aiTaskRunning) return;
+    const recordId = selected.id;
+    setAiTaskRunning(task);
+    await runWorkspaceAction(async () => {
+      setNotice(undefined);
+      try {
+        const insights = await invoke<AiInsights>("run_ai_task", { request: { recordId, task } });
+        useAppStore.setState((current) => ({
+          rows: current.rows.map((row) => row.id === recordId ? { ...row, aiInsights: insights } : row),
+          selected: current.selected?.id === recordId ? { ...current.selected, aiInsights: insights } : current.selected,
+        }));
+        setNotice(`AI ${task === "intent" ? "intent classification" : task === "metaDescription" ? "meta description draft" : "spelling and grammar check"} saved (${insights.model || "model"}).`);
+      } finally {
+        setAiTaskRunning(undefined);
+      }
+    });
   };
 
   const mergeSearchConsoleMetrics = async () => {
@@ -4389,6 +4801,12 @@ export default function App() {
                     onChange={(event) => setSettingsConfig({ maxDepth: Number(event.target.value) })}
                   />
                 </label>
+                {([["maxFolderDepth", "Max folder depth"], ["maxUrlLength", "Max URL length"], ["maxLinksPerPage", "Max links per page"]] as const).map(([key, label]) =>
+                  <label key={key} title="0 = unlimited. Applies to discovered URLs; the seed and link evidence are kept.">
+                    {label}
+                    <input type="number" min={0} step={1} value={settingsConfig[key]}
+                      onChange={(event) => setSettingsConfig({ [key]: Math.max(0, Math.floor(Number(event.target.value) || 0)) })} />
+                  </label>)}
                 <label>
                   Threads
                   <input
@@ -4709,6 +5127,15 @@ export default function App() {
                     }
                   />
                 </label>
+                <label className="settings-wide" title="One host per line, optionally with a path prefix, e.g. cdn.example.com/assets. Matching URLs are classified as internal and follow the internal resource choices; this does not enable external crawling.">
+                  CDN hosts
+                  <textarea
+                    rows={2}
+                    placeholder="cdn.example.com/assets"
+                    value={patternsToText(settingsConfig.cdnHosts)}
+                    onChange={(event) => setSettingsConfig({ cdnHosts: event.target.value.split(/\r?\n/) })}
+                  />
+                </label>
                 <div className="settings-wide segment-settings">
                   <div className="settings-section-title-row">
                     <div>
@@ -4856,52 +5283,74 @@ export default function App() {
                 </div>)}
                 <button onClick={() => setSettingsConfig({ requestHeaders: [...settingsConfig.requestHeaders, { name: "", value: "" }] })}><Plus size={15} />Add header</button>
               </div>
+              <HttpAuthSettings credentials={httpAuthCredentials} desktop={desktopRuntime} />
+              <div className="settings-grid">
+                <CheckboxField checked={settingsConfig.httpAuth.enabled}
+                  onCheckedChange={(checked) => setSettingsConfig({ httpAuth: { enabled: checked } })}>
+                  Send saved credentials to the starting origin
+                </CheckboxField>
+              </div>
+              <HttpAuthSettings credentials={formLoginCredentials} desktop={desktopRuntime} title="Form login" prefix="Form login" action="form-login"
+                help="Save and Clear take effect immediately and stay outside profiles. When enabled, the crawl posts these credentials to the login URL once and keeps the session cookies for every request; browser rendering does not share them." />
+              <div className="settings-grid">
+                <CheckboxField checked={settingsConfig.formLogin.enabled}
+                  onCheckedChange={(checked) => setSettingsConfig({ formLogin: { ...settingsConfig.formLogin, enabled: checked } })}>
+                  Log in with the saved form credentials before crawling
+                </CheckboxField>
+                <label className="settings-wide">
+                  Login URL
+                  <input type="url" aria-label="Form login URL" placeholder="https://example.com/login" value={settingsConfig.formLogin.url}
+                    required={settingsConfig.formLogin.enabled} disabled={!settingsConfig.formLogin.enabled}
+                    onChange={(event) => setSettingsConfig({ formLogin: { ...settingsConfig.formLogin, url: event.target.value } })} />
+                </label>
+                <label>
+                  Username field
+                  <input aria-label="Form login username field" required={settingsConfig.formLogin.enabled} disabled={!settingsConfig.formLogin.enabled} value={settingsConfig.formLogin.usernameField}
+                    onChange={(event) => setSettingsConfig({ formLogin: { ...settingsConfig.formLogin, usernameField: event.target.value } })} />
+                </label>
+                <label>
+                  Password field
+                  <input aria-label="Form login password field" required={settingsConfig.formLogin.enabled} disabled={!settingsConfig.formLogin.enabled} value={settingsConfig.formLogin.passwordField}
+                    onChange={(event) => setSettingsConfig({ formLogin: { ...settingsConfig.formLogin, passwordField: event.target.value } })} />
+                </label>
+                <label className="settings-wide">
+                  Extra fields (name=value per line)
+                  <textarea rows={2} aria-label="Form login extra fields" disabled={!settingsConfig.formLogin.enabled} value={formFieldsToText(settingsConfig.formLogin.extraFields)}
+                    onChange={(event) => setSettingsConfig({ formLogin: { ...settingsConfig.formLogin, extraFields: parseFormFields(event.target.value) } })} />
+                </label>
+              </div>
             </section>
 
             <section className="settings-section" data-settings-section="resources" hidden={settingsTab !== "resources"}>
               <h3>Resource Types</h3>
-              <div className="settings-grid">
-                <CheckboxField
-                  checked={settingsConfig.resourceTypes.html}
-                  onCheckedChange={(checked) => updateResourceType("html", checked)}
-                >
-                  HTML pages
-                </CheckboxField>
-                <CheckboxField
-                  checked={settingsConfig.resourceTypes.images}
-                  onCheckedChange={(checked) => updateResourceType("images", checked)}
-                >
-                  Images
-                </CheckboxField>
-                <CheckboxField
-                  checked={settingsConfig.resourceTypes.css}
-                  onCheckedChange={(checked) => updateResourceType("css", checked)}
-                >
-                  CSS
-                </CheckboxField>
-                <CheckboxField
-                  checked={settingsConfig.resourceTypes.javascript}
-                  onCheckedChange={(checked) => updateResourceType("javascript", checked)}
-                >
-                  JavaScript
-                </CheckboxField>
-                <CheckboxField
-                  checked={settingsConfig.resourceTypes.external}
-                  onCheckedChange={(checked) => updateResourceType("external", checked)}
-                >
-                  External URLs
-                </CheckboxField>
-                <CheckboxField
-                  checked={settingsConfig.resourceTypes.other}
-                  onCheckedChange={(checked) => updateResourceType("other", checked)}
-                >
-                  Other files
-                </CheckboxField>
-              </div>
+              <p className="settings-save-note">Crawl requests discovered URLs of each type. Store keeps their links and image references without requesting them; crawled types are always stored.</p>
+              <table className="crawl-store-table">
+                <thead><tr><th scope="col">Type</th><th scope="col">Crawl</th><th scope="col">Store</th></tr></thead>
+                <tbody>
+                  {([
+                    ["HTML pages", "html", "internalLinks"],
+                    ["Images", "images", "images"],
+                    ["CSS", "css", "css"],
+                    ["JavaScript", "javascript", "javascript"],
+                    ["Other files", "other", "other"],
+                    ["External URLs", "external", "externalLinks"],
+                  ] as const).map(([label, crawlKey, storeKey]) => {
+                    const crawled = settingsConfig.resourceTypes[crawlKey];
+                    return <tr key={crawlKey}>
+                      <th scope="row">{label}</th>
+                      <td><CheckboxField checked={crawled} onCheckedChange={(checked) => updateResourceType(crawlKey, checked)}>
+                        <span className="sr-only">Crawl {label}</span></CheckboxField></td>
+                      <td><CheckboxField checked={crawled || settingsConfig.store[storeKey]} disabled={crawled}
+                        onCheckedChange={(checked) => setSettingsConfig({ store: { ...settingsConfig.store, [storeKey]: checked } })}>
+                        <span className="sr-only">Store {label}</span></CheckboxField></td>
+                    </tr>;
+                  })}
+                </tbody>
+              </table>
               <h3>Reference discovery</h3>
               <p className="settings-save-note">Add referenced URLs to Spider crawls. Existing scope, resource permissions and robots rules apply; page metadata stays captured.</p>
               <div className="settings-grid reference-discovery">
-                {([['canonical', 'Canonical targets'], ['hreflang', 'Hreflang targets'], ['pagination', 'Pagination (next / previous)'], ['amp', 'AMP targets']] as const).map(([key, label]) =>
+                {([['canonical', 'Canonical targets'], ['hreflang', 'Hreflang targets'], ['pagination', 'Pagination (next / previous)'], ['amp', 'AMP targets'], ['metaRefresh', 'Meta refresh targets'], ['iframe', 'Iframe sources']] as const).map(([key, label]) =>
                   <CheckboxField key={key} checked={settingsConfig.referenceLinks[key]} disabled={settingsConfig.mode === "list" || settingsConfig.folderScope === "exactUrl"}
                     onCheckedChange={(checked) => setSettingsConfig({ referenceLinks: { ...settingsConfig.referenceLinks, [key]: checked } })}>{label}</CheckboxField>)}
               </div>
@@ -5134,6 +5583,29 @@ export default function App() {
 
             <section className="settings-section" data-settings-section="integrations" hidden={settingsTab !== "integrations"}>
               <PageSpeedSettings credentials={pageSpeedCredentials} desktop={desktopRuntime} />
+              <h3>Google account</h3>
+              <div className="settings-grid compact google-account-settings">
+                <p className="settings-wide settings-save-note">Create a Desktop OAuth client in Google Cloud with the Search Console and Analytics Data APIs enabled, save its ID and secret here, then connect. Tokens refresh automatically and stay in the OS credential store.</p>
+                <label>Client ID
+                  <input aria-label="Google OAuth client ID" autoComplete="off" spellCheck={false} value={googleClientId} disabled={!desktopRuntime || googleLoading}
+                    placeholder={googleStatus.clientId ?? "1234.apps.googleusercontent.com"} onChange={(event) => setGoogleClientId(event.target.value)} />
+                </label>
+                <label>Client secret
+                  <input type="password" aria-label="Google OAuth client secret" autoComplete="off" value={googleClientSecret} disabled={!desktopRuntime || googleLoading}
+                    placeholder={googleStatus.clientConfigured ? "Saved in OS credential store" : "GOCSPX-…"} onChange={(event) => setGoogleClientSecret(event.target.value)} />
+                </label>
+                <div className="integration-status settings-wide" role="status">
+                  <span className={googleStatus.connected ? "ok" : "muted"}>{googleLoading ? "Working…" : googleStatus.connected ? `Connected${googleStatus.refreshable ? " (auto-refresh)" : " (no refresh token)"}` : googleStatus.clientConfigured ? "Client saved, not connected" : "No OAuth client saved"}</span>
+                  {googleStatus.expiresAtMs ? <span>Token valid until {new Date(googleStatus.expiresAtMs).toLocaleString()}</span> : null}
+                  {googleStatus.message ? <span className="danger">{googleStatus.message}</span> : null}
+                </div>
+                <div className="settings-actions settings-wide">
+                  <button className="settings-action-button primary" data-action="save-google-client" disabled={!desktopRuntime || googleLoading || !googleClientId.trim() || !googleClientSecret.trim()} onClick={() => void saveGoogleClient()}><Check size={15} />Save client</button>
+                  <button className="settings-action-button secondary" data-action="connect-google" disabled={!desktopRuntime || googleLoading || !googleStatus.clientConfigured} onClick={() => void connectGoogle()}><RefreshCw size={15} />{googleStatus.connected ? "Reconnect" : "Connect Google account"}</button>
+                  <button className="settings-action-button" data-action="disconnect-google" disabled={!desktopRuntime || googleLoading || !googleStatus.connected} onClick={() => void disconnectGoogle(false)}>Disconnect</button>
+                  <button className="settings-action-button danger" data-action="clear-google-client" disabled={!desktopRuntime || googleLoading || !googleStatus.clientConfigured} onClick={() => void disconnectGoogle(true)}><Trash2 size={15} />Remove client</button>
+                </div>
+              </div>
               <h3>Google Search Console</h3>
               <div className="settings-grid compact">
                 <label className="settings-wide">
@@ -5293,6 +5765,56 @@ export default function App() {
                     </div>
                   </div>
                 ) : null}
+              </div>
+              <h3>Google Analytics 4</h3>
+              <div className="settings-grid compact analytics-settings">
+                <label className="settings-wide">Property ID
+                  <input aria-label="Google Analytics property ID" inputMode="numeric" placeholder="123456789" value={analyticsPropertyId} disabled={!desktopRuntime || googleLoading}
+                    onChange={(event) => setAnalyticsPropertyId(event.target.value)} />
+                </label>
+                <p className="settings-wide settings-save-note">Uses the connected Google account and the Search Console date range above. Sessions, engaged sessions, key events and revenue are matched to crawled URLs by host and path.</p>
+                <div className="settings-actions settings-wide">
+                  <button className="settings-action-button primary" data-action="merge-analytics" disabled={!desktopRuntime || googleLoading || !googleStatus.connected || !analyticsPropertyId.trim()} onClick={() => void mergeAnalyticsMetrics()}><Download size={15} />{googleLoading ? "Fetching" : "Fetch and Merge GA4"}</button>
+                </div>
+                {analyticsMergeResult ? <div className="integration-result settings-wide" data-analytics-result>
+                  <div><span>Property</span><strong>{analyticsMergeResult.propertyId}</strong></div>
+                  <div><span>Fetched</span><strong>{analyticsMergeResult.fetchedRows.toLocaleString()}</strong></div>
+                  <div><span>Matched</span><strong>{analyticsMergeResult.matchedRows.toLocaleString()}</strong></div>
+                  <div><span>Sessions</span><strong>{analyticsMergeResult.sessions.toLocaleString()}</strong></div>
+                </div> : null}
+              </div>
+              <h3>Backlinks (custom endpoint)</h3>
+              <div className="settings-grid compact backlink-settings">
+                <p className="settings-wide settings-save-note">Point Ferrous Frog at any backlink API: an HTTP(S) URL template containing <code>{"{url}"}</code> that returns JSON with <code>backlinks</code>, <code>referringDomains</code> and optional <code>authorityScore</code>. The credential header value stays in the OS credential store.</p>
+                <label className="settings-wide">Endpoint template
+                  <input aria-label="Backlink endpoint template" placeholder="https://api.example.com/backlinks?target={url}" value={backlinkDraft.endpointTemplate} disabled={!desktopRuntime || backlinkLoading}
+                    onChange={(event) => setBacklinkDraft({ ...backlinkDraft, endpointTemplate: event.target.value })} />
+                </label>
+                <label>Credential header
+                  <input aria-label="Backlink credential header name" placeholder="Authorization" value={backlinkDraft.headerName} disabled={!desktopRuntime || backlinkLoading}
+                    onChange={(event) => setBacklinkDraft({ ...backlinkDraft, headerName: event.target.value })} />
+                </label>
+                <label>Header value
+                  <input type="password" aria-label="Backlink credential header value" autoComplete="off" value={backlinkDraft.headerValue} disabled={!desktopRuntime || backlinkLoading}
+                    placeholder={backlinkStatus.credentialSaved ? "Saved in OS credential store" : "Bearer …"} onChange={(event) => setBacklinkDraft({ ...backlinkDraft, headerValue: event.target.value })} />
+                </label>
+                <label>URLs per run
+                  <input type="number" aria-label="Backlink URL limit" min={1} max={5000} value={backlinkMaxUrls} disabled={!desktopRuntime || backlinkLoading}
+                    onChange={(event) => setBacklinkMaxUrls(Math.max(1, Math.floor(Number(event.target.value) || 1)))} />
+                </label>
+                <div className="integration-status settings-wide" role="status">
+                  <span className={backlinkStatus.endpointTemplate ? "ok" : "muted"}>{backlinkStatus.endpointTemplate ? "Endpoint saved" : "No backlink endpoint"}</span>
+                  <span className={backlinkStatus.credentialSaved ? "ok" : "muted"}>{backlinkStatus.credentialSaved ? "Credential saved" : "No credential"}</span>
+                </div>
+                <div className="settings-actions settings-wide">
+                  <button className="settings-action-button primary" data-action="save-backlink-settings" disabled={!desktopRuntime || backlinkLoading} onClick={() => void saveBacklinkSettings()}><Check size={15} />Save endpoint</button>
+                  <button className="settings-action-button secondary" data-action="merge-backlinks" disabled={!desktopRuntime || backlinkLoading || !backlinkStatus.endpointTemplate} onClick={() => void mergeBacklinkMetrics()}><Download size={15} />{backlinkLoading ? "Fetching" : "Fetch and Merge backlinks"}</button>
+                </div>
+                {backlinkMergeResult ? <div className="integration-result settings-wide" data-backlink-result>
+                  <div><span>Requested</span><strong>{backlinkMergeResult.requestedUrls.toLocaleString()}</strong></div>
+                  <div><span>Matched</span><strong>{backlinkMergeResult.matchedRows.toLocaleString()}</strong></div>
+                  <div><span>Failed</span><strong>{backlinkMergeResult.failedUrls.toLocaleString()}</strong></div>
+                </div> : null}
               </div>
             </section>
 
@@ -5496,6 +6018,112 @@ export default function App() {
                     </div>
                   ))
                 )}
+              </div>
+            </section>
+
+            <section className="settings-section" data-settings-section="thresholds" hidden={settingsTab !== "thresholds"}>
+              <h3>Audit Thresholds</h3>
+              <p className="settings-save-note">Applied immediately to the grid, issue views, analysis and the HTML report. Alt-text length and oversized image flags are decided during the crawl.</p>
+              <div className="settings-grid">
+                {thresholdFields.map(([key, label, unit]) =>
+                  <label key={key}>
+                    {label} ({unit})
+                    <input type="number" min={0} step={1} required value={settingsConfig.thresholds[key]}
+                      onChange={(event) => setSettingsConfig({ thresholds: { ...settingsConfig.thresholds, [key]: Math.max(0, Math.floor(Number(event.target.value) || 0)) } })} />
+                  </label>)}
+              </div>
+              <button className="settings-action-button" type="button" onClick={() => setSettingsConfig({ thresholds: { ...defaultConfig.thresholds } })}>Reset to defaults</button>
+            </section>
+
+            <section className="settings-section" data-settings-section="automation" hidden={settingsTab !== "automation"}>
+              <h3>Automation</h3>
+              <p className="settings-save-note">Runs when a crawl finishes. Exports are written to a new folder under the Ferrous Frog exports directory; the webhook receives a JSON summary with status, counts and file paths. Failures appear as notices and never change the crawl result.</p>
+              <div className="settings-grid">
+                <label>
+                  Automatic export
+                  <select aria-label="Automatic export preset" value={settingsConfig.automation.exportPreset}
+                    onChange={(event) => setSettingsConfig({ automation: { ...settingsConfig.automation, exportPreset: event.target.value as AutomationConfig["exportPreset"] } })}>
+                    <option value="">None</option>
+                    <option value="basic">Basic (CSV)</option>
+                    <option value="audit">Audit (CSV, workbook, HTML report)</option>
+                    <option value="full">Full (all formats)</option>
+                  </select>
+                </label>
+                <label className="settings-wide">
+                  Webhook URL
+                  <input type="url" aria-label="Completion webhook URL" placeholder="https://example.com/hooks/crawl" value={settingsConfig.automation.webhookUrl}
+                    onChange={(event) => setSettingsConfig({ automation: { ...settingsConfig.automation, webhookUrl: event.target.value } })} />
+                </label>
+                <CheckboxField checked={settingsConfig.automation.notifyOnCompletion}
+                  onCheckedChange={(checked) => setSettingsConfig({ automation: { ...settingsConfig.automation, notifyOnCompletion: checked } })}>
+                  Desktop notification on completion
+                </CheckboxField>
+              </div>
+              <h3>Schedule</h3>
+              <p className="settings-save-note">Starts a fresh crawl of the configured start URL while this app is open and idle. Nothing runs when the app is closed.</p>
+              <div className="settings-grid">
+                <label>
+                  Schedule
+                  <select aria-label="Crawl schedule" value={settingsConfig.schedule.mode}
+                    onChange={(event) => setSettingsConfig({ schedule: { ...settingsConfig.schedule, mode: event.target.value as ScheduleConfig["mode"] } })}>
+                    <option value="none">Off</option>
+                    <option value="once">Once</option>
+                    <option value="interval">Repeat</option>
+                  </select>
+                </label>
+                <label>
+                  {settingsConfig.schedule.mode === "interval" ? "First run (optional)" : "Run at"}
+                  <input type="datetime-local" aria-label="Scheduled run time" value={settingsConfig.schedule.runAt} disabled={settingsConfig.schedule.mode === "none"}
+                    required={settingsConfig.schedule.mode === "once"}
+                    onChange={(event) => setSettingsConfig({ schedule: { ...settingsConfig.schedule, runAt: event.target.value } })} />
+                </label>
+                <label>
+                  Every (minutes)
+                  <input type="number" aria-label="Schedule interval minutes" min={5} max={10080} step={1} value={settingsConfig.schedule.intervalMinutes}
+                    disabled={settingsConfig.schedule.mode !== "interval"} required={settingsConfig.schedule.mode === "interval"}
+                    onChange={(event) => setSettingsConfig({ schedule: { ...settingsConfig.schedule, intervalMinutes: Math.floor(Number(event.target.value) || 0) } })} />
+                </label>
+              </div>
+              <p className="settings-save-note" data-schedule-status>{nextScheduledRunMs === null ? "No scheduled crawl." : `Next scheduled crawl: ${new Date(nextScheduledRunMs).toLocaleString()}${scheduleState.lastRunMs ? ` (last run ${new Date(scheduleState.lastRunMs).toLocaleString()})` : ""}`}</p>
+            </section>
+
+            <section className="settings-section" data-settings-section="ai" hidden={settingsTab !== "ai"}>
+              <h3>AI assistance</h3>
+              <p className="settings-save-note">Page text is sent to the provider you configure with your own key. Anthropic's Messages API is the default; any OpenAI-compatible chat-completions endpoint can be used instead. Save and Clear act immediately and stay outside profiles.</p>
+              <div className="settings-grid compact ai-settings">
+                <label>Provider
+                  <select aria-label="AI provider" value={aiDraft.provider} disabled={!desktopRuntime || aiLoading} onChange={(event) => setAiDraft({ ...aiDraft, provider: event.target.value as AiProvider })}>
+                    <option value="anthropic">Anthropic (Claude)</option>
+                    <option value="openAiCompatible">OpenAI-compatible endpoint</option>
+                  </select>
+                </label>
+                <label>Model
+                  <input aria-label="AI model" value={aiDraft.model} disabled={!desktopRuntime || aiLoading} placeholder="claude-opus-5" onChange={(event) => setAiDraft({ ...aiDraft, model: event.target.value })} />
+                </label>
+                <label className="settings-wide">Base URL <span className="detail-muted">(required for OpenAI-compatible providers)</span>
+                  <input type="url" aria-label="AI base URL" value={aiDraft.baseUrl} disabled={!desktopRuntime || aiLoading} placeholder={aiDraft.provider === "anthropic" ? "https://api.anthropic.com (default)" : "https://host/v1"} onChange={(event) => setAiDraft({ ...aiDraft, baseUrl: event.target.value })} />
+                </label>
+                <label>Requests per minute
+                  <input type="number" aria-label="AI requests per minute" min={1} max={600} value={aiDraft.requestsPerMinute} disabled={!desktopRuntime || aiLoading} onChange={(event) => setAiDraft({ ...aiDraft, requestsPerMinute: Math.max(1, Math.floor(Number(event.target.value) || 1)) })} />
+                </label>
+                <label>Page text per prompt (characters)
+                  <input type="number" aria-label="AI page text limit" min={1000} max={200000} step={1000} value={aiDraft.maxInputChars} disabled={!desktopRuntime || aiLoading} onChange={(event) => setAiDraft({ ...aiDraft, maxInputChars: Math.max(1000, Math.floor(Number(event.target.value) || 1000)) })} />
+                </label>
+                <div className="settings-actions settings-wide">
+                  <button className="settings-action-button primary" data-action="save-ai-settings" disabled={!desktopRuntime || aiLoading || !aiDraft.model.trim()} onClick={() => void saveAiSettings()}><Check size={15} />Save AI settings</button>
+                </div>
+                <label className="settings-wide">API key
+                  <input type="password" aria-label="AI API key" autoComplete="off" spellCheck={false} maxLength={1024} value={aiApiKey} disabled={!desktopRuntime || aiLoading}
+                    placeholder={aiStatus?.keySaved ? "Saved in OS credential store" : "Paste the provider API key"} onChange={(event) => setAiApiKey(event.target.value)} />
+                </label>
+                <div className="integration-status settings-wide" role="status">
+                  <span className={aiStatus?.keySaved ? "ok" : "muted"}>{aiLoading ? "Working…" : aiStatus?.keySaved ? "AI API key saved" : "No saved AI API key"}</span>
+                  {aiStatus?.message ? <span className="danger">{aiStatus.message}</span> : null}
+                </div>
+                <div className="settings-actions settings-wide">
+                  <button className="settings-action-button primary" data-action="save-ai-key" disabled={!desktopRuntime || aiLoading || !aiApiKey.trim()} onClick={() => void saveAiApiKey()}><Check size={15} />Save API key</button>
+                  <button className="settings-action-button danger" data-action="clear-ai-key" disabled={!desktopRuntime || aiLoading} onClick={() => void clearAiApiKey()}><Trash2 size={15} />Clear key</button>
+                </div>
               </div>
             </section>
               </fieldset>
@@ -5989,7 +6617,31 @@ export default function App() {
                 <div className="detail-content">
                   <PageSpeedPanel snapshot={selected.pageSpeed} strategy={pageSpeedStrategy} onStrategy={setPageSpeedStrategy}
                     disabledReason={pageSpeedDisabledReason} onRun={() => void runPageSpeed()}
-                    onConfigure={() => { changeSettingsOpen(true); setSettingsTab("integrations"); }} />
+                    onConfigure={() => { changeSettingsOpen(true); setSettingsTab("integrations"); }}
+                    categories={pageSpeedCategories} onCategories={setPageSpeedCategories}
+                    selectedCount={selectedRecordIds.length} onRunSelected={() => void runPageSpeedBulk()} bulkStatus={pageSpeedBulkStatus} />
+                  <FieldVitalsPanel snapshot={selected.fieldVitals} formFactor={fieldFormFactor} onFormFactor={setFieldFormFactor}
+                    disabledReason={pageSpeedDisabledReason} onRun={() => void runFieldVitals()} />
+                </div>
+              ) : detailTab === "ai" ? (
+                <div className="detail-content ai-panel" id="detail-panel-ai" role="tabpanel" aria-labelledby="detail-tab-ai">
+                  <div className="page-speed-toolbar">
+                    {([["intent", "Classify intent"], ["metaDescription", "Draft meta description"], ["spelling", "Check spelling & grammar"]] as const).map(([task, label]) =>
+                      <button key={task} className="primary" data-action={`run-ai-${task}`} onClick={() => void runAiTask(task)}
+                        disabled={Boolean(pageSpeedDisabledReason) || Boolean(aiTaskRunning) || !aiStatus?.keySaved} title={pageSpeedDisabledReason ?? (!aiStatus?.keySaved ? "Save an AI API key in Settings > AI" : undefined)}>
+                        <RefreshCw size={14} />{aiTaskRunning === task ? "Working…" : label}
+                      </button>)}
+                    <button data-action="configure-ai" onClick={() => { changeSettingsOpen(true); setSettingsTab("ai"); }} title="AI settings"><Settings size={14} />AI settings</button>
+                  </div>
+                  <p className="page-speed-caption">{pageSpeedDisabledReason ?? "The page is fetched again and its visible text (bounded by Settings > AI) is sent to the configured model. Results are saved with the row."}</p>
+                  {selected.aiInsights ? <div className="page-speed-result ai-results">
+                    <div className="page-speed-attribution"><strong>{selected.aiInsights.model || "AI"}</strong><time dateTime={new Date(selected.aiInsights.updatedAtMs).toISOString()}>{new Date(selected.aiInsights.updatedAtMs).toLocaleString()}</time></div>
+                    {selected.aiInsights.intent ? <dl className="page-speed-metrics"><div><dt>Search intent</dt><dd>{selected.aiInsights.intent.intent} ({Math.round(selected.aiInsights.intent.confidence * 100)}%)</dd></div><div><dt>Rationale</dt><dd>{selected.aiInsights.intent.rationale}</dd></div></dl> : null}
+                    {selected.aiInsights.metaDescription ? <dl className="page-speed-metrics"><div><dt>Meta description draft</dt><dd>{selected.aiInsights.metaDescription.draft} <span className="detail-muted">({selected.aiInsights.metaDescription.draft.length} chars)</span></dd></div>
+                      {selected.aiInsights.metaDescription.alternatives.map((alternative, index) => <div key={index}><dt>Alternative {index + 1}</dt><dd>{alternative}</dd></div>)}</dl> : null}
+                    {selected.aiInsights.spelling ? <dl className="page-speed-metrics"><div><dt>Language</dt><dd>{selected.aiInsights.spelling.language ?? "Unknown"}</dd></div>
+                      {selected.aiInsights.spelling.issues.length === 0 ? <div><dt>Spelling & grammar</dt><dd>No issues found</dd></div> : selected.aiInsights.spelling.issues.map((issue, index) => <div key={index}><dt>{issue.kind}</dt><dd>“{issue.text}” → “{issue.suggestion}”</dd></div>)}</dl> : null}
+                  </div> : <p className="page-speed-empty">No AI results yet.</p>}
                 </div>
               ) : (
               <div className="detail-content" key={`${selected.id}-${detailTab}`}>
@@ -7917,6 +8569,23 @@ function formatCell(row: CrawlRecord, column: GridColumn) {
   const value = row[column.key];
   if (column.key === "firstInlinkSourceUrl") {
     return foundFromCell(row);
+  }
+  if (column.key === "textToCodeRatio") {
+    return typeof value === "number" ? `${(value * 100).toFixed(1)}%` : " ";
+  }
+  if (column.key === "pageSpeed") {
+    const lab = row.pageSpeed;
+    if (!lab) return " ";
+    const score = (score?: number | null) => score == null || !Number.isFinite(score) ? "–" : String(Math.round(score * 100));
+    const ms = (ms?: number | null) => ms == null || !Number.isFinite(ms) ? "–" : `${Math.round(ms)} ms`;
+    return `${lab.strategy === "desktop" ? "Desktop" : "Mobile"} · Perf ${score(lab.performanceScore)} · A11y ${score(lab.accessibilityScore)} · BP ${score(lab.bestPracticesScore)} · SEO ${score(lab.seoScore)} · LCP ${ms(lab.lcpMs)} · CLS ${lab.cls == null ? "–" : lab.cls}`;
+  }
+  if (column.key === "fieldVitals") {
+    const field = row.fieldVitals;
+    if (!field) return " ";
+    if (!field.hasData) return `${field.formFactor}: no field data`;
+    const ms = (ms?: number | null) => ms == null || !Number.isFinite(ms) ? "–" : `${Math.round(ms)} ms`;
+    return `${field.formFactor} · LCP ${ms(field.lcpMsP75)} · INP ${ms(field.inpMsP75)} · CLS ${field.clsP75 == null ? "–" : field.clsP75}`;
   }
   if (value === null || value === undefined || value === "") {
     return " ";

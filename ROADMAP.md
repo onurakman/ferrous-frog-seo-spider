@@ -14,8 +14,8 @@ Ferrous Frog development roadmap and implementation tracker.
 - [x] Phase 1 crawler MVP is usable for Spider mode and basic List mode.
 - [ ] (Partial) Phase 2 scale/reporting work is underway: SQLite, sessions, resumable frontier state, exports, overview, graph, and many audits exist, but full audit coverage, fully streaming exports, and large-scale benchmarks are not complete.
 - [x] Phase 3 advanced extraction baseline is implemented: custom extraction, raw/rendered HTML custom search, near duplicates, sitemap export, robots tooling, resource toggles, rendered/raw DOM diff, and an optional Chrome CDP rendering backend exist.
-- [ ] (Partial) Phase 4 visualization and external data work is underway: graph storage, graph UI, directory tree, URL segments, path helpers, archive-based crawl comparison, integration provider contracts, Google Search Console metric merge, and manual PageSpeed measurements saved with individual crawl rows exist. GA4, bulk PageSpeed/grid reporting, field Core Web Vitals and backlink providers remain.
-- [ ] Phase 5 automation and AI assist is parked until earlier crawler/reporting work is stronger.
+- [x] Phase 4 visualization and external data work: graph storage, graph UI, directory tree, URL segments, path helpers, archive-based crawl comparison, integration provider contracts, Google Search Console metric merge, and manual PageSpeed measurements saved with individual crawl rows exist. GA4, bulk PageSpeed, Chrome UX Report field data and a generic backlink endpoint are integrated; vendor-specific backlink adapters remain.
+- [ ] (Partial) Phase 5 automation and AI assist: CLI, automation, scheduling, authentication flows and per-URL AI assistance exist; extreme-scale hardening remains.
 
 ## Immediate Next Work
 
@@ -44,7 +44,7 @@ Ferrous Frog development roadmap and implementation tracker.
 - [x] Remove the remaining cross-record hreflang memory fallback with SQL alias joins, deterministic target selection and bounded record decoding. Verify redirected/List URLs, missing/invalid evidence, paging, updates and SQLite work growth when many records share a final URL.
 - [ ] Improve active large-crawl query/frontier performance using measured benchmarks; incremental summaries, realistic edge/frontier loads and physical-disk runs remain open.
 - [x] Add manual PageSpeed measurement for the selected URL, optional OS-keyring credentials in Settings and latest-result persistence. Preserve device/date/URL attribution, exact List occurrences, cancellation and previous results on failures.
-- [ ] Extend PageSpeed with bounded bulk measurement, category choices, quota-aware retry/resume and dedicated metric grid/export fields.
+- [x] Extend PageSpeed with bounded bulk measurement (up to 500 selected rows, one request at a time, cancellable, progress events), Lighthouse category choices, quota-aware retry (429/503 backoff) and resume (rows already measured with the same device are skipped), plus PageSpeed/field-data grid columns and CSV/XLSX fields.
 
 See [FEATURE_COMPARISON.md](docs/FEATURE_COMPARISON.md) for the evidence-based comparison and the limits of implemented features.
 
@@ -57,9 +57,11 @@ The detailed [configuration coverage backlog](docs/CONFIGURATION_BACKLOG.md) tra
 - [x] Add a persisted toolbar scope selector for current host, start folder, all subdomains, and exact URL, synchronized with Settings and locked during a crawl. Preserve legacy host/descendant profiles and custom folder combinations; use public/private suffix boundaries for all subdomains, skip sitemap discovery for exact URL, and recheck saved Spider queues against the selected scope on resume.
 - [x] Add a Mode menu for Spider/List, archive comparison and offline SERP preview/import/export. Preserve mode-specific start URLs, lock unavailable actions with explanations, and keep snippet drafts separate from crawl results with bounded CSV imports and shared width estimates.
 - [x] Add keyword search, collapsible groups, breadcrumbs and keyboard-accessible headings for the existing Settings sections. Verify navigation leaves saved crawl preferences unchanged and fits both themes and small screens.
-- [ ] Expand Settings into dedicated Limits, Advanced, Content, robots.txt, Include/Exclude, Speed, User-Agent, Custom, API access and Crawl Analysis sections as their controls are implemented; add direct control focus and contextual help.
+- [ ] (Partial) Expand Settings into dedicated sections as their controls are implemented. Thresholds, Automation, AI, HTTP authentication, form login, CDN hosts and discovery limits now have their own sections or groups; splitting Crawl into Limits/Speed/robots.txt, direct control focus and contextual help remain.
+- [x] Add configurable audit thresholds (title/description characters and pixels, H1/H2 length, large-image size) evaluated per query in memory and SQLite views, analysis and the HTML report, with validation and reset.
 - [x] Add Apply/Cancel/OK to configuration drafts, including profile loads, with native rule validation, number-field focus, persisted preferences, cancellation of pending validation, storage-failure recovery and both-theme/mobile checks. Explicit session/archive/credential/profile-save actions remain immediate; workspace-changing actions require a clean draft and lock editing/start until complete. The last requested profile wins, and cancelled draft requests cannot publish late results or errors.
-- [ ] Separate crawl and store choices for resource types (images, CSS, JavaScript, and other files) and page-link types (internal/external hyperlinks, canonicals, pagination, hreflang, AMP, meta refresh, and iframes). Keep dependencies between choices clear and preserve bounded storage queries.
+- [x] Add optional max folder depth, max URL length and max links-per-page discovery limits with seed, sitemap, resume and link-evidence rules preserved.
+- [ ] (Partial) Separate crawl and store choices for resource types (images, CSS, JavaScript, and other files) and page-link types (internal/external hyperlinks, canonicals, pagination, hreflang, AMP, meta refresh, and iframes). Keep dependencies between choices clear and preserve bounded storage queries. Crawl/Store choices exist for images, CSS, JavaScript, other files and internal/external hyperlinks: crawled types are always stored, and store-off drops edges, outlink/inlink counts and image references before insertion so queries stay unchanged. Meta refresh and iframe discovery now exist as default-off reference-link choices; canonical/hreflang/pagination/AMP/meta refresh/iframe retention controls remain.
 - [x] Add independent default-off canonical, hreflang, pagination and AMP discovery in Spider mode, including rendered references and repeated HTTP Link canonicals. Preserve metadata/hyperlink evidence and request/scope/resource/nofollow rules; List and Exact URL do not expand. Retention controls and reference-source attribution remain separate work.
 - [x] Separate internal/external nofollow choices with legacy-profile migration, page-level directives, retained link evidence and explicit List behavior. These choices govern new discovery; queued resume URLs retain their original eligibility because saved frontier entries do not contain rel provenance.
 - [x] Repair the external resource opt-in so linked external URLs can be checked without expanding their pages. Preserve robots, include/exclude rules, Exact URL limits, internal sitemap seeds and external permissions on resume.
@@ -68,8 +70,8 @@ The detailed [configuration coverage backlog](docs/CONFIGURATION_BACKLOG.md) tra
 - [x] Add a persisted HTTP response limit (20 MiB default, up to 1 GiB), enforced during decoded streaming for pages, robots.txt and sitemaps. Retain known response evidence and exclude incomplete HTML from on-page audits. Chromium network download bounds remain separate work.
 - [x] Add validated non-secret HTTP headers restricted to the starting origin across pages, robots, sitemaps, redirects and browser requests; persist through settings/profiles and reject credential/transport headers before saving.
 - [x] Use editable Chrome desktop request defaults with Chrome/Ferrous Frog restore actions in HTTP headers. Preserve explicit saved settings and empty header lists. Keep native Chrome resource negotiation and supported HTTP compression; verify default/custom headers across page, robots, sitemap and browser requests.
-- [ ] Add CDN host classification while keeping external crawl permissions separate.
-- [ ] Link authentication settings to the Phase 5 basic/digest/form-login work once implemented. Keep SERP preview separate from any future search-provider integration requiring credentials.
+- [x] Add CDN host classification while keeping external crawl permissions separate.
+- [x] Link authentication settings to the Phase 5 basic/digest/form-login work: Settings > HTTP headers holds HTTP (Basic/Digest) and form login credentials. SERP preview stays separate from any future search-provider integration requiring credentials.
 
 ## Phase 0 - Foundation
 
@@ -297,7 +299,7 @@ Goal: ship a small but complete SEO crawler workflow.
 - [x] Native file export command that writes files to Downloads/Ferrous Frog/exports with app-data fallback.
 - [x] Selected-row CSV clipboard export with a 4 MiB cap and visible access errors.
 - [x] Exact-ID selected-row CSV export with Ctrl/Cmd/Shift selection, page-bounded select-all and stale-selection cleanup.
-- [ ] Export presets.
+- [x] Export presets (`basic`, `audit`, `full`) defined once in the export crate and used by the CLI.
 - [x] Consolidated XLSX workbook with Summary, URLs, Broken Links, Redirects, Titles, Descriptions, Canonicals and Content tabs. Include exact response duplicate evidence. Export the whole idle crawl through bounded queries and temporary worksheet files; reject oversized Excel sheets and publish only complete reports.
 - [x] Stable queued/in-flight CSV export, available for live and resumable stopped crawls without materializing records or the seen set.
 - [x] Image-alt bulk CSV with source URLs, alt text/state, dimensions and known sizes, using bounded shared image queries and atomic publication for stopped crawls.
@@ -318,7 +320,7 @@ Goal: handle large and persistent crawls.
 - [x] Database location controls.
 - [x] Crash recovery messaging and behavior.
 - [x] Import/export of database-backed crawls.
-- [ ] (Partial) Full audit-rule set for all technical SEO tabs. Core row audits, canonical target/chains/loops, pagination target errors/loops and captured-relation reciprocity warnings, AMP target errors, hreflang checks, structured-data checks, security checks, sitemap orphaning, near-duplicates, and HTML validation signals exist; remaining gaps include complete pagination sequences and multiple relations, AMP markup/reciprocity, meta keywords, and richer HTML validation.
+- [ ] (Partial) Full audit-rule set for all technical SEO tabs. Core row audits, canonical target/chains/loops, pagination target errors/loops and captured-relation reciprocity warnings, AMP target errors, hreflang checks, structured-data checks, security checks, sitemap orphaning, near-duplicates, and HTML validation signals exist; meta keywords are captured, searchable, sortable and exported; remaining gaps include complete pagination sequences and multiple relations, AMP markup/reciprocity, and richer HTML validation.
 - [ ] (Partial) Streaming exports for every bulk report. Grid, selected/queued URL, image-alt and link/redirect/sitemap-validation CSV plus XML sitemap write incrementally. Filtered XLSX and the audit workbook use bounded queries and temporary worksheet files; graph JSON and node/edge CSV serialize bounded snapshots directly. Archives stream JSON with SQLite record paging and complete edge/image paging, while retaining Memory snapshots and full frontier hydration. HTML reports retain format buffers; archive import/comparison still hydrate full files.
 - [x] Run and document a [large synthetic 1M URL storage benchmark](docs/BENCHMARKS.md), including duplicate/regex pages, summary latency and process memory. Physical-disk and active-crawler load tests remain separate work.
 
@@ -376,12 +378,12 @@ Goal: enrich crawl data and improve investigation workflows.
 ### External Data
 
 - [x] `integrations` crate.
-- [ ] (Partial) Google Search Console integration. Search Analytics provider, OS keyring token storage, Settings UI status/test controls, and merge-to-grid workflow exist; a full browser OAuth consent/refresh-token flow remains.
-- [ ] Google Analytics 4 integration.
-- [ ] (Partial) PageSpeed Insights integration. Manual selected-URL Mobile/Desktop runs, optional OS-keyring credentials, cancellable bounded requests, four Lighthouse category scores and lab LCP/CLS/TBT persist on the selected row and in archives. INP remains unavailable. Bulk scheduling/retry, category controls, result history and dedicated grid/export fields remain.
-- [ ] Core Web Vitals field-data provider and merge onto crawled URLs, with collection period, device strategy and missing-data states. Lighthouse lab metrics remain distinct from field measurements.
-- [ ] Pluggable backlink API integration points.
-- [ ] (Partial) OAuth credential storage outside source control. Google Search Console access tokens are stored in the OS credential store; reusable refresh-token flows remain.
+- [x] Google Search Console integration: Search Analytics provider, merge-to-grid workflow, Settings status/test controls and a desktop OAuth flow (loopback redirect, PKCE, automatic refresh) through a connected Google account; a pasted access token remains the fallback.
+- [x] Google Analytics 4 integration: the Data API `runReport` per host and path merges sessions, engaged sessions, key events and revenue onto crawled URLs (scheme-insensitive), with grid columns and CSV/XLSX fields, using the connected Google account.
+- [x] PageSpeed Insights integration. Selected-URL and bulk selected-row Mobile/Desktop runs with category choices, optional OS-keyring credentials, cancellable bounded requests, quota-aware retry and resume; four Lighthouse category scores and lab LCP/CLS/TBT persist per row, in archives, grid columns and CSV/XLSX exports. INP remains unavailable from Lighthouse; result history is not kept beyond the latest snapshot.
+- [x] Core Web Vitals field-data provider: the Chrome UX Report API returns p75 LCP/INP/CLS/FCP/TTFB per form factor with the collection period and an explicit no-data state; snapshots persist per row in Memory/SQLite and archives, using the saved Google API key. Lighthouse lab metrics stay separate. Grid/export columns remain open.
+- [x] Pluggable backlink API integration points: a user-configured HTTP(S) endpoint template with `{url}` and an optional credential header (kept in the OS credential store) returns `backlinks`, `referringDomains` and `authorityScore` per crawled internal HTML URL, merged into grid columns and CSV/XLSX fields. Vendor-specific adapters can build on the same contract.
+- [x] OAuth credential storage outside source control: the OAuth client and access/refresh tokens live in the OS credential store; refresh happens transparently before Search Console and Analytics requests.
 
 ## Phase 5 - Automation And AI Assist
 
@@ -389,26 +391,26 @@ Goal: automate recurring work and add optional AI-assisted analysis.
 
 Status: parked for now. Do not prioritize these items until Phase 2, Phase 3, and core Phase 4 crawler/reporting gaps are materially stronger.
 
-- [ ] Headless CLI crawl command.
-- [ ] CLI list mode command.
-- [ ] CLI config profile selection.
-- [ ] CLI output folder and export preset options.
-- [ ] Scheduled one-off crawls.
-- [ ] Scheduled interval crawls.
-- [ ] Auto-export workflows.
-- [ ] Completion notifications.
-- [ ] Webhook notification hooks.
-- [ ] Auth/login crawl flows.
-- [ ] Basic auth.
-- [ ] Digest auth.
-- [ ] Form login and cookie jar workflow.
-- [ ] Configurable LLM provider support.
-- [ ] User-managed API keys.
-- [ ] Rate-limited prompts against page content.
-- [ ] Content intent classification.
-- [ ] Draft meta description generation.
-- [ ] Thin-content and quality flags.
-- [ ] Spelling and grammar analysis.
+- [x] Headless CLI crawl command (`ferrous-frog-cli crawl <url>`), sharing the engine, validation, Memory/SQLite storage and progress reporting.
+- [x] CLI list mode command (`ferrous-frog-cli list <urls...|file>`).
+- [x] CLI config profile selection from the app's saved profiles (`--profile`, `profiles`) or an exported JSON file (`--config`).
+- [x] CLI output folder and export preset options (`--output`, `--export`, `--preset basic|audit|full`, `--database`).
+- [x] Scheduled one-off crawls: Settings > Automation > Schedule runs the configured start URL once at a chosen time while the app is open and idle.
+- [x] Scheduled interval crawls: repeat every 5 minutes to 7 days from an optional first-run time; progress survives restarts and resets when the schedule changes. No background service runs while the app is closed.
+- [x] Auto-export workflows: Settings > Automation runs the basic/audit/full preset into a new exports folder when a crawl finishes.
+- [x] Completion notifications: optional desktop notification plus in-app notices for export/webhook outcomes.
+- [x] Webhook notification hooks: an HTTP(S) endpoint receives a JSON summary (status, counts, summary, export paths) after finished and failed crawls; failures are reported as notices.
+- [x] Auth/login crawl flows: Basic, Digest and form login credentials live in the OS credential store and are enabled per configuration. Browser-rendered logins and cookie transfer to the rendering browser remain outside these flows.
+- [x] Basic auth: Settings > HTTP headers saves username/password in the OS credential store; the enabled flag persists with profiles while secrets never do. The CLI reads `FERROUS_FROG_BASIC_USER`/`FERROUS_FROG_BASIC_PASSWORD`.
+- [x] Digest auth: a `WWW-Authenticate: Digest` challenge from the starting origin is answered once per request with the saved HTTP credentials (MD5/MD5-sess, `qop=auth` or legacy); unsupported algorithms or `auth-int` leave the 401 in the results.
+- [x] Form login and cookie jar workflow: a saved username/password is posted once to the configured login URL with the chosen field names and extra fields; the session cookies then accompany every crawl request. Browser rendering does not share the jar.
+- [x] Configurable LLM provider support: Anthropic's Messages API (default model `claude-opus-5`, server-side refusal fallbacks) or any OpenAI-compatible chat-completions endpoint, with model and base URL settings.
+- [x] User-managed API keys: the AI provider key lives in the OS credential store, outside profiles and browser storage.
+- [x] Rate-limited prompts against page content: a per-minute request window, re-fetched page text bounded by a character limit, script/style-free visible text and a prompt that treats page text as untrusted data.
+- [x] Content intent classification (informational / navigational / transactional / commercial with confidence and rationale) saved per row.
+- [x] Draft meta description generation with alternatives, saved per row.
+- [x] Thin-content and quality flags: Thin Content (word count below the threshold) and Low Text Ratio (visible text below a percentage of the HTML) views, analysis issues and configurable thresholds for successful HTML pages.
+- [x] Spelling and grammar analysis: model-reported issues with suggestions and detected language, saved per row.
 - [ ] Extreme-scale performance hardening and documented benchmarks.
 
 ## Testing Tracker
@@ -419,7 +421,7 @@ Status: parked for now. Do not prioritize these items until Phase 2, Phase 3, an
 - [x] Storage tests for memory and SQLite records, query filters, near duplicates, duplicate list URLs, link edges, graph nodes, anchor text aggregation, image asset records, and frontier state roundtrips.
 - [x] Export tests for CSV, XLSX, sitemap XML, HTML report, link edge CSV, and redirect-chain CSV.
 - [x] Extractor tests for CSS text, CSS attribute, XPath, and regex.
-- [ ] Property tests for frontier/dedup logic.
+- [x] Property tests for frontier/dedup logic: a dependency-free generated-URL test checks query normalization idempotence, fragment removal, strip/limit/sort invariants and single seen-set keys across variants.
 - [ ] (Partial) Load test against a large synthetic site. The one-million-record storage benchmark and a 1,000-page local HTTP crawler fixture are documented. The crawler verifies cycles, deduplication, errors, robots, concurrency and stop/reopen/resume in Memory/SQLite; larger mixed sites, active UI queries and physical-disk runs remain pending.
 - [x] Headless Chrome UI smoke checks for full result/report paging, stale responses, live duplicates, errors, details, graph exclusions, themes and small-screen layouts (`make test-ui`). Optional screenshots use `UI_SCREENSHOT`.
 - [ ] Native desktop end-to-end crawl checks beyond IPC-fixture browser coverage.

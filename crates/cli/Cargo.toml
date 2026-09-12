@@ -1,0 +1,23 @@
+[package]
+name = "ferrous-frog-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Headless crawl and export command line for Ferrous Frog"
+
+[[bin]]
+name = "ferrous-frog-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+ferrous-frog-crawler-core.workspace = true
+ferrous-frog-export.workspace = true
+ferrous-frog-storage.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

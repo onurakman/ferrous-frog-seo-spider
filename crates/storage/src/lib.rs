@@ -131,6 +131,8 @@ pub enum IssueView {
     RenderedDomChanged,
     NearDuplicate,
     ExactDuplicate,
+    ThinContent,
+    LowTextRatio,
     BrokenLinks,
     SitemapOrphan,
 }
@@ -204,6 +206,72 @@ pub enum PageSpeedStrategy {
     Desktop,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FieldFormFactor {
+    Phone,
+    Desktop,
+    Tablet,
+}
+
+/// AI assistance results for one row: each task keeps only its latest answer.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AiInsights {
+    pub intent: Option<AiIntent>,
+    pub meta_description: Option<AiMetaDescription>,
+    pub spelling: Option<AiSpelling>,
+    pub model: String,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AiIntent {
+    pub intent: String,
+    pub confidence: f64,
+    pub rationale: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AiMetaDescription {
+    pub draft: String,
+    pub alternatives: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AiLanguageIssue {
+    pub text: String,
+    pub suggestion: String,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AiSpelling {
+    pub language: Option<String>,
+    pub issues: Vec<AiLanguageIssue>,
+}
+
+/// Latest Chrome UX Report (field) Core Web Vitals for one row; lab PageSpeed data stays separate.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FieldVitalsSnapshot {
+    pub form_factor: FieldFormFactor,
+    pub requested_url: String,
+    pub completed_at_ms: i64,
+    pub has_data: bool,
+    pub lcp_ms_p75: Option<f64>,
+    pub cls_p75: Option<f64>,
+    pub inp_ms_p75: Option<f64>,
+    pub fcp_ms_p75: Option<f64>,
+    pub ttfb_ms_p75: Option<f64>,
+    pub collection_period_start: Option<String>,
+    pub collection_period_end: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PageSpeedSnapshot {
@@ -263,6 +331,8 @@ pub struct CrawlRecord {
     pub meta_description_count: Option<usize>,
     pub meta_description_len: usize,
     pub meta_description_pixel_width: u32,
+    #[serde(default)]
+    pub meta_keywords: Option<String>,
     pub meta_robots: Option<String>,
     pub x_robots_tag: Option<String>,
     pub h1: Option<String>,
@@ -332,7 +402,25 @@ pub struct CrawlRecord {
     #[serde(default)]
     pub search_console_average_position: Option<f64>,
     #[serde(default)]
+    pub analytics_sessions: Option<f64>,
+    #[serde(default)]
+    pub analytics_engaged_sessions: Option<f64>,
+    #[serde(default)]
+    pub analytics_conversions: Option<f64>,
+    #[serde(default)]
+    pub analytics_revenue: Option<f64>,
+    #[serde(default)]
+    pub backlink_count: Option<u64>,
+    #[serde(default)]
+    pub referring_domain_count: Option<u64>,
+    #[serde(default)]
+    pub backlink_authority: Option<f64>,
+    #[serde(default)]
     pub page_speed: Option<PageSpeedSnapshot>,
+    #[serde(default)]
+    pub field_vitals: Option<FieldVitalsSnapshot>,
+    #[serde(default)]
+    pub ai_insights: Option<AiInsights>,
     pub error: Option<String>,
 }
 
@@ -372,6 +460,7 @@ impl CrawlRecord {
             title_len: 0,
             title_pixel_width: 0,
             meta_description: None,
+            meta_keywords: None,
             meta_description_count: None,
             meta_description_len: 0,
             meta_description_pixel_width: 0,
@@ -432,7 +521,16 @@ impl CrawlRecord {
             search_console_impressions: None,
             search_console_ctr: None,
             search_console_average_position: None,
+            analytics_sessions: None,
+            analytics_engaged_sessions: None,
+            analytics_conversions: None,
+            analytics_revenue: None,
+            backlink_count: None,
+            referring_domain_count: None,
+            backlink_authority: None,
             page_speed: None,
+            field_vitals: None,
+            ai_insights: None,
             error: None,
         }
     }
@@ -446,6 +544,27 @@ pub struct SearchConsoleMetricRow {
     pub impressions: f64,
     pub ctr: f64,
     pub average_position: f64,
+}
+
+/// Backlink counts from an external provider, keyed by URL.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BacklinkMetricRow {
+    pub url: String,
+    pub backlinks: u64,
+    pub referring_domains: u64,
+    pub authority_score: Option<f64>,
+}
+
+/// Google Analytics 4 metrics keyed by host + page path (scheme is matched loosely on merge).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalyticsMetricRow {
+    pub url: String,
+    pub sessions: f64,
+    pub engaged_sessions: f64,
+    pub conversions: f64,
+    pub revenue: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -531,12 +650,96 @@ pub struct CrawlSummary {
     pub sitemap_orphans: usize,
 }
 
+/// Character and pixel limits behind the length/width audit views. Alt-length and
+/// oversized-image flags are decided when records are captured and stay fixed.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AuditThresholds {
+    pub title_min_chars: usize,
+    pub title_max_chars: usize,
+    pub title_min_pixels: u32,
+    pub title_max_pixels: u32,
+    pub meta_min_chars: usize,
+    pub meta_max_chars: usize,
+    pub meta_min_pixels: u32,
+    pub meta_max_pixels: u32,
+    pub h1_max_chars: usize,
+    pub h2_max_chars: usize,
+    pub large_image_bytes: usize,
+    /// Successful HTML pages below this word count are flagged as thin content.
+    pub thin_content_words: usize,
+    /// Pages whose visible text is below this percentage of the HTML size are flagged.
+    pub min_text_ratio_percent: u32,
+}
+
+impl Default for AuditThresholds {
+    fn default() -> Self {
+        Self {
+            title_min_chars: 30,
+            title_max_chars: 60,
+            title_min_pixels: 200,
+            title_max_pixels: 580,
+            meta_min_chars: 70,
+            meta_max_chars: 160,
+            meta_min_pixels: 400,
+            meta_max_pixels: 920,
+            h1_max_chars: 70,
+            h2_max_chars: 70,
+            large_image_bytes: 200 * 1024,
+            thin_content_words: 200,
+            min_text_ratio_percent: 10,
+        }
+    }
+}
+
+impl AuditThresholds {
+    pub fn validate(&self) -> Result<(), String> {
+        for (label, min, max) in [
+            (
+                "Title characters",
+                self.title_min_chars,
+                self.title_max_chars,
+            ),
+            (
+                "Title pixels",
+                self.title_min_pixels as usize,
+                self.title_max_pixels as usize,
+            ),
+            (
+                "Meta description characters",
+                self.meta_min_chars,
+                self.meta_max_chars,
+            ),
+            (
+                "Meta description pixels",
+                self.meta_min_pixels as usize,
+                self.meta_max_pixels as usize,
+            ),
+        ] {
+            if max == 0 || min > max {
+                return Err(format!(
+                    "{label}: the maximum must be greater than zero and at least the minimum"
+                ));
+            }
+        }
+        if self.h1_max_chars == 0 || self.h2_max_chars == 0 || self.large_image_bytes == 0 {
+            return Err("Heading and image limits must be greater than zero".to_string());
+        }
+        if self.min_text_ratio_percent > 100 {
+            return Err("The minimum text ratio must be between 0 and 100 percent".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GridQuery {
     pub offset: usize,
     pub limit: usize,
     pub global_search: Option<String>,
+    #[serde(default)]
+    pub thresholds: AuditThresholds,
     #[serde(default)]
     pub segment_pattern: Option<String>,
     #[serde(default)]
@@ -554,6 +757,7 @@ impl Default for GridQuery {
             offset: 0,
             limit: 200,
             global_search: None,
+            thresholds: AuditThresholds::default(),
             segment_pattern: None,
             segment_regex: false,
             filters: None,
@@ -948,6 +1152,23 @@ fn validate_page_speed_snapshot(snapshot: &PageSpeedSnapshot) -> Result<(), Stor
     Ok(())
 }
 
+fn validate_field_vitals_snapshot(snapshot: &FieldVitalsSnapshot) -> Result<(), StorageError> {
+    for (name, value) in [
+        ("lcpMsP75", snapshot.lcp_ms_p75),
+        ("clsP75", snapshot.cls_p75),
+        ("inpMsP75", snapshot.inp_ms_p75),
+        ("fcpMsP75", snapshot.fcp_ms_p75),
+        ("ttfbMsP75", snapshot.ttfb_ms_p75),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+            return Err(StorageError::InvalidPageSpeedSnapshot(format!(
+                "{name} must be a finite non-negative number"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub trait CrawlStore: Clone + Send + Sync + 'static {
     fn clear(&self);
     fn upsert(&self, record: CrawlRecord) -> CrawlRecord;
@@ -956,6 +1177,8 @@ pub trait CrawlStore: Clone + Send + Sync + 'static {
     fn add_link_edge(&self, edge: LinkEdge) -> LinkEdge;
     fn add_image_assets(&self, page_url: &str, images: Vec<ImageAsset>);
     fn merge_search_console_metrics(&self, metrics: Vec<SearchConsoleMetricRow>) -> usize;
+    fn merge_analytics_metrics(&self, metrics: Vec<AnalyticsMetricRow>) -> usize;
+    fn merge_backlink_metrics(&self, metrics: Vec<BacklinkMetricRow>) -> usize;
     fn records(&self) -> Vec<CrawlRecord>;
     fn query(&self, query: GridQuery) -> GridResponse;
     fn link_edges(&self, query: LinkEdgeQuery) -> LinkEdgeResponse;
@@ -1066,6 +1289,12 @@ impl MemoryStore {
             if record.page_speed.is_none() {
                 record.page_speed = inner.records[index].page_speed.clone();
             }
+            if record.field_vitals.is_none() {
+                record.field_vitals = inner.records[index].field_vitals.clone();
+            }
+            if record.ai_insights.is_none() {
+                record.ai_insights = inner.records[index].ai_insights.clone();
+            }
             inner.records[index] = record.clone();
             index
         } else {
@@ -1102,6 +1331,33 @@ impl MemoryStore {
             .find(|record| record.id == id)
             .ok_or(StorageError::RecordNotFound(id))?;
         record.page_speed = Some(snapshot);
+        Ok(())
+    }
+
+    pub fn try_save_field_vitals(
+        &self,
+        id: u64,
+        snapshot: FieldVitalsSnapshot,
+    ) -> Result<(), StorageError> {
+        validate_field_vitals_snapshot(&snapshot)?;
+        let mut inner = self.inner.write().map_err(|_| StorageError::LockPoisoned)?;
+        let record = inner
+            .records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(StorageError::RecordNotFound(id))?;
+        record.field_vitals = Some(snapshot);
+        Ok(())
+    }
+
+    pub fn try_save_ai_insights(&self, id: u64, insights: AiInsights) -> Result<(), StorageError> {
+        let mut inner = self.inner.write().map_err(|_| StorageError::LockPoisoned)?;
+        let record = inner
+            .records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(StorageError::RecordNotFound(id))?;
+        record.ai_insights = Some(insights);
         Ok(())
     }
 
@@ -1191,6 +1447,50 @@ impl MemoryStore {
         updated
     }
 
+    pub fn merge_backlink_metrics(&self, metrics: Vec<BacklinkMetricRow>) -> usize {
+        let mut inner = self.inner.write().expect("memory store lock poisoned");
+        let mut by_alias = HashMap::new();
+        for metric in metrics {
+            for alias in url_aliases(&metric.url) {
+                by_alias.insert(alias, metric.clone());
+            }
+        }
+        if by_alias.is_empty() {
+            return 0;
+        }
+        let mut updated = 0usize;
+        for record in &mut inner.records {
+            let aliases = sorted_aliases(record_url_aliases(record));
+            if let Some(metric) = aliases.iter().find_map(|alias| by_alias.get(alias)) {
+                record.backlink_count = Some(metric.backlinks);
+                record.referring_domain_count = Some(metric.referring_domains);
+                record.backlink_authority = metric.authority_score;
+                updated += 1;
+            }
+        }
+        updated
+    }
+
+    pub fn merge_analytics_metrics(&self, metrics: Vec<AnalyticsMetricRow>) -> usize {
+        let mut inner = self.inner.write().expect("memory store lock poisoned");
+        let metrics_by_alias = analytics_metrics_by_alias(metrics);
+        if metrics_by_alias.is_empty() {
+            return 0;
+        }
+        let mut updated = 0usize;
+        for record in &mut inner.records {
+            let aliases = sorted_aliases(record_url_aliases(record));
+            if let Some(metric) = aliases.iter().find_map(|alias| metrics_by_alias.get(alias)) {
+                record.analytics_sessions = Some(metric.sessions);
+                record.analytics_engaged_sessions = Some(metric.engaged_sessions);
+                record.analytics_conversions = Some(metric.conversions);
+                record.analytics_revenue = Some(metric.revenue);
+                updated += 1;
+            }
+        }
+        updated
+    }
+
     pub fn records(&self) -> Vec<CrawlRecord> {
         let inner = self.inner.read().expect("memory store lock poisoned");
         let mut records = inner.records.clone();
@@ -1254,6 +1554,7 @@ impl MemoryStore {
             matches_view(
                 row,
                 &query.view,
+                &query.thresholds,
                 &title_counts,
                 &meta_counts,
                 &h1_counts,
@@ -1481,6 +1782,14 @@ impl CrawlStore for MemoryStore {
         Self::merge_search_console_metrics(self, metrics)
     }
 
+    fn merge_analytics_metrics(&self, metrics: Vec<AnalyticsMetricRow>) -> usize {
+        Self::merge_analytics_metrics(self, metrics)
+    }
+
+    fn merge_backlink_metrics(&self, metrics: Vec<BacklinkMetricRow>) -> usize {
+        Self::merge_backlink_metrics(self, metrics)
+    }
+
     fn records(&self) -> Vec<CrawlRecord> {
         Self::records(self)
     }
@@ -1618,12 +1927,14 @@ impl SqliteStore {
         }
         let existing = conn
             .query_row(
-                "SELECT id, page_speed FROM crawl_records WHERE storage_key = ?1",
+                "SELECT id, page_speed, field_vitals, ai_insights FROM crawl_records WHERE storage_key = ?1",
                 [&record.storage_key],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)? as u64,
                         row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
@@ -1631,11 +1942,25 @@ impl SqliteStore {
         if record.page_speed.is_none() {
             record.page_speed = existing
                 .as_ref()
-                .and_then(|(_, snapshot)| snapshot.as_deref())
+                .and_then(|(_, snapshot, _, _)| snapshot.as_deref())
                 .map(serde_json::from_str)
                 .transpose()?;
         }
-        let existing_id = existing.map(|(id, _)| id);
+        if record.field_vitals.is_none() {
+            record.field_vitals = existing
+                .as_ref()
+                .and_then(|(_, _, snapshot, _)| snapshot.as_deref())
+                .map(serde_json::from_str)
+                .transpose()?;
+        }
+        if record.ai_insights.is_none() {
+            record.ai_insights = existing
+                .as_ref()
+                .and_then(|(_, _, _, snapshot)| snapshot.as_deref())
+                .map(serde_json::from_str)
+                .transpose()?;
+        }
+        let existing_id = existing.map(|(id, _, _, _)| id);
         record.inlink_count =
             sqlite_inlink_count_for_record(&conn, &record)?.unwrap_or(record.inlink_count);
         let redirect_chain = serde_json::to_string(&record.redirect_chain)?;
@@ -1645,6 +1970,16 @@ impl SqliteStore {
         let custom_searches = serde_json::to_string(&record.custom_searches)?;
         let page_speed = record
             .page_speed
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let field_vitals = record
+            .field_vitals
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let ai_insights = record
+            .ai_insights
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
@@ -1754,7 +2089,17 @@ impl SqliteStore {
                     meta_description_pixel_width = ?88,
                     title_count = ?89,
                     meta_description_count = ?90,
-                    page_speed = ?91
+                    page_speed = ?91,
+                    meta_keywords = ?93,
+                    field_vitals = ?94,
+                    analytics_sessions = ?95,
+                    analytics_engaged_sessions = ?96,
+                    analytics_conversions = ?97,
+                    analytics_revenue = ?98,
+                    ai_insights = ?99,
+                    backlink_count = ?100,
+                    referring_domain_count = ?101,
+                    backlink_authority = ?102
                  WHERE id = ?92",
                 params![
                     record.url,
@@ -1848,7 +2193,21 @@ impl SqliteStore {
                     record.title_count.map(|count| count as i64),
                     record.meta_description_count.map(|count| count as i64),
                     page_speed,
-                    record.id as i64
+                    record.id as i64,
+                    record.meta_keywords,
+                    field_vitals,
+                    record.analytics_sessions,
+                    record.analytics_engaged_sessions,
+                    record.analytics_conversions,
+                    record.analytics_revenue,
+                    ai_insights,
+                    record
+                        .backlink_count
+                        .map(|value| value.min(i64::MAX as u64) as i64),
+                    record
+                        .referring_domain_count
+                        .map(|value| value.min(i64::MAX as u64) as i64),
+                    record.backlink_authority
                 ],
             )?;
             update_sqlite_edge_statuses(&conn, &record)?;
@@ -1947,7 +2306,17 @@ impl SqliteStore {
                     meta_description_pixel_width,
                     title_count,
                     meta_description_count,
-                    page_speed
+                    page_speed,
+                    meta_keywords,
+                    field_vitals,
+                    analytics_sessions,
+                    analytics_engaged_sessions,
+                    analytics_conversions,
+                    analytics_revenue,
+                    ai_insights,
+                    backlink_count,
+                    referring_domain_count,
+                    backlink_authority
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
@@ -1956,7 +2325,8 @@ impl SqliteStore {
                     ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57,
                     ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65, ?66, ?67, ?68, ?69,
                     ?70, ?71, ?72, ?73, ?74, ?75, ?76, ?77, ?78, ?79, ?80,
-                    ?81, ?82, ?83, ?84, ?85, ?86, ?87, ?88, ?89, ?90, ?91
+                    ?81, ?82, ?83, ?84, ?85, ?86, ?87, ?88, ?89, ?90, ?91, ?92, ?93,
+                    ?94, ?95, ?96, ?97, ?98, ?99, ?100, ?101
                  )",
                 params![
                     record.url,
@@ -2049,7 +2419,21 @@ impl SqliteStore {
                     record.meta_description_pixel_width,
                     record.title_count.map(|count| count as i64),
                     record.meta_description_count.map(|count| count as i64),
-                    page_speed
+                    page_speed,
+                    record.meta_keywords,
+                    field_vitals,
+                    record.analytics_sessions,
+                    record.analytics_engaged_sessions,
+                    record.analytics_conversions,
+                    record.analytics_revenue,
+                    ai_insights,
+                    record
+                        .backlink_count
+                        .map(|value| value.min(i64::MAX as u64) as i64),
+                    record
+                        .referring_domain_count
+                        .map(|value| value.min(i64::MAX as u64) as i64),
+                    record.backlink_authority
                 ],
             )?;
             record.id = conn.last_insert_rowid() as u64;
@@ -2072,6 +2456,43 @@ impl SqliteStore {
         let transaction = conn.transaction()?;
         if transaction.execute(
             "UPDATE crawl_records SET page_speed = ?1 WHERE id = ?2",
+            params![payload, sql_id],
+        )? == 0
+        {
+            return Err(StorageError::RecordNotFound(id));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn try_save_field_vitals(
+        &self,
+        id: u64,
+        snapshot: FieldVitalsSnapshot,
+    ) -> Result<(), StorageError> {
+        validate_field_vitals_snapshot(&snapshot)?;
+        let payload = serde_json::to_string(&snapshot)?;
+        let sql_id = i64::try_from(id).map_err(|_| StorageError::RecordNotFound(id))?;
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        if transaction.execute(
+            "UPDATE crawl_records SET field_vitals = ?1 WHERE id = ?2",
+            params![payload, sql_id],
+        )? == 0
+        {
+            return Err(StorageError::RecordNotFound(id));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn try_save_ai_insights(&self, id: u64, insights: AiInsights) -> Result<(), StorageError> {
+        let payload = serde_json::to_string(&insights)?;
+        let sql_id = i64::try_from(id).map_err(|_| StorageError::RecordNotFound(id))?;
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        if transaction.execute(
+            "UPDATE crawl_records SET ai_insights = ?1 WHERE id = ?2",
             params![payload, sql_id],
         )? == 0
         {
@@ -2190,6 +2611,119 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn try_merge_backlink_metrics(
+        &self,
+        metrics: Vec<BacklinkMetricRow>,
+    ) -> Result<usize, StorageError> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let mut updated_ids = HashSet::new();
+        for metric in metrics {
+            let aliases = sorted_aliases(url_aliases(&metric.url));
+            if aliases.is_empty() {
+                continue;
+            }
+            let placeholders = sql_placeholders(aliases.len());
+            let select_sql = format!(
+                "SELECT id FROM crawl_records
+                 WHERE storage_key IN ({placeholders})
+                    OR url IN ({placeholders})
+                    OR final_url IN ({placeholders})"
+            );
+            let args = repeat_args(&aliases, 3);
+            let ids = {
+                let mut stmt = tx.prepare(&select_sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                let mut ids = Vec::new();
+                for row in rows {
+                    ids.push(row?);
+                }
+                ids
+            };
+            if ids.is_empty() {
+                continue;
+            }
+            let id_placeholders = sql_placeholders(ids.len());
+            let update_sql = format!(
+                "UPDATE crawl_records
+                 SET backlink_count = ?, referring_domain_count = ?, backlink_authority = ?
+                 WHERE id IN ({id_placeholders})"
+            );
+            let mut update_args = vec![
+                Value::Integer(metric.backlinks.min(i64::MAX as u64) as i64),
+                Value::Integer(metric.referring_domains.min(i64::MAX as u64) as i64),
+                metric
+                    .authority_score
+                    .map(Value::Real)
+                    .unwrap_or(Value::Null),
+            ];
+            update_args.extend(ids.iter().copied().map(Value::Integer));
+            tx.execute(&update_sql, rusqlite::params_from_iter(update_args.iter()))?;
+            updated_ids.extend(ids.into_iter().map(|id| id as u64));
+        }
+        tx.commit()?;
+        Ok(updated_ids.len())
+    }
+
+    pub fn try_merge_analytics_metrics(
+        &self,
+        metrics: Vec<AnalyticsMetricRow>,
+    ) -> Result<usize, StorageError> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let mut updated_ids = HashSet::new();
+        for metric in metrics {
+            let aliases = sorted_aliases(scheme_insensitive_aliases(&metric.url));
+            if aliases.is_empty() {
+                continue;
+            }
+            let placeholders = sql_placeholders(aliases.len());
+            let select_sql = format!(
+                "SELECT id FROM crawl_records
+                 WHERE storage_key IN ({placeholders})
+                    OR url IN ({placeholders})
+                    OR final_url IN ({placeholders})"
+            );
+            let args = repeat_args(&aliases, 3);
+            let ids = {
+                let mut stmt = tx.prepare(&select_sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+                    row.get::<_, i64>(0)
+                })?;
+                let mut ids = Vec::new();
+                for row in rows {
+                    ids.push(row?);
+                }
+                ids
+            };
+            if ids.is_empty() {
+                continue;
+            }
+            let id_placeholders = sql_placeholders(ids.len());
+            let update_sql = format!(
+                "UPDATE crawl_records
+                 SET analytics_sessions = ?,
+                     analytics_engaged_sessions = ?,
+                     analytics_conversions = ?,
+                     analytics_revenue = ?
+                 WHERE id IN ({id_placeholders})"
+            );
+            let mut update_args = vec![
+                Value::Real(metric.sessions),
+                Value::Real(metric.engaged_sessions),
+                Value::Real(metric.conversions),
+                Value::Real(metric.revenue),
+            ];
+            update_args.extend(ids.iter().copied().map(Value::Integer));
+            tx.execute(&update_sql, rusqlite::params_from_iter(update_args.iter()))?;
+            updated_ids.extend(ids.into_iter().map(|id| id as u64));
+        }
+        tx.commit()?;
+        Ok(updated_ids.len())
     }
 
     pub fn try_merge_search_console_metrics(
@@ -2983,6 +3517,16 @@ impl SqliteStore {
                 search_console_ctr REAL,
                 search_console_average_position REAL,
                 page_speed TEXT,
+                meta_keywords TEXT,
+                field_vitals TEXT,
+                analytics_sessions REAL,
+                analytics_engaged_sessions REAL,
+                analytics_conversions REAL,
+                analytics_revenue REAL,
+                ai_insights TEXT,
+                backlink_count INTEGER,
+                referring_domain_count INTEGER,
+                backlink_authority REAL,
                 error TEXT,
                 in_sitemap INTEGER NOT NULL DEFAULT 0
             );
@@ -3131,6 +3675,20 @@ impl SqliteStore {
         )?;
         add_column_if_missing(&conn, "viewport", "INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&conn, "amphtml", "TEXT")?;
+        add_column_if_missing(&conn, "meta_keywords", "TEXT")?;
+        add_column_if_missing(&conn, "field_vitals", "TEXT")?;
+        for column in [
+            "analytics_sessions",
+            "analytics_engaged_sessions",
+            "analytics_conversions",
+            "analytics_revenue",
+        ] {
+            add_column_if_missing(&conn, column, "REAL")?;
+        }
+        add_column_if_missing(&conn, "ai_insights", "TEXT")?;
+        add_column_if_missing(&conn, "backlink_count", "INTEGER")?;
+        add_column_if_missing(&conn, "referring_domain_count", "INTEGER")?;
+        add_column_if_missing(&conn, "backlink_authority", "REAL")?;
         add_column_if_missing(&conn, "rel_next", "TEXT")?;
         add_column_if_missing(&conn, "rel_prev", "TEXT")?;
         add_column_if_missing(&conn, "hreflang_count", "INTEGER NOT NULL DEFAULT 0")?;
@@ -3292,6 +3850,16 @@ impl CrawlStore for SqliteStore {
             .expect("sqlite image asset update failed");
     }
 
+    fn merge_analytics_metrics(&self, metrics: Vec<AnalyticsMetricRow>) -> usize {
+        self.try_merge_analytics_metrics(metrics)
+            .expect("sqlite analytics merge failed")
+    }
+
+    fn merge_backlink_metrics(&self, metrics: Vec<BacklinkMetricRow>) -> usize {
+        self.try_merge_backlink_metrics(metrics)
+            .expect("sqlite backlink merge failed")
+    }
+
     fn merge_search_console_metrics(&self, metrics: Vec<SearchConsoleMetricRow>) -> usize {
         self.try_merge_search_console_metrics(metrics)
             .expect("sqlite Search Console metric merge failed")
@@ -3373,6 +3941,24 @@ impl ActiveStore {
         }
     }
 
+    pub fn try_save_field_vitals(
+        &self,
+        id: u64,
+        snapshot: FieldVitalsSnapshot,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(store) => store.try_save_field_vitals(id, snapshot),
+            Self::Sqlite(store) => store.try_save_field_vitals(id, snapshot),
+        }
+    }
+
+    pub fn try_save_ai_insights(&self, id: u64, insights: AiInsights) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(store) => store.try_save_ai_insights(id, insights),
+            Self::Sqlite(store) => store.try_save_ai_insights(id, insights),
+        }
+    }
+
     pub fn memory() -> Self {
         Self::Memory(MemoryStore::new())
     }
@@ -3429,6 +4015,20 @@ impl CrawlStore for ActiveStore {
         match self {
             ActiveStore::Memory(store) => store.add_image_assets(page_url, images),
             ActiveStore::Sqlite(store) => store.add_image_assets(page_url, images),
+        }
+    }
+
+    fn merge_analytics_metrics(&self, metrics: Vec<AnalyticsMetricRow>) -> usize {
+        match self {
+            ActiveStore::Memory(store) => store.merge_analytics_metrics(metrics),
+            ActiveStore::Sqlite(store) => store.merge_analytics_metrics(metrics),
+        }
+    }
+
+    fn merge_backlink_metrics(&self, metrics: Vec<BacklinkMetricRow>) -> usize {
+        match self {
+            ActiveStore::Memory(store) => store.merge_backlink_metrics(metrics),
+            ActiveStore::Sqlite(store) => store.merge_backlink_metrics(metrics),
         }
     }
 
@@ -4161,6 +4761,35 @@ fn url_aliases(value: &str) -> HashSet<String> {
     url_aliases_many([value])
 }
 
+/// GA4 reports host + path without a scheme, so both schemes must match crawled rows.
+fn scheme_insensitive_aliases(value: &str) -> HashSet<String> {
+    let mut aliases = url_aliases(value);
+    if let Ok(parsed) = url::Url::parse(value.trim()) {
+        let mut swapped = parsed.clone();
+        let other = if parsed.scheme() == "https" {
+            "http"
+        } else {
+            "https"
+        };
+        if swapped.set_scheme(other).is_ok() {
+            aliases.extend(url_aliases(swapped.as_str()));
+        }
+    }
+    aliases
+}
+
+fn analytics_metrics_by_alias(
+    metrics: Vec<AnalyticsMetricRow>,
+) -> HashMap<String, AnalyticsMetricRow> {
+    let mut metrics_by_alias = HashMap::new();
+    for metric in metrics {
+        for alias in scheme_insensitive_aliases(&metric.url) {
+            metrics_by_alias.insert(alias, metric.clone());
+        }
+    }
+    metrics_by_alias
+}
+
 fn search_console_metrics_by_alias(
     metrics: Vec<SearchConsoleMetricRow>,
 ) -> HashMap<String, SearchConsoleMetricRow> {
@@ -4637,7 +5266,39 @@ fn graph_label(url: &str) -> String {
     url.to_string()
 }
 
+fn json_column<T: for<'de> Deserialize<'de>>(
+    row: &rusqlite::Row<'_>,
+    name: &str,
+) -> rusqlite::Result<Option<T>> {
+    let column = row.as_ref().column_index(name)?;
+    row.get::<_, Option<String>>(column)?
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    column,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()
+}
+
 fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CrawlRecord> {
+    let ai_insights = json_column::<AiInsights>(row, "ai_insights")?;
+    let field_vitals_column = row.as_ref().column_index("field_vitals")?;
+    let field_vitals = row
+        .get::<_, Option<String>>(field_vitals_column)?
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    field_vitals_column,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })
+        })
+        .transpose()?;
     let page_speed_column = row.as_ref().column_index("page_speed")?;
     let page_speed = row
         .get::<_, Option<String>>(page_speed_column)?
@@ -4754,6 +5415,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CrawlRecord> {
         x_content_type_options_header: row.get("x_content_type_options_header")?,
         viewport: row.get("viewport")?,
         amphtml: row.get("amphtml")?,
+        meta_keywords: row.get("meta_keywords")?,
         rel_next: row.get("rel_next")?,
         rel_prev: row.get("rel_prev")?,
         hreflang_count: row.get("hreflang_count")?,
@@ -4788,6 +5450,19 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CrawlRecord> {
         search_console_ctr: row.get("search_console_ctr")?,
         search_console_average_position: row.get("search_console_average_position")?,
         page_speed,
+        field_vitals,
+        ai_insights,
+        backlink_count: row
+            .get::<_, Option<i64>>("backlink_count")?
+            .map(|value| value.max(0) as u64),
+        referring_domain_count: row
+            .get::<_, Option<i64>>("referring_domain_count")?
+            .map(|value| value.max(0) as u64),
+        backlink_authority: row.get("backlink_authority")?,
+        analytics_sessions: row.get("analytics_sessions")?,
+        analytics_engaged_sessions: row.get("analytics_engaged_sessions")?,
+        analytics_conversions: row.get("analytics_conversions")?,
+        analytics_revenue: row.get("analytics_revenue")?,
         error: row.get("error")?,
     })
 }
@@ -5210,6 +5885,16 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             search_console_ctr REAL,
             search_console_average_position REAL,
             page_speed TEXT,
+            meta_keywords TEXT,
+            field_vitals TEXT,
+            analytics_sessions REAL,
+            analytics_engaged_sessions REAL,
+            analytics_conversions REAL,
+            analytics_revenue REAL,
+            ai_insights TEXT,
+            backlink_count INTEGER,
+            referring_domain_count INTEGER,
+            backlink_authority REAL,
             error TEXT,
             in_sitemap INTEGER NOT NULL DEFAULT 0
         );
@@ -5292,6 +5977,16 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             external_outlink_count,
             custom_extractions,
             page_speed,
+            meta_keywords,
+            field_vitals,
+            analytics_sessions,
+            analytics_engaged_sessions,
+            analytics_conversions,
+            analytics_revenue,
+            ai_insights,
+            backlink_count,
+            referring_domain_count,
+            backlink_authority,
             error,
             in_sitemap
         )
@@ -5373,6 +6068,16 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             external_outlink_count,
             custom_extractions,
             page_speed,
+            meta_keywords,
+            field_vitals,
+            analytics_sessions,
+            analytics_engaged_sessions,
+            analytics_conversions,
+            analytics_revenue,
+            ai_insights,
+            backlink_count,
+            referring_domain_count,
+            backlink_authority,
             error,
             in_sitemap
         FROM crawl_records_old;
@@ -5727,6 +6432,7 @@ const HREFLANG_AUDIT_CTES: &str = "WITH
 fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
     let mut clauses = Vec::new();
     let mut args = Vec::new();
+    let t = &query.thresholds;
 
     if is_html_audit_view(&query.view) {
         clauses.push(SUCCESS_HTML_SQL.to_string());
@@ -5760,23 +6466,23 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
         IssueView::TitleMissing => clauses.push("(title IS NULL OR ff_trim(title) = '')".to_string()),
         IssueView::TitleDuplicate => {}
         IssueView::TitleMultiple => clauses.push("title_count > 1".to_string()),
-        IssueView::TitleTooShort => clauses.push("(title IS NOT NULL AND ff_trim(title) != '' AND title_len < 30)".to_string()),
-        IssueView::TitleTooLong => clauses.push("title_len > 60".to_string()),
-        IssueView::TitlePixelTooNarrow => clauses.push("(title IS NOT NULL AND ff_trim(title) != '' AND title_pixel_width < 200)".to_string()),
-        IssueView::TitlePixelTooWide => clauses.push("title_pixel_width > 580".to_string()),
+        IssueView::TitleTooShort => clauses.push(format!("(title IS NOT NULL AND ff_trim(title) != '' AND title_len < {})", t.title_min_chars)),
+        IssueView::TitleTooLong => clauses.push(format!("title_len > {}", t.title_max_chars)),
+        IssueView::TitlePixelTooNarrow => clauses.push(format!("(title IS NOT NULL AND ff_trim(title) != '' AND title_pixel_width < {})", t.title_min_pixels)),
+        IssueView::TitlePixelTooWide => clauses.push(format!("title_pixel_width > {}", t.title_max_pixels)),
         IssueView::MetaMissing => clauses.push("(meta_description IS NULL OR ff_trim(meta_description) = '')".to_string()),
         IssueView::MetaDuplicate => {}
         IssueView::MetaMultiple => clauses.push("meta_description_count > 1".to_string()),
-        IssueView::MetaTooShort => clauses.push("(meta_description IS NOT NULL AND ff_trim(meta_description) != '' AND meta_description_len < 70)".to_string()),
-        IssueView::MetaTooLong => clauses.push("meta_description_len > 160".to_string()),
-        IssueView::MetaPixelTooNarrow => clauses.push("(meta_description IS NOT NULL AND ff_trim(meta_description) != '' AND meta_description_pixel_width < 400)".to_string()),
-        IssueView::MetaPixelTooWide => clauses.push("meta_description_pixel_width > 920".to_string()),
+        IssueView::MetaTooShort => clauses.push(format!("(meta_description IS NOT NULL AND ff_trim(meta_description) != '' AND meta_description_len < {})", t.meta_min_chars)),
+        IssueView::MetaTooLong => clauses.push(format!("meta_description_len > {}", t.meta_max_chars)),
+        IssueView::MetaPixelTooNarrow => clauses.push(format!("(meta_description IS NOT NULL AND ff_trim(meta_description) != '' AND meta_description_pixel_width < {})", t.meta_min_pixels)),
+        IssueView::MetaPixelTooWide => clauses.push(format!("meta_description_pixel_width > {}", t.meta_max_pixels)),
         IssueView::H1Missing => clauses.push("(h1 IS NULL OR ff_trim(h1) = '')".to_string()),
         IssueView::H1Duplicate => {}
-        IssueView::H1TooLong => clauses.push("h1_len > 70".to_string()),
+        IssueView::H1TooLong => clauses.push(format!("h1_len > {}", t.h1_max_chars)),
         IssueView::H2Missing => clauses.push("(h2 IS NULL OR ff_trim(h2) = '')".to_string()),
         IssueView::H2Duplicate => {}
-        IssueView::H2TooLong => clauses.push("h2_len > 70".to_string()),
+        IssueView::H2TooLong => clauses.push(format!("h2_len > {}", t.h2_max_chars)),
         IssueView::TitleSameAsH1 => clauses.push(
             "(title IS NOT NULL AND h1 IS NOT NULL AND ff_trim(title) != '' AND lower(ff_trim(title)) = lower(ff_trim(h1)))"
                 .to_string(),
@@ -5851,6 +6557,11 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
         IssueView::ExactDuplicate => clauses.push(
             "id IN (SELECT record_id FROM ff_exact_duplicate_records)".into(),
         ),
+        IssueView::ThinContent => clauses.push(format!("word_count < {}", t.thin_content_words)),
+        IssueView::LowTextRatio => clauses.push(format!(
+            "text_to_code_ratio * 100 < {}",
+            t.min_text_ratio_percent
+        )),
         IssueView::BrokenLinks => clauses.push(broken_record_sql()),
         IssueView::SitemapOrphan => clauses
             .push("in_sitemap != 0 AND inlink_count = 0 AND classification = 'internal'".to_string()),
@@ -5871,6 +6582,7 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
             "h2",
             "canonical",
             "amphtml",
+            "meta_keywords",
             "rel_next",
             "rel_prev",
             "response_hash",
@@ -6115,6 +6827,7 @@ fn sort_column(sort_by: Option<&str>) -> Option<String> {
         Some("relNext") => Some("rel_next".to_string()),
         Some("relPrev") => Some("rel_prev".to_string()),
         Some("amphtml") => Some("amphtml".to_string()),
+        Some("metaKeywords") => Some("meta_keywords".to_string()),
         Some("wordCount") => Some("word_count".to_string()),
         Some("textToCodeRatio") => Some("text_to_code_ratio".to_string()),
         Some("imageCount") => Some("image_count".to_string()),
@@ -6140,6 +6853,13 @@ fn sort_column(sort_by: Option<&str>) -> Option<String> {
         Some("searchConsoleImpressions") => Some("search_console_impressions".to_string()),
         Some("searchConsoleCtr") => Some("search_console_ctr".to_string()),
         Some("searchConsoleAveragePosition") => Some("search_console_average_position".to_string()),
+        Some("analyticsSessions") => Some("analytics_sessions".to_string()),
+        Some("analyticsEngagedSessions") => Some("analytics_engaged_sessions".to_string()),
+        Some("analyticsConversions") => Some("analytics_conversions".to_string()),
+        Some("analyticsRevenue") => Some("analytics_revenue".to_string()),
+        Some("backlinkCount") => Some("backlink_count".to_string()),
+        Some("referringDomainCount") => Some("referring_domain_count".to_string()),
+        Some("backlinkAuthority") => Some("backlink_authority".to_string()),
         Some("nearDuplicateClusterId") => Some("near_duplicate_cluster_id".to_string()),
         Some("inlinkCount") => Some("inlink_count".to_string()),
         Some("firstInlinkSourceUrl") => Some(sqlite_first_inlink_expression("source_url")),
@@ -6926,6 +7646,7 @@ fn compact_text(value: &str) -> String {
 fn matches_view(
     row: &CrawlRecord,
     view: &IssueView,
+    thresholds: &AuditThresholds,
     title_counts: &HashMap<String, usize>,
     meta_counts: &HashMap<String, usize>,
     h1_counts: &HashMap<String, usize>,
@@ -6962,14 +7683,14 @@ fn matches_view(
         }
         IssueView::TitleTooShort => {
             let title = row.title.as_deref().unwrap_or("").trim();
-            !title.is_empty() && row.title_len < 30
+            !title.is_empty() && row.title_len < thresholds.title_min_chars
         }
-        IssueView::TitleTooLong => row.title_len > 60,
+        IssueView::TitleTooLong => row.title_len > thresholds.title_max_chars,
         IssueView::TitlePixelTooNarrow => {
             let title = row.title.as_deref().unwrap_or("").trim();
-            !title.is_empty() && row.title_pixel_width < 200
+            !title.is_empty() && row.title_pixel_width < thresholds.title_min_pixels
         }
-        IssueView::TitlePixelTooWide => row.title_pixel_width > 580,
+        IssueView::TitlePixelTooWide => row.title_pixel_width > thresholds.title_max_pixels,
         IssueView::MetaMissing => row
             .meta_description
             .as_deref()
@@ -6987,14 +7708,16 @@ fn matches_view(
         }
         IssueView::MetaTooShort => {
             let meta = row.meta_description.as_deref().unwrap_or("").trim();
-            !meta.is_empty() && row.meta_description_len < 70
+            !meta.is_empty() && row.meta_description_len < thresholds.meta_min_chars
         }
-        IssueView::MetaTooLong => row.meta_description_len > 160,
+        IssueView::MetaTooLong => row.meta_description_len > thresholds.meta_max_chars,
         IssueView::MetaPixelTooNarrow => {
             let meta = row.meta_description.as_deref().unwrap_or("").trim();
-            !meta.is_empty() && row.meta_description_pixel_width < 400
+            !meta.is_empty() && row.meta_description_pixel_width < thresholds.meta_min_pixels
         }
-        IssueView::MetaPixelTooWide => row.meta_description_pixel_width > 920,
+        IssueView::MetaPixelTooWide => {
+            row.meta_description_pixel_width > thresholds.meta_max_pixels
+        }
         IssueView::H1Missing => row.h1.as_deref().unwrap_or("").trim().is_empty(),
         IssueView::H1Duplicate => {
             row.h1
@@ -7004,7 +7727,7 @@ fn matches_view(
                 .unwrap_or(0)
                 > 1
         }
-        IssueView::H1TooLong => row.h1_len > 70,
+        IssueView::H1TooLong => row.h1_len > thresholds.h1_max_chars,
         IssueView::H2Missing => row.h2.as_deref().unwrap_or("").trim().is_empty(),
         IssueView::H2Duplicate => {
             row.h2
@@ -7014,7 +7737,7 @@ fn matches_view(
                 .unwrap_or(0)
                 > 1
         }
-        IssueView::H2TooLong => row.h2_len > 70,
+        IssueView::H2TooLong => row.h2_len > thresholds.h2_max_chars,
         IssueView::TitleSameAsH1 => {
             let title = row.title.as_deref().unwrap_or("").trim();
             let h1 = row.h1.as_deref().unwrap_or("").trim();
@@ -7075,6 +7798,10 @@ fn matches_view(
                 > 1
         }
         IssueView::ExactDuplicate => is_exact_duplicate_record(row, exact_hashes),
+        IssueView::ThinContent => row.word_count < thresholds.thin_content_words,
+        IssueView::LowTextRatio => {
+            row.text_to_code_ratio * 100.0 < f64::from(thresholds.min_text_ratio_percent)
+        }
         IssueView::BrokenLinks => is_broken_record(row),
         IssueView::SitemapOrphan => {
             row.in_sitemap
@@ -7087,7 +7814,9 @@ fn matches_view(
 fn is_html_audit_view(view: &IssueView) -> bool {
     matches!(
         view,
-        IssueView::TitleMissing
+        IssueView::ThinContent
+            | IssueView::LowTextRatio
+            | IssueView::TitleMissing
             | IssueView::TitleDuplicate
             | IssueView::TitleMultiple
             | IssueView::TitleTooShort
@@ -7276,6 +8005,12 @@ fn row_matches_search(row: &CrawlRecord, search: &str) -> bool {
             .contains(search)
         || row
             .amphtml
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains(search)
+        || row
+            .meta_keywords
             .as_deref()
             .unwrap_or("")
             .to_lowercase()
@@ -7472,6 +8207,7 @@ fn compare_rows(left: &CrawlRecord, right: &CrawlRecord, sort_by: &str) -> Order
         "relNext" => left.rel_next.cmp(&right.rel_next),
         "relPrev" => left.rel_prev.cmp(&right.rel_prev),
         "amphtml" => left.amphtml.cmp(&right.amphtml),
+        "metaKeywords" => left.meta_keywords.cmp(&right.meta_keywords),
         "wordCount" => left.word_count.cmp(&right.word_count),
         "textToCodeRatio" => left
             .text_to_code_ratio
@@ -7517,6 +8253,24 @@ fn compare_rows(left: &CrawlRecord, right: &CrawlRecord, sort_by: &str) -> Order
         ),
         "searchConsoleCtr" => {
             compare_optional_f64(left.search_console_ctr, right.search_console_ctr)
+        }
+        "analyticsSessions" => {
+            compare_optional_f64(left.analytics_sessions, right.analytics_sessions)
+        }
+        "analyticsEngagedSessions" => compare_optional_f64(
+            left.analytics_engaged_sessions,
+            right.analytics_engaged_sessions,
+        ),
+        "analyticsConversions" => {
+            compare_optional_f64(left.analytics_conversions, right.analytics_conversions)
+        }
+        "analyticsRevenue" => compare_optional_f64(left.analytics_revenue, right.analytics_revenue),
+        "backlinkCount" => left.backlink_count.cmp(&right.backlink_count),
+        "referringDomainCount" => left
+            .referring_domain_count
+            .cmp(&right.referring_domain_count),
+        "backlinkAuthority" => {
+            compare_optional_f64(left.backlink_authority, right.backlink_authority)
         }
         "searchConsoleAveragePosition" => compare_optional_f64(
             left.search_console_average_position,
@@ -9176,6 +9930,7 @@ mod tests {
             "A useful description long enough to behave like a normal result row.".to_string(),
         );
         record.meta_description_len = 68;
+        record.meta_keywords = Some("sqlite, storage".to_string());
         record.custom_extractions = vec![CustomExtractionValue {
             name: "heading".to_string(),
             values: vec!["Example".to_string()],
@@ -9198,6 +9953,292 @@ mod tests {
         assert_eq!(response.rows[0].custom_extractions[0].name, "heading");
         assert_eq!(response.rows[0].simhash, Some(u64::MAX));
         assert_eq!(response.rows[0].word_count, 250);
+        assert_eq!(
+            response.rows[0].meta_keywords.as_deref(),
+            Some("sqlite, storage")
+        );
+        let searched = store.query(GridQuery {
+            global_search: Some("STORAGE".to_string()),
+            sort_by: Some("metaKeywords".to_string()),
+            ..GridQuery::default()
+        });
+        assert_eq!(searched.total, 1);
+    }
+
+    #[test]
+    fn backlink_metrics_merge_by_url_in_both_stores() {
+        for store in [
+            ActiveStore::memory(),
+            ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+        ] {
+            let mut record = CrawlRecord::pending("https://example.com/docs/".to_string(), 0);
+            record.status_code = Some(200);
+            store.upsert(record);
+            let updated = store.merge_backlink_metrics(vec![
+                BacklinkMetricRow {
+                    url: "https://example.com/docs/#section".into(),
+                    backlinks: 42,
+                    referring_domains: 7,
+                    authority_score: None,
+                },
+                BacklinkMetricRow {
+                    url: "https://example.com/missing".into(),
+                    backlinks: 1,
+                    referring_domains: 1,
+                    authority_score: Some(1.0),
+                },
+            ]);
+            assert_eq!(updated, 1);
+            let row = store.records().remove(0);
+            assert_eq!(row.backlink_count, Some(42));
+            assert_eq!(row.referring_domain_count, Some(7));
+            assert_eq!(row.backlink_authority, None);
+            let sorted = store.query(GridQuery {
+                sort_by: Some("backlinkCount".to_string()),
+                sort_dir: SortDirection::Desc,
+                ..GridQuery::default()
+            });
+            assert_eq!(sorted.rows[0].backlink_count, Some(42));
+        }
+    }
+
+    #[test]
+    fn analytics_metrics_merge_by_host_and_path_regardless_of_scheme() {
+        for store in [
+            ActiveStore::memory(),
+            ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+        ] {
+            let mut record = CrawlRecord::pending("http://example.com/docs/".to_string(), 0);
+            record.status_code = Some(200);
+            store.upsert(record);
+            let mut other = CrawlRecord::pending("https://example.com/other".to_string(), 0);
+            other.status_code = Some(200);
+            store.upsert(other);
+            let updated = store.merge_analytics_metrics(vec![
+                AnalyticsMetricRow {
+                    url: "https://example.com/docs/".into(),
+                    sessions: 120.0,
+                    engaged_sessions: 80.0,
+                    conversions: 3.0,
+                    revenue: 12.5,
+                },
+                AnalyticsMetricRow {
+                    url: "https://example.com/missing".into(),
+                    sessions: 1.0,
+                    engaged_sessions: 1.0,
+                    conversions: 0.0,
+                    revenue: 0.0,
+                },
+            ]);
+            assert_eq!(updated, 1);
+            let rows = store.records();
+            let docs = rows
+                .iter()
+                .find(|row| row.url == "http://example.com/docs/")
+                .unwrap();
+            assert_eq!(docs.analytics_sessions, Some(120.0));
+            assert_eq!(docs.analytics_revenue, Some(12.5));
+            assert_eq!(
+                rows.iter()
+                    .find(|row| row.url == "https://example.com/other")
+                    .unwrap()
+                    .analytics_sessions,
+                None
+            );
+            let sorted = store.query(GridQuery {
+                sort_by: Some("analyticsSessions".to_string()),
+                sort_dir: SortDirection::Desc,
+                ..GridQuery::default()
+            });
+            assert_eq!(sorted.rows[0].analytics_sessions, Some(120.0));
+        }
+    }
+
+    #[test]
+    fn ai_insights_persist_per_row_in_both_stores() {
+        let insights = AiInsights {
+            intent: Some(AiIntent {
+                intent: "informational".into(),
+                confidence: 0.9,
+                rationale: "Guide".into(),
+            }),
+            meta_description: None,
+            spelling: Some(AiSpelling {
+                language: Some("en".into()),
+                issues: vec![AiLanguageIssue {
+                    text: "teh".into(),
+                    suggestion: "the".into(),
+                    kind: "spelling".into(),
+                }],
+            }),
+            model: "claude-opus-5".into(),
+            updated_at_ms: 5,
+        };
+        for store in [
+            ActiveStore::memory(),
+            ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+        ] {
+            let mut record = CrawlRecord::pending("https://example.com/a".to_string(), 0);
+            record.status_code = Some(200);
+            let saved = store.upsert(record.clone());
+            assert!(
+                store
+                    .try_save_ai_insights(saved.id + 9, insights.clone())
+                    .is_err()
+            );
+            store
+                .try_save_ai_insights(saved.id, insights.clone())
+                .unwrap();
+            assert_eq!(store.records()[0].ai_insights, Some(insights.clone()));
+            store.upsert(record);
+            assert_eq!(store.records()[0].ai_insights, Some(insights.clone()));
+        }
+    }
+
+    #[test]
+    fn field_vitals_snapshots_persist_per_row_and_survive_upserts() {
+        let snapshot = FieldVitalsSnapshot {
+            form_factor: FieldFormFactor::Phone,
+            requested_url: "https://example.com/a".into(),
+            completed_at_ms: 1_700_000_000_000,
+            has_data: true,
+            lcp_ms_p75: Some(2100.0),
+            cls_p75: Some(0.05),
+            inp_ms_p75: Some(180.0),
+            fcp_ms_p75: None,
+            ttfb_ms_p75: Some(600.0),
+            collection_period_start: Some("2026-08-15".into()),
+            collection_period_end: Some("2026-09-11".into()),
+        };
+        let record = || {
+            let mut record = CrawlRecord::pending("https://example.com/a".to_string(), 0);
+            record.status_code = Some(200);
+            record
+        };
+        for store in [
+            ActiveStore::memory(),
+            ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+        ] {
+            let saved = store.upsert(record());
+            assert!(
+                store
+                    .try_save_field_vitals(saved.id + 99, snapshot.clone())
+                    .is_err()
+            );
+            store
+                .try_save_field_vitals(saved.id, snapshot.clone())
+                .unwrap();
+            assert_eq!(store.records()[0].field_vitals, Some(snapshot.clone()));
+            // A recrawl without field data keeps the saved snapshot.
+            store.upsert(record());
+            assert_eq!(store.records()[0].field_vitals, Some(snapshot.clone()));
+            assert!(
+                store
+                    .try_save_field_vitals(
+                        saved.id,
+                        FieldVitalsSnapshot {
+                            lcp_ms_p75: Some(f64::NAN),
+                            ..snapshot.clone()
+                        }
+                    )
+                    .is_err()
+            );
+        }
+        // Archives written before field data existed still load.
+        let mut value = serde_json::to_value(record()).unwrap();
+        value.as_object_mut().unwrap().remove("fieldVitals");
+        let restored: CrawlRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.field_vitals, None);
+    }
+
+    #[test]
+    fn audit_thresholds_drive_length_views_in_memory_and_sqlite() {
+        let mut record = CrawlRecord::pending("https://example.com/a".to_string(), 0);
+        record.status_code = Some(200);
+        record.content_type = Some("text/html".to_string());
+        record.title = Some("A title with forty five characters in it!".to_string());
+        record.title_len = 45;
+        record.title_pixel_width = 300;
+        record.h1 = Some("Heading".to_string());
+        record.h1_len = 7;
+        record.word_count = 500;
+        record.text_to_code_ratio = 0.5;
+        let memory = MemoryStore::new();
+        memory.upsert(record.clone());
+        let sqlite = SqliteStore::in_memory().unwrap();
+        sqlite.upsert(record);
+        let count = |view: IssueView, thresholds: AuditThresholds| {
+            let query = GridQuery {
+                view,
+                thresholds,
+                ..GridQuery::default()
+            };
+            (memory.query(query.clone()).total, sqlite.query(query).total)
+        };
+        let defaults = AuditThresholds::default();
+        assert_eq!(count(IssueView::TitleTooShort, defaults), (0, 0));
+        assert_eq!(count(IssueView::TitleTooLong, defaults), (0, 0));
+        let strict = AuditThresholds {
+            title_min_chars: 50,
+            title_max_chars: 60,
+            title_min_pixels: 350,
+            h1_max_chars: 5,
+            ..defaults
+        };
+        assert_eq!(count(IssueView::TitleTooShort, strict), (1, 1));
+        assert_eq!(count(IssueView::TitlePixelTooNarrow, strict), (1, 1));
+        assert_eq!(count(IssueView::H1TooLong, strict), (1, 1));
+        let loose = AuditThresholds {
+            title_max_chars: 40,
+            ..defaults
+        };
+        assert_eq!(count(IssueView::TitleTooLong, loose), (1, 1));
+        // Thin content and text ratio use the same thresholds in both stores.
+        let mut thin = CrawlRecord::pending("https://example.com/thin".to_string(), 0);
+        thin.status_code = Some(200);
+        thin.content_type = Some("text/html".to_string());
+        thin.word_count = 50;
+        thin.text_to_code_ratio = 0.04;
+        memory.upsert(thin.clone());
+        sqlite.upsert(thin);
+        assert_eq!(count(IssueView::ThinContent, defaults), (1, 1));
+        assert_eq!(count(IssueView::LowTextRatio, defaults), (1, 1));
+        let relaxed = AuditThresholds {
+            thin_content_words: 10,
+            min_text_ratio_percent: 1,
+            ..defaults
+        };
+        assert_eq!(count(IssueView::ThinContent, relaxed), (0, 0));
+        assert_eq!(count(IssueView::LowTextRatio, relaxed), (0, 0));
+        assert!(
+            AuditThresholds {
+                min_text_ratio_percent: 101,
+                ..defaults
+            }
+            .validate()
+            .is_err()
+        );
+        // Serialized queries without thresholds keep the defaults.
+        let restored: GridQuery =
+            serde_json::from_str(r#"{"offset":0,"limit":10,"sortDir":"asc","view":"all"}"#)
+                .unwrap();
+        assert_eq!(restored.thresholds, defaults);
+        assert!(
+            AuditThresholds {
+                title_min_chars: 70,
+                ..defaults
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            AuditThresholds {
+                h1_max_chars: 0,
+                ..defaults
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,19 +1,13 @@
 use ferrous_frog_storage::{
-    CanonicalDiagnostics, CrawlRecord, Issue, IssueView, ReferenceDiagnostics, Severity,
-    exact_duplicate_hashes, is_exact_duplicate_record, is_no_response_record,
+    AuditThresholds, CanonicalDiagnostics, CrawlRecord, Issue, IssueView, ReferenceDiagnostics,
+    Severity, exact_duplicate_hashes, is_exact_duplicate_record, is_no_response_record,
     is_success_html_record, is_success_record, reference_diagnostics,
 };
 use std::collections::HashMap;
 
-const TITLE_MIN: usize = 30;
-const TITLE_MAX: usize = 60;
-const META_MIN: usize = 70;
-const META_MAX: usize = 160;
-const H1_MAX: usize = 70;
-const H2_MAX: usize = 70;
 const IMAGE_ALT_MAX: usize = 125;
 
-pub fn analyze_records(records: &[CrawlRecord]) -> Vec<Issue> {
+pub fn analyze_records(records: &[CrawlRecord], thresholds: &AuditThresholds) -> Vec<Issue> {
     let html_records = records
         .iter()
         .filter(|record| is_success_html_record(record));
@@ -51,13 +45,14 @@ pub fn analyze_records(records: &[CrawlRecord]) -> Vec<Issue> {
         if !is_success_html_record(record) {
             continue;
         }
-        title_issues(record, &title_counts, &mut issues);
-        meta_issues(record, &meta_counts, &mut issues);
-        h1_issues(record, &h1_counts, &mut issues);
-        h2_issues(record, &h2_counts, &mut issues);
+        title_issues(record, &title_counts, thresholds, &mut issues);
+        meta_issues(record, &meta_counts, thresholds, &mut issues);
+        h1_issues(record, &h1_counts, thresholds, &mut issues);
+        h2_issues(record, &h2_counts, thresholds, &mut issues);
         canonical_issues(record, references.canonical, &mut issues);
         reference_target_issues(record, references, &mut issues);
         image_issues(record, &mut issues);
+        content_issues(record, thresholds, &mut issues);
         mobile_issues(record, &mut issues);
         hreflang_issues(record, &mut issues);
         structured_data_issues(record, &mut issues);
@@ -118,7 +113,12 @@ fn response_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
     }
 }
 
-fn title_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &mut Vec<Issue>) {
+fn title_issues(
+    record: &CrawlRecord,
+    counts: &HashMap<String, usize>,
+    thresholds: &AuditThresholds,
+    issues: &mut Vec<Issue>,
+) {
     if let Some(count) = record.title_count.filter(|count| *count > 1) {
         issues.push(issue(
             "title.multiple",
@@ -151,23 +151,29 @@ fn title_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &
         ));
     }
 
-    if record.title_len < TITLE_MIN {
+    if record.title_len < thresholds.title_min_chars {
         issues.push(issue(
             "title.too_short",
             IssueView::TitleTooShort,
             Severity::Info,
             record,
-            format!("Page title is shorter than {TITLE_MIN} characters"),
+            format!(
+                "Page title is shorter than {} characters",
+                thresholds.title_min_chars
+            ),
         ));
     }
 
-    if record.title_len > TITLE_MAX {
+    if record.title_len > thresholds.title_max_chars {
         issues.push(issue(
             "title.too_long",
             IssueView::TitleTooLong,
             Severity::Warning,
             record,
-            format!("Page title is longer than {TITLE_MAX} characters"),
+            format!(
+                "Page title is longer than {} characters",
+                thresholds.title_max_chars
+            ),
         ));
     }
 
@@ -184,7 +190,12 @@ fn title_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &
     }
 }
 
-fn meta_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &mut Vec<Issue>) {
+fn meta_issues(
+    record: &CrawlRecord,
+    counts: &HashMap<String, usize>,
+    thresholds: &AuditThresholds,
+    issues: &mut Vec<Issue>,
+) {
     if let Some(count) = record.meta_description_count.filter(|count| *count > 1) {
         issues.push(issue(
             "meta_description.multiple",
@@ -217,28 +228,39 @@ fn meta_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &m
         ));
     }
 
-    if record.meta_description_len < META_MIN {
+    if record.meta_description_len < thresholds.meta_min_chars {
         issues.push(issue(
             "meta_description.too_short",
             IssueView::MetaTooShort,
             Severity::Info,
             record,
-            format!("Meta description is shorter than {META_MIN} characters"),
+            format!(
+                "Meta description is shorter than {} characters",
+                thresholds.meta_min_chars
+            ),
         ));
     }
 
-    if record.meta_description_len > META_MAX {
+    if record.meta_description_len > thresholds.meta_max_chars {
         issues.push(issue(
             "meta_description.too_long",
             IssueView::MetaTooLong,
             Severity::Warning,
             record,
-            format!("Meta description is longer than {META_MAX} characters"),
+            format!(
+                "Meta description is longer than {} characters",
+                thresholds.meta_max_chars
+            ),
         ));
     }
 }
 
-fn h1_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &mut Vec<Issue>) {
+fn h1_issues(
+    record: &CrawlRecord,
+    counts: &HashMap<String, usize>,
+    thresholds: &AuditThresholds,
+    issues: &mut Vec<Issue>,
+) {
     let h1 = record.h1.as_deref().unwrap_or("").trim();
     if h1.is_empty() {
         issues.push(issue(
@@ -262,18 +284,23 @@ fn h1_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &mut
         ));
     }
 
-    if record.h1_len > H1_MAX {
+    if record.h1_len > thresholds.h1_max_chars {
         issues.push(issue(
             "h1.too_long",
             IssueView::H1TooLong,
             Severity::Info,
             record,
-            format!("H1 is longer than {H1_MAX} characters"),
+            format!("H1 is longer than {} characters", thresholds.h1_max_chars),
         ));
     }
 }
 
-fn h2_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &mut Vec<Issue>) {
+fn h2_issues(
+    record: &CrawlRecord,
+    counts: &HashMap<String, usize>,
+    thresholds: &AuditThresholds,
+    issues: &mut Vec<Issue>,
+) {
     let h2 = record.h2.as_deref().unwrap_or("").trim();
     if h2.is_empty() {
         issues.push(issue(
@@ -297,13 +324,13 @@ fn h2_issues(record: &CrawlRecord, counts: &HashMap<String, usize>, issues: &mut
         ));
     }
 
-    if record.h2_len > H2_MAX {
+    if record.h2_len > thresholds.h2_max_chars {
         issues.push(issue(
             "h2.too_long",
             IssueView::H2TooLong,
             Severity::Info,
             record,
-            format!("H2 is longer than {H2_MAX} characters"),
+            format!("H2 is longer than {} characters", thresholds.h2_max_chars),
         ));
     }
 }
@@ -476,6 +503,37 @@ fn directive_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
             Severity::Info,
             record,
             "URL is marked noindex".to_string(),
+        ));
+    }
+}
+
+fn content_issues(record: &CrawlRecord, thresholds: &AuditThresholds, issues: &mut Vec<Issue>) {
+    if !is_success_html_record(record) {
+        return;
+    }
+    if record.word_count < thresholds.thin_content_words {
+        issues.push(issue(
+            "content.thin",
+            IssueView::ThinContent,
+            Severity::Info,
+            record,
+            format!(
+                "Page has {} words, below the {}-word thin-content threshold",
+                record.word_count, thresholds.thin_content_words
+            ),
+        ));
+    }
+    if record.text_to_code_ratio * 100.0 < f64::from(thresholds.min_text_ratio_percent) {
+        issues.push(issue(
+            "content.low_text_ratio",
+            IssueView::LowTextRatio,
+            Severity::Info,
+            record,
+            format!(
+                "Visible text is {:.1}% of the HTML, below the {}% minimum",
+                record.text_to_code_ratio * 100.0,
+                thresholds.min_text_ratio_percent
+            ),
         ));
     }
 }
@@ -771,7 +829,7 @@ mod tests {
         let mut records = vec![record.clone()];
         record.indexability_status = "Response body incomplete".into();
         records.push(record);
-        let issues = analyze_records(&records);
+        let issues = analyze_records(&records, &AuditThresholds::default());
         let rules: Vec<_> = issues
             .iter()
             .filter(|issue| issue.rule_id.ends_with(".multiple"))
@@ -798,7 +856,10 @@ mod tests {
         target.status_code = Some(404);
         let mut incomplete = source.clone();
         incomplete.indexability_status = "Response body incomplete".into();
-        let issues = analyze_records(&[source.clone(), target, incomplete]);
+        let issues = analyze_records(
+            &[source.clone(), target, incomplete],
+            &AuditThresholds::default(),
+        );
         let amp: Vec<_> = issues
             .iter()
             .filter(|issue| issue.rule_id == "amp.to_error")
@@ -831,7 +892,7 @@ mod tests {
             page("unknown", Some("unknown-target"), None),
             incomplete,
         ];
-        let issues = analyze_records(&rows);
+        let issues = analyze_records(&rows, &AuditThresholds::default());
         let reciprocity: Vec<_> = issues
             .iter()
             .filter(|issue| issue.rule_id.ends_with("_non_reciprocal"))
@@ -895,7 +956,7 @@ mod tests {
             page("linear-b", None, Some("linear-a")),
             incomplete,
         ];
-        let issues = analyze_records(&rows);
+        let issues = analyze_records(&rows, &AuditThresholds::default());
         let loops: Vec<_> = issues
             .iter()
             .filter(|issue| {
@@ -946,14 +1007,17 @@ mod tests {
         blocked.error = Some("Blocked by robots.txt".into());
         let mut incomplete = source.clone();
         incomplete.indexability_status = "Response body incomplete".into();
-        let issues = analyze_records(&[
-            source.clone(),
-            missing,
-            failed,
-            unknown,
-            blocked,
-            incomplete,
-        ]);
+        let issues = analyze_records(
+            &[
+                source.clone(),
+                missing,
+                failed,
+                unknown,
+                blocked,
+                incomplete,
+            ],
+            &AuditThresholds::default(),
+        );
         let pagination: Vec<_> = issues
             .iter()
             .filter(|issue| issue.rule_id.starts_with("pagination."))
@@ -1001,7 +1065,7 @@ mod tests {
             page("b", "a"),
             page("self", "self"),
         ];
-        let issues = analyze_records(&records);
+        let issues = analyze_records(&records, &AuditThresholds::default());
         for (rule, paths, severity) in [
             (
                 "canonical.uncrawled",
@@ -1052,7 +1116,7 @@ mod tests {
         missing.status_code = Some(404);
         missing.content_type = Some("text/html".to_string());
 
-        let issues = analyze_records(&[page, image, missing]);
+        let issues = analyze_records(&[page, image, missing], &AuditThresholds::default());
         for view in [
             IssueView::TitleMissing,
             IssueView::MetaMissing,
@@ -1091,7 +1155,7 @@ mod tests {
         failed.final_url = "https://example.com/failed".to_string();
         failed.status_code = Some(500);
 
-        let issues = analyze_records(&[page, failed]);
+        let issues = analyze_records(&[page, failed], &AuditThresholds::default());
         for view in [
             IssueView::TitleDuplicate,
             IssueView::MetaDuplicate,
@@ -1113,9 +1177,12 @@ mod tests {
         repeated.final_url.push_str("#section");
         repeated.storage_key = "list:2:https://example.test/a".into();
         assert!(
-            analyze_records(&[first.clone(), repeated.clone()])
-                .iter()
-                .all(|issue| issue.rule_id != "content.exact_duplicate")
+            analyze_records(
+                &[first.clone(), repeated.clone()],
+                &AuditThresholds::default()
+            )
+            .iter()
+            .all(|issue| issue.rule_id != "content.exact_duplicate")
         );
 
         let mut second = first.clone();
@@ -1130,7 +1197,10 @@ mod tests {
         let mut incomplete = first.clone();
         incomplete.final_url = "https://example.test/incomplete".into();
         incomplete.indexability_status = "Response body incomplete".into();
-        let issues = analyze_records(&[first, second, repeated, failed, incomplete]);
+        let issues = analyze_records(
+            &[first, second, repeated, failed, incomplete],
+            &AuditThresholds::default(),
+        );
         let exact = issues
             .iter()
             .filter(|issue| issue.rule_id == "content.exact_duplicate")
@@ -1156,7 +1226,10 @@ mod tests {
         redirect.status_code = Some(302);
         redirect.error = Some("Redirect response missing Location header".to_string());
 
-        let issues = analyze_records(&[blocked, pending, failed, redirect]);
+        let issues = analyze_records(
+            &[blocked, pending, failed, redirect],
+            &AuditThresholds::default(),
+        );
         assert_eq!(issues.len(), 2);
         assert!(issues.iter().any(|issue| {
             issue.view == IssueView::NoResponse && issue.url == "https://example.com/failed"
@@ -1164,6 +1237,58 @@ mod tests {
         assert!(issues.iter().any(|issue| {
             issue.view == IssueView::BrokenLinks && issue.url == "https://example.com/redirect"
         }));
+    }
+
+    #[test]
+    fn thresholds_change_length_issues_and_messages() {
+        let mut record = CrawlRecord::pending("https://example.test/".to_string(), 0);
+        record.status_code = Some(200);
+        record.content_type = Some("text/html".into());
+        record.title = Some("A title with forty five characters in it!".into());
+        record.title_len = 45;
+        record.meta_description = Some("A description".into());
+        record.meta_description_len = 100;
+        record.h1 = Some("Heading".into());
+        record.h1_len = 7;
+        record.word_count = 500;
+        record.text_to_code_ratio = 0.4;
+        let ids = |thresholds: AuditThresholds| {
+            analyze_records(std::slice::from_ref(&record), &thresholds)
+                .into_iter()
+                .filter(|issue| {
+                    issue.rule_id.contains("too_") || issue.rule_id.starts_with("content.")
+                })
+                .map(|issue| (issue.rule_id.clone(), issue.message.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert!(ids(AuditThresholds::default()).is_empty());
+        let strict = AuditThresholds {
+            title_min_chars: 50,
+            meta_max_chars: 90,
+            h1_max_chars: 5,
+            ..AuditThresholds::default()
+        };
+        let issues = ids(strict);
+        assert_eq!(
+            issues.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            [
+                "title.too_short",
+                "meta_description.too_long",
+                "h1.too_long"
+            ]
+        );
+        assert!(issues[0].1.contains("50"));
+        assert!(issues[1].1.contains("90"));
+        let thin = ids(AuditThresholds {
+            thin_content_words: 600,
+            min_text_ratio_percent: 50,
+            ..AuditThresholds::default()
+        });
+        assert_eq!(
+            thin.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            ["content.thin", "content.low_text_ratio"]
+        );
+        assert!(thin[0].1.contains("600"));
     }
 
     #[test]
@@ -1213,7 +1338,7 @@ mod tests {
         first.near_duplicate_cluster_id = Some(1);
         second.near_duplicate_cluster_id = Some(1);
 
-        let issues = analyze_records(&[first, second]);
+        let issues = analyze_records(&[first, second], &AuditThresholds::default());
 
         assert!(
             issues

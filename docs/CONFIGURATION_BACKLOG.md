@@ -1,6 +1,6 @@
 # Configuration Coverage And Implementation Backlog
 
-Reviewed on 2026-09-09 against the current repository, the supplied reference screenshots, the public [configuration index](https://www.screamingfrog.co.uk/seo-spider/user-guide/), and relevant [configuration guidance](https://www.screamingfrog.co.uk/seo-spider/user-guide/configuration/). The scope includes the full settings families, beyond the screenshots. Detailed provider parameters will be verified against each provider's current API when implemented.
+Reviewed on 2026-09-12 against the current repository, the supplied reference screenshots, the public [configuration index](https://www.screamingfrog.co.uk/seo-spider/user-guide/), and relevant [configuration guidance](https://www.screamingfrog.co.uk/seo-spider/user-guide/configuration/). The scope includes the full settings families, beyond the screenshots. Detailed provider parameters will be verified against each provider's current API when implemented.
 
 Status describes Ferrous Frog: **Available** means a working setting exists; **Partial** means capture, engine support, or a smaller workflow exists; **Missing** means implementation is still required. A report or captured field does not imply its configuration is complete. This is a backlog, not a feature availability claim.
 
@@ -38,10 +38,10 @@ Evidence: `CrawlConfig`, `CrawlResourceTypes`, scope/frontier code in [crawler-c
 
 | ID | Control/workflow | Current state and remaining work |
 | --- | --- | --- |
-| CR-01 | Resource matrix | Partial: HTML, images, CSS, JavaScript, external and other-file crawl toggles. Add independent storage choices and explicit media discovery. |
-| CR-02 | Hyperlink matrix | Partial: links are captured and queued; optional external checks now fetch linked URLs without expanding external pages. Separate internal/external fetching from edge retention, without losing source diagnostics. |
+| CR-01 | Resource matrix | Partial: HTML, images, CSS, JavaScript, external and other-file crawl toggles with separate default-on store choices; crawled types are always stored, and uncrawled types with store off drop their edges, counts and image references. Add explicit media discovery. |
+| CR-02 | Hyperlink matrix | Partial: links are captured and queued; optional external checks fetch linked URLs without expanding external pages. Separate internal/external store choices retain or drop edges and inlink/outlink counts for hyperlinks that are not crawled; crawled hyperlinks are always stored. Source diagnostics for dropped links are not retained. |
 | CR-03 | Alternate-link matrix | Partial: canonical, hreflang, pagination and AMP metadata is captured, with independent default-off Spider discovery controls for each type. Repeated HTTP Link canonicals and rendered references follow existing request/scope/robots/resource/nofollow/depth rules; List/Exact URL do not expand. Metadata and hyperlink counts remain unchanged. Independent retention, stored reference-source attribution and generic/mobile alternates remain missing. |
-| CR-04 | Embedded navigation | Missing: explicit meta-refresh, iframe and mobile-alternate discovery/retention rules and source labels. |
+| CR-04 | Embedded navigation | Partial: default-off meta-refresh and iframe discovery follows the reference-link rules (scope, robots, resources, nofollow, depth; not in List/Exact URL). Retention of the targets on records, source labels and mobile-alternate discovery remain missing. |
 | CR-05 | Legacy assets | Partial: generic other-file crawling. Keep SWF as an asset type if needed; no Flash execution. |
 | CR-06 | Folder boundary | Available: start-folder/exact-folder rules and separate one-hop checking outside the start folder without expanding those pages. Redirect, resume, robots, resource and nofollow rules remain enforced. |
 | CR-07 | Subdomain boundary | Available: explicit all-subdomain scope uses the bundled Public Suffix List including private suffixes; IP, local and unknown-suffix hosts remain exact. Existing host/descendant profiles keep their original boundaries. |
@@ -49,7 +49,7 @@ Evidence: `CrawlConfig`, `CrawlResourceTypes`, scope/frontier code in [crawler-c
 | CR-09 | Invalid references | Partial: URL normalization discards malformed targets. Retain diagnostic references without issuing invalid requests. |
 | CR-10 | Sitemap sources | Available: persisted Spider master switch, seed-origin robots-advertised discovery, origin probe, HTML-linked sources and explicit URLs. Indexes recurse with document/depth/URL bounds, shared request policy and cross-source deduplication. Late discoveries update stored membership. Exact URL disables discovery; List inputs remain independent. |
 | CR-11 | URL transformations | Partial: sorting, stripping and limiting query parameters exist. Add ordered rewrite rules with before/after preview and collision diagnostics. |
-| CR-12 | Host aliases/CDNs | Missing: explicit host classification with clear separation from permissions to crawl external hosts. |
+| CR-12 | Host aliases/CDNs | Available: CDN host entries with optional path prefixes classify matching URLs as internal for links, records, scope and resource rules; external crawl permission stays separate. Host aliases for duplicate-site detection remain missing. |
 
 ## Extraction And Audit Inputs
 
@@ -57,7 +57,7 @@ Evidence: `PageSignals` and fixture tests in [parser](../crates/parser/src/lib.r
 
 | ID | Control/workflow | Current state and remaining work |
 | --- | --- | --- |
-| EX-01 | Metadata selection | Partial: titles, descriptions, headings and directives are captured. Add field-group switches and meta-keyword capture. |
+| EX-01 | Metadata selection | Partial: titles, descriptions, meta keywords, headings and directives are captured; meta keywords are searchable, sortable and exported. Field-group switches remain missing. |
 | EX-02 | Text statistics | Partial: word count, text/code ratio and near-duplicate fingerprints use configurable include/exclude regions. Exact response hashes retain full-body scope. Readability analysis remains missing. |
 | EX-03 | Response details | Partial: timings, hashes, size and selected header flags exist, with bounded Rust HTTP response reads. Add optional complete headers and separate browser download limits. |
 | EX-04 | Structured markup | Partial: JSON-LD syntax and selected schema checks exist. Add extraction switches, richer validation and Microdata/RDFa handling. |
@@ -75,8 +75,8 @@ Evidence: `CrawlConfig`, `RequestPolicy`, normalization and retry functions in [
 | --- | --- | --- |
 | LM-01 | Total/depth budgets | Available: total URLs, link depth and redirect count. Keep behavior consistent across fresh and resumed runs. |
 | LM-02 | Group quotas | Missing: budgets per depth, host and path pattern; persist counters in resumable state. |
-| LM-03 | Path depth | Missing: folder-count limit distinct from link depth. |
-| LM-04 | URL/link bounds | Missing: maximum URL length and links retained/discovered per document, with truncation diagnostics. |
+| LM-03 | Path depth | Available: max folder depth counts directory segments of discovered URLs, separate from link depth; 0 is unlimited. |
+| LM-04 | URL/link bounds | Partial: max URL length and max links queued per page exist (0 = unlimited); link evidence stays complete. Per-document retained-link caps and truncation diagnostics remain missing. |
 | LM-05 | Download bounds | Partial: Rust HTTP responses have a persisted 20 MiB default limit, adjustable up to 1 GiB, checked during decoded streaming for pages, robots.txt and sitemaps. Incomplete HTML retains HTTP evidence and is excluded from on-page audits. Chromium network downloads still need separate bounds. |
 | LM-06 | Query limits | Available: retained parameter cap. Distinct URL-variant budgets are missing. |
 | LM-07 | Pacing | Available: concurrency, per-host rate and request spacing. Maintain the same policy for redirects, sitemaps and rendered HTTP requests. |
@@ -105,7 +105,7 @@ The [JavaScript crawling guide](https://www.screamingfrog.co.uk/seo-spider/tutor
 | AD-05 | HTTPS policy | Partial: HTTPS and security headers are inspected. Add explicit HSTS handling with recorded synthetic transitions. |
 | AD-06 | Fragment checks | Missing: optional anchor/bookmark validation, separate from normal fragment-free URL identity. |
 | AD-07 | HTML validation | Partial: duplicate IDs and deprecated tags. Add configurable validation with contextual evidence. |
-| AD-08 | Missing MIME type | Missing: explicit fallback behavior; distinguish inferred content type from received headers. |
+| AD-08 | Missing MIME type | Available: responses without a Content-Type header whose body starts with an HTML document are recorded as `text/html (inferred)` and audited as HTML; other typeless responses keep an empty content type. |
 | AD-09 | Environmental estimate | Missing, low priority: optional transfer-based estimate with disclosed assumptions; no misleading precision. |
 
 ## Content And Thresholds
@@ -117,12 +117,12 @@ The supplied Content screen and [duplicate-analysis guide](https://www.screaming
 | CT-01 | Analysis region | Available: persisted include/exclude CSS selectors and bounded pasted-HTML text preview share the crawl parser. Overlap is deduplicated, exclusions win, unmatched includes yield no text. Only text metrics/fingerprints change; metadata/discovery and exact response hashes retain their scope. DOM selection does not evaluate computed CSS visibility; existing records require recrawling. |
 | CT-02 | Duplicate policy | Partial: exact metadata duplicates, near-duplicate clusters and an Exact Response Duplicates audit with grid/count/workbook evidence. Complete successful HTML with equal decoded-response hashes must span distinct normalized final URLs; repeated List rows or aliases alone do not qualify. Hash scope is independent of rendering/content regions. Configurable eligibility, similarity interpretation and paired text evidence remain missing. |
 | CT-03 | Duplicate inspection | Missing: paired content evidence and recomputation after policy edits; depends on bounded text retention. |
-| CT-04 | Language quality | Missing: spelling/grammar settings, language selection, ignore lists, dictionary controls and evidence views. |
-| CT-05 | Semantic analysis | Missing: optional embeddings, model/dimensions, similarity thresholds, privacy/cost controls and result provenance. |
-| TH-01 | Metadata thresholds | Partial: fixed character/pixel checks. Add typed shared settings consumed by memory, SQLite, analysis, UI and exports. |
-| TH-02 | Content/image thresholds | Partial: fixed word, heading, alt-length and asset-size checks. Expose validated limits and units. |
+| CT-04 | Language quality | Partial: the AI tab reports spelling/grammar issues with suggestions and the detected language per URL. Dictionary controls, ignore lists and bulk evidence views remain missing. |
+| CT-05 | Semantic analysis | Partial: Settings > AI configures the provider, model, rate limit and page-text bound; intent classification and meta description drafts record the model and time. Embeddings and similarity analysis remain missing. |
+| TH-01 | Metadata thresholds | Available: Settings > Thresholds edits title/description character and pixel limits plus H1/H2 lengths. One typed setting drives memory and SQLite views, analysis issues and the HTML report; XLSX/CSV rows carry raw lengths. |
+| TH-02 | Content/image thresholds | Partial: heading lengths, the HTML report's large-image limit, the thin-content word count and the minimum text ratio are configurable. Alt-length and oversized-image flags stay fixed at capture time. |
 | TH-03 | Link thresholds | Missing: configurable depth, internal/external outlink counts and weak-anchor patterns. |
-| TH-04 | Reset/reanalyse | Missing: named threshold presets, reset defaults and invalidation of affected derived results. |
+| TH-04 | Reset/reanalyse | Partial: a reset-to-defaults action exists and views re-query immediately because thresholds are evaluated per query. Named presets remain missing. |
 
 ## Custom Processing
 
@@ -141,15 +141,15 @@ The API provider and authentication groups are explicitly requested in the suppl
 
 | ID | Control/workflow | Current state and remaining work |
 | --- | --- | --- |
-| API-01 | Search Console | Partial: token keyring, property input, connection test and metric merge. Add OAuth refresh, dates/dimensions/filters, quotas and URL inspection. |
-| API-02 | GA4 | Partial: metric types only. Add account/property selection, date range, metrics, filters, URL matching and merge. |
-| API-03 | PageSpeed | Partial: manual selected-URL Mobile/Desktop measurements, four category scores and lab LCP/CLS/TBT, optional OS-keyring API key, cancellation, 90-second/16-MiB request bounds and latest-result row/archive persistence. No INP measurement. Add bulk scheduling, category controls, quota-aware retry/resume, history and dedicated grid/export fields. |
-| API-04 | Field performance | Missing: field-data provider and URL merge with collection period, missing-data state and device strategy. Keep field measurements distinct from Lighthouse lab data. |
-| API-05 | Backlink services | Missing: separate Majestic, Ahrefs and Moz adapters with their own account/metric/index/quota settings; shared URL merge contracts already exist. |
+| API-01 | Search Console | Partial: a connected Google account (desktop OAuth client, loopback + PKCE, automatic refresh) or a pasted token, property input, connection test and metric merge with a date range. Dimension/filter choices, quotas and URL inspection remain missing. |
+| API-02 | GA4 | Partial: property ID, date range and merge of sessions/engaged sessions/key events/revenue by host and path through the connected Google account, with grid/export columns. Property listing, filters and custom metrics remain missing. |
+| API-03 | PageSpeed | Available: selected-URL and bulk selected-row Mobile/Desktop measurements with Lighthouse category choices, optional OS-keyring API key, cancellation, quota-aware retry with resume, 90-second/16-MiB request bounds, latest-result persistence, grid columns and CSV/XLSX fields. No INP measurement and no result history. |
+| API-04 | Field performance | Partial: the Chrome UX Report provider fetches p75 LCP/INP/CLS/FCP/TTFB per form factor with the collection period and a no-data state for the selected URL, stored per row beside the Lighthouse snapshot. Bulk fetching and grid/export columns remain missing. |
+| API-05 | Backlink services | Partial: a generic endpoint-template adapter with an OS-stored credential header merges backlink, referring-domain and authority values per URL. Majestic, Ahrefs and Moz specific adapters, index choices and quota handling remain missing. |
 | API-06 | Provider-derived URLs | Missing: opt-in discovery, orphan comparison and provenance for URLs absent from the crawl. |
 | API-07 | Optional AI providers | Missing: remote/local provider configuration, keyring, model selection, bounded prompt execution, testing and reusable prompts. Keep Phase 5 priority. |
-| AU-01 | HTTP authentication | Missing: basic/digest support with origin-scoped credentials and redirect leakage tests. |
-| AU-02 | Interactive login | Missing: form login, cookie transfer, expiry/logout detection and resumable authenticated crawls. |
+| AU-01 | HTTP authentication | Available: Basic and Digest (MD5, qop=auth) credentials are saved in the OS credential store, enabled per configuration and used only for the starting origin; engine tests cover internal/external requests, the RFC digest vector, one challenge retry and serialized profiles. Browser-rendering authentication remains missing. |
+| AU-02 | Interactive login | Partial: form login posts saved credentials once with configurable field names and extra fields; the cookie jar carries the session through the crawl (engine test with a cookie-gated site). Expiry/logout detection, browser cookie transfer and resumable authenticated sessions remain missing. |
 | AU-03 | Login profiles | Missing: named credential references and safe profile import/export; never serialize passwords or tokens into plain settings. |
 
 Universal Analytics from the older screenshot is retired; target GA4 and optional historical-file import instead of a new live UA connector. See [Google's migration timeline](https://support.google.com/analytics/answer/11583528).
@@ -182,7 +182,7 @@ Evidence: storage/session commands, release handling and theme initialization in
 | OP-02 | Resource budget | Partial: capacity estimates. Add measured memory/disk limits and backpressure; Rust does not need a Java heap-allocation setting. |
 | OP-03 | Retention | Missing: opt-in age/count limits, preview of affected sessions and pinned-session protection. |
 | OP-04 | Notifications | Partial: release checks/reminders. Add crawl-completion and failure notifications; optional delivery adapters later. |
-| OP-05 | Automation | Missing: CLI, scheduling and report presets; retain Phase 5 sequencing. |
+| OP-05 | Automation | Partial: headless CLI (crawl/list, profiles, export presets), automatic preset exports, completion webhook, desktop notification and in-app once/interval schedules exist. OS-level scheduling while the app is closed remains outside scope; combine the CLI with cron or Task Scheduler for that. |
 | OP-06 | Local tool access | Missing, later: optional MCP endpoint with explicit access controls and bounded queries, after headless commands stabilize. |
 
 ## Acceptance For Every New Setting

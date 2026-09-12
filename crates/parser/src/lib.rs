@@ -90,6 +90,8 @@ pub struct PageSignals {
     pub meta_description_count: usize,
     pub meta_description_len: usize,
     pub meta_description_pixel_width: u32,
+    #[serde(default)]
+    pub meta_keywords: Option<String>,
     pub meta_robots: Option<String>,
     pub h1: Option<String>,
     pub h1_len: usize,
@@ -142,6 +144,8 @@ pub enum PageReferenceKind {
     Hreflang,
     Pagination,
     Amp,
+    MetaRefresh,
+    Iframe,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -243,6 +247,7 @@ pub fn parse_html_with_content(
     let document = Html::parse_document(html);
     let title = first_text(&document, "title");
     let meta_description = meta_content(&document, "description");
+    let meta_keywords = meta_content(&document, "keywords");
     let (title_count, meta_description_count) = metadata_tag_counts(&document);
     let meta_robots = meta_content(&document, "robots");
     let h1 = first_text(&document, "h1");
@@ -304,6 +309,7 @@ pub fn parse_html_with_content(
         meta_description_count,
         meta_description_len,
         meta_description_pixel_width,
+        meta_keywords,
         meta_robots,
         h1,
         h1_len,
@@ -721,7 +727,50 @@ fn reference_links(document: &Html, base_url: &Url) -> Vec<PageReferenceLink> {
             }
         }
     }
+    for node in document
+        .select(&selector("meta[http-equiv][content]"))
+        .filter(is_active_html_document_element)
+        .filter(|node| {
+            node.value()
+                .attr("http-equiv")
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("refresh"))
+        })
+    {
+        if let Some(url) = meta_refresh_target(node.value().attr("content").unwrap_or_default())
+            .and_then(|target| normalize_url(base_url, target))
+        {
+            links.push(PageReferenceLink {
+                url: url.to_string(),
+                kind: PageReferenceKind::MetaRefresh,
+                rel_nofollow: false,
+            });
+        }
+    }
+    for node in document
+        .select(&selector("iframe[src]"))
+        .filter(is_active_html_document_element)
+    {
+        if let Some(url) = normalize_url(base_url, node.value().attr("src").unwrap_or_default()) {
+            links.push(PageReferenceLink {
+                url: url.to_string(),
+                kind: PageReferenceKind::Iframe,
+                rel_nofollow: false,
+            });
+        }
+    }
     links
+}
+
+/// Extracts the target from a refresh directive such as `5; url='/next'` or `0;/next`.
+fn meta_refresh_target(content: &str) -> Option<&str> {
+    let (_, rest) = content.split_once([';', ','])?;
+    let rest = rest.trim();
+    let target = match rest.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("url=") => &rest[4..],
+        _ => rest,
+    };
+    let target = target.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+    (!target.is_empty()).then_some(target)
 }
 
 #[derive(Default)]
@@ -1810,6 +1859,45 @@ mod tests {
             assert_eq!(signals.visible_text, "Selected text");
             assert!(signals.links.is_empty());
         }
+    }
+
+    #[test]
+    fn meta_keywords_are_captured_from_the_first_active_tag() {
+        let signals = parse_html(
+            &Url::parse("https://example.test/").unwrap(),
+            r#"<head><meta name="KEYWORDS" content=" seo, crawler ">
+                <meta name="keywords" content="second"></head>"#,
+        );
+        assert_eq!(signals.meta_keywords.as_deref(), Some("seo, crawler"));
+        let signals = parse_html(
+            &Url::parse("https://example.test/").unwrap(),
+            "<head></head>",
+        );
+        assert_eq!(signals.meta_keywords, None);
+    }
+
+    #[test]
+    fn meta_refresh_and_iframe_targets_are_typed_references() {
+        assert_eq!(meta_refresh_target("5; url='/next'"), Some("/next"));
+        assert_eq!(meta_refresh_target("0;URL=/next"), Some("/next"));
+        assert_eq!(meta_refresh_target("0, /next"), Some("/next"));
+        assert_eq!(meta_refresh_target("30"), None);
+        assert_eq!(meta_refresh_target("0; url="), None);
+        let signals = parse_html(
+            &Url::parse("https://example.test/page").unwrap(),
+            r#"<head><meta http-equiv="Refresh" content="0; url=/moved">
+                <meta http-equiv="content-type" content="text/html"></head>
+                <body><iframe src="https://embed.test/video"></iframe>
+                <template><iframe src="/template"></iframe></template>
+                <iframe></iframe></body>"#,
+        );
+        assert_eq!(
+            serde_json::to_value(&signals.reference_links).unwrap(),
+            serde_json::json!([
+                {"url":"https://example.test/moved","kind":"metaRefresh","relNofollow":false},
+                {"url":"https://embed.test/video","kind":"iframe","relNofollow":false}
+            ])
+        );
     }
 
     #[test]

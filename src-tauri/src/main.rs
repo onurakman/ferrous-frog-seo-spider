@@ -1,8 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ai;
 mod content;
 #[cfg(test)]
 mod export_tests;
+mod google_oauth;
+mod http_auth;
 mod pagespeed;
 mod serp;
 #[cfg(test)]
@@ -12,6 +15,7 @@ mod updates;
 mod window_state;
 
 use ferrous_frog_analysis::analyze_records;
+use ferrous_frog_crawler_core::{AutomationConfig, CrawlProgress};
 use ferrous_frog_crawler_core::{
     CrawlConfig, CrawlControl, CrawlerEvent, RenderingStatus, RobotsTxtBatchTestRequest,
     RobotsTxtBatchTestResult, RobotsTxtDownloadRequest, RobotsTxtDownloadResult,
@@ -21,20 +25,23 @@ use ferrous_frog_crawler_core::{
     validate_configuration, validate_crawl_start, validate_rendering,
 };
 use ferrous_frog_export::{
-    audit_workbook_to_writer, graph_nodes_to_csv, link_edges_to_csv, link_edges_to_csv_string,
-    query_to_xlsx_writer, records_to_csv, records_to_csv_string, records_to_html_report,
-    records_to_sitemap_xml, records_to_xlsx_bytes, redirect_chains_to_csv_string,
-    sitemap_validation_to_csv_string,
+    audit_workbook_to_writer, export_preset, graph_nodes_to_csv, link_edges_to_csv,
+    link_edges_to_csv_string, query_to_xlsx_writer, records_to_csv, records_to_csv_string,
+    records_to_html_report, records_to_sitemap_xml, records_to_xlsx_bytes,
+    redirect_chains_to_csv_string, sitemap_validation_to_csv_string, write_export_files,
 };
 use ferrous_frog_integrations::{
-    DateRange, MetricRequest, SearchConsoleConfig, SearchConsoleProvider, UrlMetricProvider,
+    AnalyticsConfig, BacklinkEndpointConfig, BacklinkEndpointProvider, DateRange,
+    GoogleAnalyticsProvider, MetricRequest, SearchConsoleConfig, SearchConsoleProvider,
+    UrlMetricProvider,
 };
 use ferrous_frog_storage::{
-    ActiveStore, AnchorTextResponse, CrawlFrontierState, CrawlGraph, CrawlGraphQuery,
-    CrawlPathQuery, CrawlPathResponse, CrawlRecord, CrawlStore, GridQuery, GridResponse,
-    ImageAsset, ImageAssetQuery, ImageAssetResponse, Issue, LinkEdge, LinkEdgeQuery,
-    LinkEdgeResponse, SearchConsoleMetricRow, SitemapValidationQuery, SitemapValidationResponse,
-    is_broken_record, is_no_response_record, summarize, validate_grid_query,
+    ActiveStore, AnalyticsMetricRow, AnchorTextResponse, AuditThresholds, BacklinkMetricRow,
+    CrawlFrontierState, CrawlGraph, CrawlGraphQuery, CrawlPathQuery, CrawlPathResponse,
+    CrawlRecord, CrawlStore, GridQuery, GridResponse, ImageAsset, ImageAssetQuery,
+    ImageAssetResponse, Issue, LinkEdge, LinkEdgeQuery, LinkEdgeResponse, SearchConsoleMetricRow,
+    SitemapValidationQuery, SitemapValidationResponse, is_broken_record, is_no_response_record,
+    summarize, validate_grid_query,
 };
 use keyring::{Entry, Error as KeyringError};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -45,11 +52,48 @@ use std::fs;
 use std::io::{BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_window_state::AppHandleExt;
+
+// ponytail: process-wide audit thresholds; move into AppState if sessions ever need separate limits.
+static AUDIT_THRESHOLDS: RwLock<AuditThresholds> = RwLock::new(AuditThresholds {
+    title_min_chars: 30,
+    title_max_chars: 60,
+    title_min_pixels: 200,
+    title_max_pixels: 580,
+    meta_min_chars: 70,
+    meta_max_chars: 160,
+    meta_min_pixels: 400,
+    meta_max_pixels: 920,
+    h1_max_chars: 70,
+    h2_max_chars: 70,
+    large_image_bytes: 200 * 1024,
+    thin_content_words: 200,
+    min_text_ratio_percent: 10,
+});
+
+fn audit_thresholds() -> AuditThresholds {
+    *AUDIT_THRESHOLDS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn with_thresholds(mut query: GridQuery) -> GridQuery {
+    query.thresholds = audit_thresholds();
+    query
+}
+
+#[tauri::command]
+fn set_audit_thresholds(thresholds: AuditThresholds) -> Result<(), String> {
+    thresholds.validate()?;
+    *AUDIT_THRESHOLDS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = thresholds;
+    Ok(())
+}
 
 struct AppState {
     store: Mutex<ActiveStore>,
@@ -240,6 +284,55 @@ struct SearchConsoleMergeResult {
     impressions: f64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeAnalyticsMetricsRequest {
+    property_id: String,
+    start_date: String,
+    end_date: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AnalyticsMergeResult {
+    property_id: String,
+    fetched_rows: usize,
+    matched_rows: usize,
+    sessions: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveBacklinkSettingsRequest {
+    endpoint_template: String,
+    header_name: String,
+    header_value: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BacklinkSettingsStatus {
+    endpoint_template: String,
+    header_name: String,
+    credential_saved: bool,
+    keyring_available: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeBacklinkMetricsRequest {
+    max_urls: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BacklinkMergeResult {
+    requested_urls: usize,
+    matched_rows: usize,
+    failed_urls: usize,
+    first_error: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DatabaseLocation {
@@ -274,6 +367,10 @@ const URL_TREE_RECORD_LIMIT: usize = 10_000;
 const KEYRING_SERVICE: &str = "ferrous-frog-seo-spider";
 const GSC_KEYRING_ACCOUNT: &str = "google-search-console";
 const GSC_SITE_URL_SETTING: &str = "google_search_console_site_url";
+const GA4_PROPERTY_SETTING: &str = "google_analytics_property_id";
+const BACKLINK_ENDPOINT_SETTING: &str = "backlink_endpoint_template";
+const BACKLINK_HEADER_SETTING: &str = "backlink_header_name";
+const BACKLINK_KEYRING_ACCOUNT: &str = "backlink-api-key";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -338,10 +435,16 @@ fn validate_crawl_configuration(config: CrawlConfig) -> Result<(), String> {
 async fn start_crawl(
     app: AppHandle,
     state: State<'_, AppState>,
-    config: CrawlConfig,
+    mut config: CrawlConfig,
     resume: bool,
 ) -> Result<CrawlSession, String> {
     validate_crawl_start(&config).map_err(|error| format!("{error:#}"))?;
+    if config.http_auth.enabled {
+        config.basic_credentials = Some(http_auth::load_saved_credentials().await?);
+    }
+    if config.form_login.enabled {
+        config.form_credentials = Some(http_auth::load_form_login_credentials().await?);
+    }
     validate_rendering(&config.rendering).map_err(|error| error.to_string())?;
     let mut current_task = state.crawl_task.lock().await;
     ensure_idle(&state, &current_task)?;
@@ -355,6 +458,9 @@ async fn start_crawl(
     let control = CrawlControl::default();
     *current_control = Some(control.clone());
     let session_id = session.id.clone();
+    let automation = config.automation.clone();
+    let thresholds = config.thresholds;
+    let automation_store = store.clone();
     let task = tauri::async_runtime::spawn(async move {
         let progress_conn = Arc::new(Mutex::new(conn));
         let persistence_error = Arc::new(Mutex::new(None::<String>));
@@ -385,8 +491,12 @@ async fn start_crawl(
         };
         // Observe engine panics as well as returned errors so history never stays "running".
         let result = tauri::async_runtime::spawn(crawl(config, store, control, emit)).await;
+        let mut finished = None;
         let error = match result {
-            Ok(Ok(_)) => None,
+            Ok(Ok(progress)) => {
+                finished = Some(progress);
+                None
+            }
             Ok(Err(error)) => Some(format!("{error:#}")),
             Err(error) => Some(format!("crawl task failed: {error}")),
         }
@@ -408,9 +518,120 @@ async fn start_crawl(
             event.kind = "failed".to_string();
             let _ = app.emit("crawl-event", event);
         }
+        run_automation(
+            &app,
+            &automation,
+            thresholds,
+            automation_store,
+            &session_id,
+            finished.as_ref(),
+        )
+        .await;
     });
     *current_task = Some(task);
     Ok(session)
+}
+
+/// Post-crawl actions: preset exports, a webhook summary and a desktop notification.
+/// Failures become notices; they never change the crawl outcome.
+async fn run_automation(
+    app: &AppHandle,
+    automation: &AutomationConfig,
+    thresholds: AuditThresholds,
+    store: ActiveStore,
+    session_id: &str,
+    progress: Option<&CrawlProgress>,
+) {
+    let mut notices = Vec::new();
+    let mut exported = Vec::new();
+    if let (Some(_), Some(kinds)) = (progress, export_preset(&automation.export_preset)) {
+        let dir = export_dir(app).map(|dir| dir.join(format!("auto-{}", now_ms())));
+        let written = match dir {
+            Ok(dir) => tauri::async_runtime::spawn_blocking(move || {
+                write_export_files(&store, &thresholds, &kinds, &dir)
+            })
+            .await
+            .map_err(|error| format!("export worker failed: {error}"))
+            .and_then(|result| result),
+            Err(error) => Err(error),
+        };
+        match written {
+            Ok(paths) => {
+                if let Some(dir) = paths.first().and_then(|path| path.parent()) {
+                    notices.push(format!(
+                        "Exported {} file(s) to {}",
+                        paths.len(),
+                        dir.display()
+                    ));
+                }
+                exported = paths;
+            }
+            Err(error) => notices.push(format!("Automatic export failed: {error}")),
+        }
+    }
+    if !automation.webhook_url.trim().is_empty() {
+        let payload = automation_payload(session_id, progress, &exported);
+        if let Err(error) = post_webhook(automation.webhook_url.trim(), &payload).await {
+            notices.push(format!("Webhook failed: {error}"));
+        }
+    }
+    if automation.notify_on_completion {
+        use tauri_plugin_notification::NotificationExt;
+        let body = match progress {
+            Some(progress) => format!(
+                "Crawl finished: {} URLs crawled, {} broken",
+                progress.crawled, progress.summary.broken
+            ),
+            None => "Crawl failed".to_string(),
+        };
+        if let Err(error) = app
+            .notification()
+            .builder()
+            .title("Ferrous Frog SEO Spider")
+            .body(body)
+            .show()
+        {
+            notices.push(format!("Notification failed: {error}"));
+        }
+    }
+    if !notices.is_empty() {
+        let _ = app.emit("crawl-event", CrawlerEvent::notice(notices.join(" · ")));
+    }
+}
+
+fn automation_payload(
+    session_id: &str,
+    progress: Option<&CrawlProgress>,
+    exported: &[PathBuf],
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": if progress.is_some() { "crawl.finished" } else { "crawl.failed" },
+        "sessionId": session_id,
+        "status": progress.map(|p| p.status.as_str()).unwrap_or("failed"),
+        "crawled": progress.map(|p| p.crawled).unwrap_or(0),
+        "queued": progress.map(|p| p.queued).unwrap_or(0),
+        "discovered": progress.map(|p| p.discovered).unwrap_or(0),
+        "elapsedMs": progress.map(|p| p.elapsed_ms).unwrap_or(0),
+        "summary": progress.map(|p| serde_json::to_value(&p.summary).unwrap_or_default()),
+        "exports": exported.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        "sentAtMs": now_ms(),
+    })
+}
+
+async fn post_webhook(url: &str, payload: &serde_json::Value) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| error.to_string())?;
+    client
+        .post(url)
+        .json(payload)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn ensure_idle(
@@ -670,7 +891,7 @@ async fn get_url_tree(
 #[tauri::command]
 fn get_issues(state: State<'_, AppState>) -> Vec<Issue> {
     let records = state.store.lock().expect("store lock poisoned").records();
-    analyze_records(&records)
+    analyze_records(&records, &audit_thresholds())
 }
 
 #[tauri::command]
@@ -1101,8 +1322,7 @@ async fn test_search_console_credentials(
 ) -> Result<SearchConsoleTestResult, String> {
     let site_url = get_integration_setting(&app, GSC_SITE_URL_SETTING)?
         .ok_or_else(|| "Google Search Console site URL is not configured".to_string())?;
-    let access_token = read_search_console_access_token()?
-        .ok_or_else(|| "Google Search Console access token is not configured".to_string())?;
+    let access_token = search_console_access_token().await?;
     let provider = SearchConsoleProvider::new(SearchConsoleConfig {
         site_url,
         access_token,
@@ -1143,8 +1363,7 @@ async fn merge_search_console_metrics(
     ensure_idle(&state, &task)?;
     let site_url = get_integration_setting(&app, GSC_SITE_URL_SETTING)?
         .ok_or_else(|| "Google Search Console site URL is not configured".to_string())?;
-    let access_token = read_search_console_access_token()?
-        .ok_or_else(|| "Google Search Console access token is not configured".to_string())?;
+    let access_token = search_console_access_token().await?;
     let provider = SearchConsoleProvider::new(SearchConsoleConfig {
         site_url,
         access_token,
@@ -1257,7 +1476,7 @@ fn export_html_report(state: State<'_, AppState>) -> Result<String, String> {
             ..LinkEdgeQuery::default()
         })
         .edges;
-    records_to_html_report(&records, &edges).map_err(|error| error.to_string())
+    records_to_html_report(&records, &edges, &audit_thresholds()).map_err(|error| error.to_string())
 }
 
 fn stream_export_file(
@@ -1367,11 +1586,11 @@ fn write_redirect_chains_csv_stream(
     store: &ActiveStore,
     file: &mut fs::File,
 ) -> Result<usize, String> {
-    let mut query = GridQuery {
+    let mut query = with_thresholds(GridQuery {
         offset: 0,
         limit: EXPORT_STREAM_PAGE_SIZE,
         ..GridQuery::default()
-    };
+    });
     let mut row_count = 0;
     let mut wrote_header = false;
 
@@ -1681,6 +1900,7 @@ fn write_archive_array<T: Serialize>(
 }
 
 fn query_store_rows(store: &ActiveStore, query: GridQuery) -> Result<GridResponse, String> {
+    let query = with_thresholds(query);
     validate_grid_query(&query).map_err(|error| error.to_string())?;
     match store {
         ActiveStore::Memory(store) => Ok(store.query(query)),
@@ -2051,7 +2271,9 @@ async fn export_file(
             | ExportFileKind::GraphEdgesCsv => unreachable!("scoped export returned earlier"),
             ExportFileKind::Csv => {
                 let records = store
-                    .query(request.query.unwrap_or_else(export_grid_query))
+                    .query(with_thresholds(
+                        request.query.unwrap_or_else(export_grid_query),
+                    ))
                     .rows;
                 let row_count = records.len();
                 let csv = records_to_csv_string(&records).map_err(|error| error.to_string())?;
@@ -2063,7 +2285,9 @@ async fn export_file(
             }
             ExportFileKind::Sitemap => {
                 let records = store
-                    .query(request.query.unwrap_or_else(export_grid_query))
+                    .query(with_thresholds(
+                        request.query.unwrap_or_else(export_grid_query),
+                    ))
                     .rows;
                 let row_count = records.len();
                 let xml = records_to_sitemap_xml(&records);
@@ -2130,8 +2354,8 @@ async fn export_file(
                     })
                     .edges;
                 let row_count = records.len();
-                let html =
-                    records_to_html_report(&records, &edges).map_err(|error| error.to_string())?;
+                let html = records_to_html_report(&records, &edges, &audit_thresholds())
+                    .map_err(|error| error.to_string())?;
                 (
                     format!("ferrous-frog-seo-report-{timestamp}.html"),
                     html.into_bytes(),
@@ -2630,6 +2854,233 @@ fn search_console_keyring_entry() -> Result<Entry, String> {
         .map_err(|error| format!("failed to open OS credential store: {error}"))
 }
 
+/// The connected Google account wins; a manually pasted token remains the fallback.
+async fn search_console_access_token() -> Result<String, String> {
+    if let Some(token) = google_oauth::access_token().await? {
+        return Ok(token);
+    }
+    read_search_console_access_token()?.ok_or_else(|| {
+        "Connect a Google account or paste a Search Console access token in Settings > Integrations"
+            .to_string()
+    })
+}
+
+fn backlink_settings_status(app: &AppHandle) -> Result<BacklinkSettingsStatus, String> {
+    let (credential_saved, keyring_available) =
+        match Entry::new(KEYRING_SERVICE, BACKLINK_KEYRING_ACCOUNT)
+            .and_then(|entry| entry.get_password())
+        {
+            Ok(value) => (!value.trim().is_empty(), true),
+            Err(KeyringError::NoEntry) => (false, true),
+            Err(_) => (false, false),
+        };
+    Ok(BacklinkSettingsStatus {
+        endpoint_template: get_integration_setting(app, BACKLINK_ENDPOINT_SETTING)?
+            .unwrap_or_default(),
+        header_name: get_integration_setting(app, BACKLINK_HEADER_SETTING)?.unwrap_or_default(),
+        credential_saved,
+        keyring_available,
+    })
+}
+
+#[tauri::command]
+fn get_backlink_settings(app: AppHandle) -> Result<BacklinkSettingsStatus, String> {
+    backlink_settings_status(&app)
+}
+
+#[tauri::command]
+fn save_backlink_settings(
+    app: AppHandle,
+    request: SaveBacklinkSettingsRequest,
+) -> Result<BacklinkSettingsStatus, String> {
+    let template = request.endpoint_template.trim().to_string();
+    if template.is_empty() {
+        delete_integration_setting(&app, BACKLINK_ENDPOINT_SETTING)?;
+        delete_integration_setting(&app, BACKLINK_HEADER_SETTING)?;
+        if let Ok(entry) = Entry::new(KEYRING_SERVICE, BACKLINK_KEYRING_ACCOUNT) {
+            let _ = entry.delete_credential();
+        }
+        return backlink_settings_status(&app);
+    }
+    BacklinkEndpointProvider::new(BacklinkEndpointConfig {
+        endpoint_template: template.clone(),
+        header_name: Some(request.header_name.trim().to_string()),
+        header_value: None,
+    })
+    .map_err(|error| error.to_string())?;
+    set_integration_setting(&app, BACKLINK_ENDPOINT_SETTING, &template)?;
+    set_integration_setting(&app, BACKLINK_HEADER_SETTING, request.header_name.trim())?;
+    if let Some(value) = request.header_value.as_deref().map(str::trim)
+        && !value.is_empty()
+    {
+        if value.len() > 1024 || value.chars().any(char::is_control) {
+            return Err("The backlink credential must be at most 1,024 printable bytes".into());
+        }
+        Entry::new(KEYRING_SERVICE, BACKLINK_KEYRING_ACCOUNT)
+            .and_then(|entry| entry.set_password(value))
+            .map_err(|_| "Could not save the backlink credential in the OS credential store")?;
+    }
+    backlink_settings_status(&app)
+}
+
+#[tauri::command]
+async fn merge_backlink_metrics(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: MergeBacklinkMetricsRequest,
+) -> Result<BacklinkMergeResult, String> {
+    let task = state.crawl_task.lock().await;
+    ensure_idle(&state, &task)?;
+    let settings = backlink_settings_status(&app)?;
+    if settings.endpoint_template.is_empty() {
+        return Err("Configure the backlink endpoint in Settings > Integrations first".into());
+    }
+    let header_value = match Entry::new(KEYRING_SERVICE, BACKLINK_KEYRING_ACCOUNT)
+        .and_then(|entry| entry.get_password())
+    {
+        Ok(value) => Some(value),
+        Err(KeyringError::NoEntry) => None,
+        Err(_) => {
+            return Err("The OS credential store is unavailable. Unlock it and try again".into());
+        }
+    };
+    let provider = BacklinkEndpointProvider::new(BacklinkEndpointConfig {
+        endpoint_template: settings.endpoint_template,
+        header_name: (!settings.header_name.is_empty()).then_some(settings.header_name),
+        header_value,
+    })
+    .map_err(|error| error.to_string())?;
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_string())?
+        .clone();
+    let limit = request.max_urls.clamp(1, 5_000);
+    let read_store = store.clone();
+    let urls: Vec<String> = tauri::async_runtime::spawn_blocking(move || {
+        let mut urls: Vec<String> = read_store
+            .records()
+            .into_iter()
+            .filter(|record| {
+                record.classification == ferrous_frog_storage::UrlClassification::Internal
+                    && ferrous_frog_storage::is_success_html_record(record)
+            })
+            .map(|record| record.final_url)
+            .collect();
+        urls.sort();
+        urls.dedup();
+        urls.truncate(limit);
+        urls
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    let mut rows = Vec::new();
+    let mut failed_urls = 0;
+    let mut first_error = None;
+    for url in &urls {
+        match provider.fetch_url(url).await {
+            Ok(metrics) => rows.push(BacklinkMetricRow {
+                url: url.clone(),
+                backlinks: metrics.backlinks,
+                referring_domains: metrics.referring_domains,
+                authority_score: metrics.authority_score,
+            }),
+            Err(error) => {
+                failed_urls += 1;
+                first_error.get_or_insert_with(|| format!("{url}: {error}"));
+                if failed_urls >= 10 && rows.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    let matched_rows =
+        tauri::async_runtime::spawn_blocking(move || store.merge_backlink_metrics(rows))
+            .await
+            .map_err(|error| error.to_string())?;
+    drop(task);
+    Ok(BacklinkMergeResult {
+        requested_urls: urls.len(),
+        matched_rows,
+        failed_urls,
+        first_error,
+    })
+}
+
+#[tauri::command]
+fn get_analytics_property(app: AppHandle) -> Result<Option<String>, String> {
+    get_integration_setting(&app, GA4_PROPERTY_SETTING)
+}
+
+#[tauri::command]
+async fn merge_analytics_metrics(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: MergeAnalyticsMetricsRequest,
+) -> Result<AnalyticsMergeResult, String> {
+    let task = state.crawl_task.lock().await;
+    ensure_idle(&state, &task)?;
+    let property_id = request
+        .property_id
+        .trim()
+        .trim_start_matches("properties/")
+        .to_string();
+    if property_id.is_empty() || !property_id.chars().all(|c| c.is_ascii_digit()) {
+        return Err("Enter the numeric Google Analytics 4 property ID".into());
+    }
+    set_integration_setting(&app, GA4_PROPERTY_SETTING, &property_id)?;
+    let access_token = google_oauth::access_token()
+        .await?
+        .ok_or("Connect a Google account with Analytics access in Settings > Integrations")?;
+    let provider = GoogleAnalyticsProvider::new(AnalyticsConfig {
+        property_id: property_id.clone(),
+        access_token,
+    });
+    let response = provider
+        .fetch_metrics(MetricRequest {
+            urls: Vec::new(),
+            date_range: Some(DateRange {
+                start_date: request.start_date,
+                end_date: request.end_date,
+            }),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut sessions = 0.0;
+    let rows = response
+        .rows
+        .into_iter()
+        .filter_map(|row| {
+            let metric = row.analytics?;
+            sessions += metric.sessions;
+            Some(AnalyticsMetricRow {
+                url: row.url,
+                sessions: metric.sessions,
+                engaged_sessions: metric.engaged_sessions,
+                conversions: metric.conversions,
+                revenue: metric.revenue,
+            })
+        })
+        .collect::<Vec<_>>();
+    let fetched_rows = rows.len();
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned".to_string())?
+        .clone();
+    let matched_rows =
+        tauri::async_runtime::spawn_blocking(move || store.merge_analytics_metrics(rows))
+            .await
+            .map_err(|error| error.to_string())?;
+    drop(task);
+    Ok(AnalyticsMergeResult {
+        property_id,
+        fetched_rows,
+        matched_rows,
+        sessions,
+    })
+}
+
 fn read_search_console_access_token() -> Result<Option<String>, String> {
     match search_console_keyring_entry()?.get_password() {
         Ok(token) => Ok(Some(token)),
@@ -2667,11 +3118,11 @@ fn now_ms() -> i64 {
 }
 
 fn export_grid_query() -> GridQuery {
-    GridQuery {
+    with_thresholds(GridQuery {
         offset: 0,
         limit: 1_000_000,
         ..GridQuery::default()
-    }
+    })
 }
 
 fn url_tree_segments(record: &CrawlRecord) -> Vec<String> {
@@ -2838,7 +3289,7 @@ fn sort_url_tree_nodes(nodes: &mut [UrlTreeNode]) {
     }
 }
 
-fn export_path(app: &AppHandle, filename: &str) -> Result<PathBuf, String> {
+fn export_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let base = app
         .path()
         .download_dir()
@@ -2847,12 +3298,17 @@ fn export_path(app: &AppHandle, filename: &str) -> Result<PathBuf, String> {
     let dir = base.join("Ferrous Frog").join("exports");
     fs::create_dir_all(&dir)
         .map_err(|error| format!("failed to create export directory: {error}"))?;
-    Ok(dir.join(filename))
+    Ok(dir)
+}
+
+fn export_path(app: &AppHandle, filename: &str) -> Result<PathBuf, String> {
+    Ok(export_dir(app)?.join(filename))
 }
 
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(window_state::FLAGS)
@@ -2868,6 +3324,8 @@ fn main() {
             exit_confirmed: AtomicBool::new(false),
         })
         .manage(pagespeed::PageSpeedState::default())
+        .manage(google_oauth::GoogleOAuthState::default())
+        .manage(ai::AiState::default())
         .setup(|app| {
             // Start the splash minimum after Tauri has created its windows.
             app.manage(Instant::now());
@@ -2905,6 +3363,7 @@ fn main() {
             test_robots_txt_batch,
             download_robots_txt,
             get_rows,
+            set_audit_thresholds,
             validate_result_filters,
             get_url_tree,
             get_issues,
@@ -2926,15 +3385,37 @@ fn main() {
             load_config_profile,
             delete_config_profile,
             get_search_console_credential_status,
+            http_auth::get_http_auth_status,
+            http_auth::save_http_auth_credentials,
+            http_auth::clear_http_auth_credentials,
+            http_auth::get_form_login_status,
+            http_auth::save_form_login_credentials,
+            http_auth::clear_form_login_credentials,
             pagespeed::get_page_speed_credential_status,
             pagespeed::save_page_speed_api_key,
             pagespeed::clear_page_speed_api_key,
             pagespeed::run_page_speed,
+            pagespeed::run_page_speed_bulk,
+            pagespeed::run_field_vitals,
             pagespeed::cancel_page_speed,
             save_search_console_credentials,
             clear_search_console_credentials,
             test_search_console_credentials,
             merge_search_console_metrics,
+            get_analytics_property,
+            merge_analytics_metrics,
+            get_backlink_settings,
+            save_backlink_settings,
+            merge_backlink_metrics,
+            google_oauth::get_google_oauth_status,
+            google_oauth::save_google_oauth_client,
+            google_oauth::disconnect_google_account,
+            google_oauth::connect_google_account,
+            ai::get_ai_status,
+            ai::save_ai_settings,
+            ai::save_ai_api_key,
+            ai::clear_ai_api_key,
+            ai::run_ai_task,
             export_csv,
             export_selected_csv,
             export_xlsx,

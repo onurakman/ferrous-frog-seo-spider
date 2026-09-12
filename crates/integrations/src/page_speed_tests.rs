@@ -22,6 +22,7 @@ fn config(strategy: PageSpeedStrategy) -> PageSpeedConfig {
         api_key: Some(format!(" {API_KEY} ")),
         strategy,
         locale: Some(" en-US ".to_string()),
+        categories: PageSpeedCategory::ALL.to_vec(),
     }
 }
 
@@ -139,6 +140,7 @@ async fn optional_empty_key_and_locale_are_omitted() {
             api_key,
             strategy: PageSpeedStrategy::Mobile,
             locale: None,
+            categories: Vec::new(),
         })
         .unwrap();
         provider
@@ -479,4 +481,32 @@ async fn transport_disconnects_do_not_expose_the_api_request_url() {
         assert_redacted(&error, &endpoint);
         server.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn selected_categories_limit_the_request_and_empty_means_all() {
+    let (endpoint, server) = serve_once(response("200 OK", SUCCESS.as_bytes())).await;
+    let provider = PageSpeedProvider::new(PageSpeedConfig {
+        categories: vec![
+            PageSpeedCategory::Seo,
+            PageSpeedCategory::Performance,
+            PageSpeedCategory::Seo,
+        ],
+        ..config(PageSpeedStrategy::Mobile)
+    })
+    .unwrap();
+    provider
+        .fetch_url(REQUESTED_URL.to_string(), endpoint)
+        .await
+        .unwrap();
+    let request = server.await.unwrap();
+    let line = request.lines().next().unwrap();
+    assert!(line.contains("category=performance&category=seo"), "{line}");
+    assert!(
+        !line.contains("accessibility") && !line.contains("best-practices"),
+        "{line}"
+    );
+    let parsed: PageSpeedConfig =
+        serde_json::from_str(r#"{"apiKey":null,"strategy":"mobile","locale":null}"#).unwrap();
+    assert_eq!(parsed.categories, PageSpeedCategory::ALL.to_vec());
 }

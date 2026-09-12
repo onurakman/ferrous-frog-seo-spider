@@ -1,6 +1,6 @@
 use super::*;
 use ferrous_frog_storage::{
-    CrawlStore, LinkEdgeQuery, LinkType, MemoryStore, RedirectHop, SqliteStore,
+    AuditThresholds, CrawlStore, LinkEdgeQuery, LinkType, MemoryStore, RedirectHop, SqliteStore,
 };
 use std::process::{Command, Stdio};
 
@@ -88,7 +88,7 @@ fn metadata_counts_keep_unknown_cells_empty_and_export_multiple_tag_evidence() {
     let legacy = page("legacy", "Legacy page", "Legacy description");
     let records = [measured, absent, legacy];
 
-    let html = records_to_html_report(&records, &[]).unwrap();
+    let html = records_to_html_report(&records, &[], &AuditThresholds::default()).unwrap();
     assert!(html.contains("Multiple titles (3 tags)"));
     assert!(html.contains("Multiple meta descriptions (2 tags)"));
     assert!(!html.contains("Multiple titles (0 tags)"));
@@ -703,8 +703,19 @@ fn filtered_xlsx_stream_matches_legacy_columns_and_preserves_filters_and_order()
         assert_eq!(sheets.len(), 1);
         assert_eq!(sheets[0].0, "Crawl Results");
         let rows = &sheets[0].1;
-        assert_eq!(rows[0].len(), 91);
-        assert_eq!(&rows[0][89..], ["title_count", "meta_description_count"]);
+        assert_eq!(rows[0].len(), 111);
+        assert_eq!(
+            &rows[0][89..93],
+            [
+                "title_count",
+                "meta_description_count",
+                "meta_keywords",
+                "page_speed_strategy"
+            ]
+        );
+        assert_eq!(rows[0][103], "field_cls_p75");
+        assert_eq!(rows[0][107], "analytics_revenue");
+        assert_eq!(rows[0][110], "backlink_authority");
         assert_eq!(
             &rows[0][..5],
             ["id", "url", "final_url", "classification", "status_code"]

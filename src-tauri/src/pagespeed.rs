@@ -1,10 +1,12 @@
 use crate::{AppState, KEYRING_SERVICE, now_ms, selected_records};
 use ferrous_frog_integrations::{
-    MetricRequest, PageSpeedConfig, PageSpeedMetrics, PageSpeedProvider,
-    PageSpeedStrategy as ProviderStrategy, UrlMetricProvider,
+    FieldFormFactor as ProviderFormFactor, FieldVitalsConfig, FieldVitalsMetrics,
+    FieldVitalsProvider, MetricRequest, PageSpeedCategory, PageSpeedConfig, PageSpeedMetrics,
+    PageSpeedProvider, PageSpeedStrategy as ProviderStrategy, UrlMetricProvider,
 };
 use ferrous_frog_storage::{
-    CrawlRecord, PageSpeedSnapshot, PageSpeedStrategy, is_success_html_record,
+    CrawlRecord, FieldFormFactor, FieldVitalsSnapshot, PageSpeedSnapshot, PageSpeedStrategy,
+    is_success_html_record,
 };
 use keyring::{Entry, Error as KeyringError};
 use serde::{Deserialize, Serialize};
@@ -174,6 +176,54 @@ pub struct RunPageSpeedRequest {
     record_id: u64,
     strategy: PageSpeedStrategy,
     request_id: String,
+    #[serde(default)]
+    categories: Vec<PageSpeedCategory>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunPageSpeedBulkRequest {
+    record_ids: Vec<u64>,
+    strategy: PageSpeedStrategy,
+    request_id: String,
+    #[serde(default)]
+    categories: Vec<PageSpeedCategory>,
+    /// Skip rows that already hold a snapshot for the same strategy.
+    #[serde(default)]
+    resume: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PageSpeedBulkFailure {
+    record_id: u64,
+    error: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PageSpeedBulkResult {
+    measured: usize,
+    skipped: usize,
+    failed: Vec<PageSpeedBulkFailure>,
+    cancelled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PageSpeedBulkProgress {
+    request_id: String,
+    completed: usize,
+    total: usize,
+    record_id: u64,
+    error: Option<String>,
+}
+
+const BULK_LIMIT: usize = 500;
+const QUOTA_BACKOFF_SECS: [u64; 3] = [2, 8, 30];
+
+fn quota_limited(error: &str) -> bool {
+    error.contains("HTTP 429") || error.contains("HTTP 503")
 }
 
 #[derive(Debug, Serialize)]
@@ -389,9 +439,181 @@ where
     result
 }
 
+/// Measures the selected rows one after another with one cancellable request ID.
+/// Quota responses (429/503) are retried with backoff; other failures move on to the next row.
+async fn run_page_speed_bulk_with_fetcher<F, Fut>(
+    state: &AppState,
+    page_speed: &PageSpeedState,
+    request: RunPageSpeedBulkRequest,
+    fetch: F,
+    progress: impl Fn(PageSpeedBulkProgress),
+) -> Result<PageSpeedBulkResult, String>
+where
+    F: Fn(String, PageSpeedStrategy, Vec<PageSpeedCategory>) -> Fut,
+    Fut: Future<Output = Result<PageSpeedMetrics, String>>,
+{
+    if request.record_ids.is_empty() || request.record_ids.len() > BULK_LIMIT {
+        return Err(format!("select between 1 and {BULK_LIMIT} rows to measure"));
+    }
+    let (_active, mut cancel) = page_speed.begin(&request.request_id)?;
+    let task = state
+        .crawl_task
+        .try_lock()
+        .map_err(|_| "The crawl is busy; try PageSpeed again after the current operation")?;
+    if state.exit_confirmed.load(Ordering::SeqCst) {
+        return Err("the application is closing".into());
+    }
+    if task
+        .as_ref()
+        .is_some_and(|task| !task.inner().is_finished())
+    {
+        return Err("Stop or complete the active crawl before running PageSpeed".into());
+    }
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned")?
+        .clone();
+    let read_store = store.clone();
+    let ids = request.record_ids.clone();
+    let rows = tauri::async_runtime::spawn_blocking(move || selected_records(&read_store, &ids))
+        .await
+        .map_err(|_| "PageSpeed record worker failed")??;
+    let total = rows.len();
+    let mut result = PageSpeedBulkResult {
+        measured: 0,
+        skipped: 0,
+        failed: Vec::new(),
+        cancelled: false,
+    };
+    for (index, row) in rows.into_iter().enumerate() {
+        if *cancel.borrow() {
+            result.cancelled = true;
+            break;
+        }
+        let record_id = row.id;
+        let report = |error: Option<String>| {
+            progress(PageSpeedBulkProgress {
+                request_id: request.request_id.clone(),
+                completed: index + 1,
+                total,
+                record_id,
+                error,
+            })
+        };
+        if request.resume
+            && row
+                .page_speed
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.strategy == request.strategy)
+        {
+            result.skipped += 1;
+            report(None);
+            continue;
+        }
+        let url = match page_speed_url(&row) {
+            Ok(url) => url,
+            Err(error) => {
+                report(Some(error.clone()));
+                result
+                    .failed
+                    .push(PageSpeedBulkFailure { record_id, error });
+                continue;
+            }
+        };
+        let mut attempt = 0;
+        let outcome = loop {
+            let fetched = tokio::select! {
+                biased;
+                _ = cancel.changed() => Err(CANCELLED.to_string()),
+                result = fetch(url.clone(), request.strategy, request.categories.clone()) => result,
+            };
+            match fetched {
+                Err(error) if quota_limited(&error) && attempt < QUOTA_BACKOFF_SECS.len() => {
+                    let wait = std::time::Duration::from_secs(QUOTA_BACKOFF_SECS[attempt]);
+                    attempt += 1;
+                    tokio::select! {
+                        biased;
+                        _ = cancel.changed() => break Err(CANCELLED.to_string()),
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+                other => break other,
+            }
+        };
+        match outcome {
+            Ok(metrics) => {
+                let snapshot = PageSpeedSnapshot {
+                    strategy: request.strategy,
+                    requested_url: url,
+                    completed_at_ms: now_ms(),
+                    final_url: metrics.final_url,
+                    fetched_at: metrics.fetched_at,
+                    lighthouse_version: metrics.lighthouse_version,
+                    performance_score: metrics.performance_score,
+                    accessibility_score: metrics.accessibility_score,
+                    best_practices_score: metrics.best_practices_score,
+                    seo_score: metrics.seo_score,
+                    lcp_ms: metrics.lcp_ms,
+                    cls: metrics.cls,
+                    tbt_ms: metrics.tbt_ms,
+                };
+                let save_store = store.clone();
+                let saved = tauri::async_runtime::spawn_blocking(move || {
+                    save_store
+                        .try_save_page_speed(record_id, snapshot)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|_| "PageSpeed snapshot worker failed".to_string())
+                .and_then(|inner| inner);
+                match saved {
+                    Ok(()) => {
+                        result.measured += 1;
+                        report(None);
+                    }
+                    Err(error) => {
+                        report(Some(error.clone()));
+                        result
+                            .failed
+                            .push(PageSpeedBulkFailure { record_id, error });
+                    }
+                }
+            }
+            Err(error) if error == CANCELLED => {
+                result.cancelled = true;
+                break;
+            }
+            Err(error) => {
+                report(Some(error.clone()));
+                result
+                    .failed
+                    .push(PageSpeedBulkFailure { record_id, error });
+            }
+        }
+    }
+    drop(task);
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn run_page_speed_bulk(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    page_speed: State<'_, PageSpeedState>,
+    request: RunPageSpeedBulkRequest,
+) -> Result<PageSpeedBulkResult, String> {
+    use tauri::Emitter;
+    run_page_speed_bulk_with_fetcher(&state, &page_speed, request, fetch_page_speed, |event| {
+        let _ = app.emit("page-speed-progress", event);
+    })
+    .await
+}
+
 async fn fetch_page_speed(
     url: String,
     strategy: PageSpeedStrategy,
+    categories: Vec<PageSpeedCategory>,
 ) -> Result<PageSpeedMetrics, String> {
     let api_key = tauri::async_runtime::spawn_blocking(|| {
         saved_key(keyring_entry().and_then(|entry| entry.get_password()))
@@ -405,6 +627,7 @@ async fn fetch_page_speed(
             PageSpeedStrategy::Desktop => ProviderStrategy::Desktop,
         },
         locale: None,
+        categories,
     })
     .map_err(|error| error.to_string())?;
     let mut response = provider
@@ -424,13 +647,121 @@ async fn fetch_page_speed(
         .ok_or_else(|| "PageSpeed returned no Lighthouse measurement".into())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunFieldVitalsRequest {
+    record_id: u64,
+    form_factor: FieldFormFactor,
+}
+
+/// Fetches Chrome UX Report field data for the selected row and stores the latest snapshot.
+async fn run_field_vitals_with_fetcher<F, Fut>(
+    state: &AppState,
+    request: RunFieldVitalsRequest,
+    fetch: F,
+) -> Result<FieldVitalsSnapshot, String>
+where
+    F: FnOnce(String, FieldFormFactor) -> Fut,
+    Fut: Future<Output = Result<FieldVitalsMetrics, String>>,
+{
+    let task = state
+        .crawl_task
+        .try_lock()
+        .map_err(|_| "The crawl is busy; try field data again after the current operation")?;
+    if state.exit_confirmed.load(Ordering::SeqCst) {
+        return Err("the application is closing".into());
+    }
+    if task
+        .as_ref()
+        .is_some_and(|task| !task.inner().is_finished())
+    {
+        return Err("Stop or complete the active crawl before fetching field data".into());
+    }
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned")?
+        .clone();
+    let read_store = store.clone();
+    let record_id = request.record_id;
+    let url = tauri::async_runtime::spawn_blocking(move || {
+        let rows = selected_records(&read_store, &[record_id])?;
+        page_speed_url(&rows[0])
+    })
+    .await
+    .map_err(|_| "Field data record worker failed")??;
+    let metrics = fetch(url.clone(), request.form_factor).await?;
+    let snapshot = FieldVitalsSnapshot {
+        form_factor: request.form_factor,
+        requested_url: url,
+        completed_at_ms: now_ms(),
+        has_data: metrics.has_data,
+        lcp_ms_p75: metrics.lcp_ms_p75,
+        cls_p75: metrics.cls_p75,
+        inp_ms_p75: metrics.inp_ms_p75,
+        fcp_ms_p75: metrics.fcp_ms_p75,
+        ttfb_ms_p75: metrics.ttfb_ms_p75,
+        collection_period_start: metrics.collection_period_start,
+        collection_period_end: metrics.collection_period_end,
+    };
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        store
+            .try_save_field_vitals(record_id, snapshot.clone())
+            .map_err(|error| error.to_string())?;
+        Ok(snapshot)
+    })
+    .await
+    .map_err(|_| "Field data snapshot worker failed")?;
+    drop(task);
+    result
+}
+
+async fn fetch_field_vitals(
+    url: String,
+    form_factor: FieldFormFactor,
+) -> Result<FieldVitalsMetrics, String> {
+    let api_key = tauri::async_runtime::spawn_blocking(|| {
+        saved_key(keyring_entry().and_then(|entry| entry.get_password()))
+    })
+    .await
+    .map_err(|_| "PageSpeed credential worker failed")??
+    .ok_or_else(|| {
+        "Chrome UX Report needs the Google API key saved in Settings > Integrations (with the Chrome UX Report API enabled)".to_string()
+    })?;
+    let provider = FieldVitalsProvider::new(FieldVitalsConfig {
+        api_key,
+        form_factor: match form_factor {
+            FieldFormFactor::Phone => ProviderFormFactor::Phone,
+            FieldFormFactor::Desktop => ProviderFormFactor::Desktop,
+            FieldFormFactor::Tablet => ProviderFormFactor::Tablet,
+        },
+    })
+    .map_err(|error| error.to_string())?;
+    provider
+        .fetch(&url)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn run_field_vitals(
+    state: State<'_, AppState>,
+    request: RunFieldVitalsRequest,
+) -> Result<FieldVitalsSnapshot, String> {
+    run_field_vitals_with_fetcher(&state, request, fetch_field_vitals).await
+}
+
 #[tauri::command]
 pub async fn run_page_speed(
     state: State<'_, AppState>,
     page_speed: State<'_, PageSpeedState>,
     request: RunPageSpeedRequest,
 ) -> Result<PageSpeedSnapshot, String> {
-    run_with_fetcher(&state, &page_speed, request, fetch_page_speed).await
+    let categories = request.categories.clone();
+    run_with_fetcher(&state, &page_speed, request, move |url, strategy| {
+        fetch_page_speed(url, strategy, categories)
+    })
+    .await
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -479,6 +810,7 @@ mod tests {
             record_id,
             strategy: PageSpeedStrategy::Desktop,
             request_id: request_id.into(),
+            categories: Vec::new(),
         }
     }
 
@@ -997,5 +1329,192 @@ mod tests {
             Some(&snapshot)
         );
         assert!(state.crawl_task.try_lock().is_ok());
+    }
+    #[tokio::test]
+    async fn field_vitals_snapshots_are_saved_for_the_selected_row() {
+        let store = ActiveStore::Sqlite(SqliteStore::in_memory().unwrap());
+        let row = store.upsert(page());
+        let state = state(store.clone());
+        let snapshot = run_field_vitals_with_fetcher(
+            &state,
+            RunFieldVitalsRequest {
+                record_id: row.id,
+                form_factor: FieldFormFactor::Desktop,
+            },
+            |url, form_factor| async move {
+                assert_eq!(url, "https://example.test/final");
+                assert_eq!(form_factor, FieldFormFactor::Desktop);
+                Ok(FieldVitalsMetrics {
+                    has_data: true,
+                    lcp_ms_p75: Some(1800.0),
+                    cls_p75: Some(0.02),
+                    inp_ms_p75: Some(120.0),
+                    fcp_ms_p75: Some(900.0),
+                    ttfb_ms_p75: Some(300.0),
+                    collection_period_start: Some("2026-08-15".into()),
+                    collection_period_end: Some("2026-09-11".into()),
+                    normalized_url: None,
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot.form_factor, FieldFormFactor::Desktop);
+        assert_eq!(store.records()[0].field_vitals, Some(snapshot));
+        let missing = run_field_vitals_with_fetcher(
+            &state,
+            RunFieldVitalsRequest {
+                record_id: row.id + 1,
+                form_factor: FieldFormFactor::Phone,
+            },
+            |_, _| async move { Ok(FieldVitalsMetrics::default()) },
+        )
+        .await;
+        assert!(missing.is_err());
+        let failed = run_field_vitals_with_fetcher(
+            &state,
+            RunFieldVitalsRequest {
+                record_id: row.id,
+                form_factor: FieldFormFactor::Phone,
+            },
+            |_, _| async move { Err("Chrome UX Report returned HTTP 429".to_string()) },
+        )
+        .await
+        .unwrap_err();
+        assert!(failed.contains("429"));
+        assert_eq!(
+            store.records()[0]
+                .field_vitals
+                .as_ref()
+                .map(|s| s.form_factor),
+            Some(FieldFormFactor::Desktop),
+            "failures keep the previous snapshot"
+        );
+    }
+    #[tokio::test]
+    async fn bulk_measurements_skip_resume_rows_retry_quota_errors_and_report_progress() {
+        let store = ActiveStore::Sqlite(SqliteStore::in_memory().unwrap());
+        let first = store.upsert(page());
+        let mut second_row = page();
+        second_row.url = "https://example.test/second".into();
+        second_row.final_url = "https://example.test/second".into();
+        second_row.storage_key = "https://example.test/second".into();
+        let second = store.upsert(second_row);
+        let mut third_row = page();
+        third_row.url = "https://example.test/third".into();
+        third_row.final_url = "https://example.test/third".into();
+        third_row.storage_key = "https://example.test/third".into();
+        third_row.status_code = Some(404);
+        let third = store.upsert(third_row);
+        store
+            .try_save_page_speed(
+                first.id,
+                PageSpeedSnapshot {
+                    strategy: PageSpeedStrategy::Mobile,
+                    requested_url: first.final_url.clone(),
+                    completed_at_ms: 1,
+                    final_url: None,
+                    fetched_at: None,
+                    lighthouse_version: None,
+                    performance_score: Some(0.5),
+                    accessibility_score: None,
+                    best_practices_score: None,
+                    seo_score: None,
+                    lcp_ms: None,
+                    cls: None,
+                    tbt_ms: None,
+                },
+            )
+            .unwrap();
+        let state = state(store.clone());
+        let page_speed = PageSpeedState::default();
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let seen_attempts = attempts.clone();
+        let seen_progress = progress.clone();
+        let result = run_page_speed_bulk_with_fetcher(
+            &state,
+            &page_speed,
+            RunPageSpeedBulkRequest {
+                record_ids: vec![first.id, second.id, third.id],
+                strategy: PageSpeedStrategy::Mobile,
+                request_id: "bulk-1".into(),
+                categories: vec![PageSpeedCategory::Performance],
+                resume: true,
+            },
+            move |url, _, categories| {
+                let attempts = seen_attempts.clone();
+                async move {
+                    assert_eq!(categories, vec![PageSpeedCategory::Performance]);
+                    let count = {
+                        let mut attempts = attempts.lock().unwrap();
+                        attempts.push(url.clone());
+                        attempts.iter().filter(|seen| **seen == url).count()
+                    };
+                    if count == 1 {
+                        Err("PageSpeed Insights returned HTTP 429".to_string())
+                    } else {
+                        Ok(metrics())
+                    }
+                }
+            },
+            move |event| seen_progress.lock().unwrap().push(event),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.measured, 1);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].record_id, third.id);
+        assert!(!result.cancelled);
+        assert_eq!(
+            attempts.lock().unwrap().len(),
+            2,
+            "one quota retry for the measured row"
+        );
+        let records = store.records();
+        assert_eq!(
+            records
+                .iter()
+                .find(|row| row.id == first.id)
+                .unwrap()
+                .page_speed
+                .as_ref()
+                .unwrap()
+                .performance_score,
+            Some(0.5),
+            "resume keeps the existing snapshot"
+        );
+        assert!(
+            records
+                .iter()
+                .find(|row| row.id == second.id)
+                .unwrap()
+                .page_speed
+                .is_some()
+        );
+        {
+            let progress = progress.lock().unwrap();
+            assert_eq!(progress.len(), 3);
+            assert_eq!(progress[2].completed, 3);
+            assert!(progress[2].error.is_some());
+        }
+        assert!(
+            run_page_speed_bulk_with_fetcher(
+                &state,
+                &page_speed,
+                RunPageSpeedBulkRequest {
+                    record_ids: Vec::new(),
+                    strategy: PageSpeedStrategy::Mobile,
+                    request_id: "bulk-2".into(),
+                    categories: Vec::new(),
+                    resume: false,
+                },
+                |_, _, _| async { Ok(metrics()) },
+                |_| {},
+            )
+            .await
+            .is_err()
+        );
     }
 }

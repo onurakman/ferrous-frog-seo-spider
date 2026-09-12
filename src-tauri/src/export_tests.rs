@@ -1634,3 +1634,56 @@ fn advanced_csv_and_sitemap_filters_remain_applied_after_the_first_storage_page(
     assert!(xml.contains("/keep/10000</loc>"));
     assert!(!xml.contains("/keep/10001</loc>"));
 }
+
+#[tokio::test]
+async fn webhook_posts_the_summary_and_reports_http_failures() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hooks", listener.local_addr().unwrap());
+    let (body_tx, body_rx) = tokio::sync::oneshot::channel::<String>();
+    let server = tokio::spawn(async move {
+        let mut body_tx = Some(body_tx);
+        for status in ["200 OK", "500 Internal Server Error"] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0_u8; 16_384];
+            let read = stream.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+            if let Some(tx) = body_tx.take() {
+                let _ = tx.send(request);
+            }
+            let _ = stream
+                .write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await;
+            let _ = stream.shutdown().await;
+        }
+    });
+    let progress = CrawlProgress {
+        status: "finished".into(),
+        crawled: 3,
+        queued: 0,
+        discovered: 4,
+        elapsed_ms: 120,
+        pages_per_second: 2.0,
+        summary: Default::default(),
+    };
+    let payload = automation_payload(
+        "session-1",
+        Some(&progress),
+        &[PathBuf::from("/tmp/exports/crawl.csv")],
+    );
+    assert_eq!(payload["event"], "crawl.finished");
+    assert_eq!(payload["crawled"], 3);
+    assert_eq!(payload["exports"][0], "/tmp/exports/crawl.csv");
+    assert_eq!(automation_payload("s", None, &[])["event"], "crawl.failed");
+    post_webhook(&url, &payload).await.unwrap();
+    let request = body_rx.await.unwrap();
+    assert!(request.starts_with("POST /hooks HTTP/1.1"));
+    assert!(request.contains("content-type: application/json"));
+    assert!(request.contains("\"sessionId\":\"session-1\""));
+    let failure = post_webhook(&url, &payload).await.unwrap_err();
+    assert!(failure.contains("500"), "{failure}");
+    server.abort();
+}

@@ -6,7 +6,7 @@ use ferrous_frog_parser::{
     parse_html_with_content, same_host,
 };
 use ferrous_frog_storage::{
-    CrawlFrontierItem, CrawlFrontierState, CrawlRecord, CrawlStore, CrawlSummary,
+    AuditThresholds, CrawlFrontierItem, CrawlFrontierState, CrawlRecord, CrawlStore, CrawlSummary,
     CustomExtractionValue, CustomSearchSource, CustomSearchValue, HreflangLink, ImageAsset,
     LinkEdge, LinkType, RedirectHop, StructuredDataIssue, UrlClassification,
 };
@@ -18,7 +18,7 @@ use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use regex::Regex;
 use reqwest::header::{
-    CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, LINK, LOCATION, RETRY_AFTER,
+    CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, LINK, LOCATION, RETRY_AFTER,
 };
 use reqwest::{Client, StatusCode, redirect::Policy};
 use rustls::ClientConfig;
@@ -58,6 +58,8 @@ const DEFAULT_REQUEST_HEADERS: [(&str, &str); 3] = [
 ];
 const CRAWL_CANCELLED_MESSAGE: &str = "crawl cancelled";
 const MIN_NEAR_DUPLICATE_WORDS: usize = 20;
+/// Recorded when a response has no Content-Type header but its body starts like an HTML document.
+pub const INFERRED_HTML_CONTENT_TYPE: &str = "text/html (inferred)";
 type HostRateLimiter = Arc<RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -76,6 +78,15 @@ pub struct CrawlConfig {
     pub max_response_bytes: usize,
     pub max_urls: usize,
     pub max_depth: usize,
+    /// Directory segments a discovered URL may have; 0 means unlimited.
+    #[serde(default)]
+    pub max_folder_depth: usize,
+    /// Characters a discovered URL may have; 0 means unlimited.
+    #[serde(default)]
+    pub max_url_length: usize,
+    /// URLs queued from one page; 0 means unlimited. Link evidence is retained beyond the limit.
+    #[serde(default)]
+    pub max_links_per_page: usize,
     pub concurrency: usize,
     pub requests_per_second: u32,
     pub request_delay_ms: u64,
@@ -101,6 +112,9 @@ pub struct CrawlConfig {
     pub exclude_url_patterns: Vec<String>,
     #[serde(default)]
     pub subdomain_scope: SubdomainScope,
+    /// Hosts, optionally with a path prefix, classified as internal (for example `cdn.example.com/assets`).
+    #[serde(default)]
+    pub cdn_hosts: Vec<String>,
     #[serde(default)]
     pub folder_scope: FolderScope,
     #[serde(default)]
@@ -115,11 +129,29 @@ pub struct CrawlConfig {
     #[serde(default)]
     pub resource_types: CrawlResourceTypes,
     #[serde(default)]
+    pub store: StoreChoices,
+    #[serde(default)]
     pub reference_links: ReferenceLinksConfig,
     #[serde(default)]
     pub query_settings: QuerySettings,
     #[serde(default)]
     pub content: ContentConfig,
+    #[serde(default)]
+    pub thresholds: AuditThresholds,
+    #[serde(default)]
+    pub automation: AutomationConfig,
+    #[serde(default)]
+    pub http_auth: HttpAuthConfig,
+    #[serde(default)]
+    pub schedule: ScheduleConfig,
+    #[serde(default)]
+    pub form_login: FormLoginConfig,
+    /// Form login credentials injected by the host at start; never serialized.
+    #[serde(skip)]
+    pub form_credentials: Option<BasicCredentials>,
+    /// Basic credentials injected by the host at start; never serialized into profiles or archives.
+    #[serde(skip)]
+    pub basic_credentials: Option<BasicCredentials>,
     #[serde(default)]
     pub custom_extractors: Vec<CustomExtractor>,
     #[serde(default)]
@@ -130,7 +162,7 @@ pub struct CrawlConfig {
     pub resume_from_state: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestHeader {
     pub name: String,
     pub value: String,
@@ -143,6 +175,8 @@ pub struct ReferenceLinksConfig {
     pub hreflang: bool,
     pub pagination: bool,
     pub amp: bool,
+    pub meta_refresh: bool,
+    pub iframe: bool,
 }
 
 impl ReferenceLinksConfig {
@@ -152,6 +186,8 @@ impl ReferenceLinksConfig {
             PageReferenceKind::Hreflang => self.hreflang,
             PageReferenceKind::Pagination => self.pagination,
             PageReferenceKind::Amp => self.amp,
+            PageReferenceKind::MetaRefresh => self.meta_refresh,
+            PageReferenceKind::Iframe => self.iframe,
         }
     }
 }
@@ -235,6 +271,159 @@ impl Default for CrawlResourceTypes {
     }
 }
 
+/// In-app schedule evaluated by the desktop app while it is open; the engine ignores it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ScheduleConfig {
+    pub mode: ScheduleMode,
+    /// First run as an ISO 8601 or `datetime-local` value; empty means "one interval after applying".
+    pub run_at: String,
+    pub interval_minutes: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ScheduleMode {
+    #[default]
+    None,
+    Once,
+    Interval,
+}
+
+impl ScheduleConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        match self.mode {
+            ScheduleMode::None => Ok(()),
+            ScheduleMode::Once if self.run_at.trim().is_empty() => {
+                Err("A one-off schedule needs a run time".to_string())
+            }
+            ScheduleMode::Once => Ok(()),
+            ScheduleMode::Interval if !(5..=10_080).contains(&self.interval_minutes) => {
+                Err("Interval schedules must repeat every 5 minutes to 7 days".to_string())
+            }
+            ScheduleMode::Interval => Ok(()),
+        }
+    }
+}
+
+/// Form login submitted once before crawling; the session cookies then follow every request.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FormLoginConfig {
+    pub enabled: bool,
+    pub url: String,
+    pub username_field: String,
+    pub password_field: String,
+    /// Extra static fields such as a "remember me" flag; secrets belong in the credential store.
+    pub extra_fields: Vec<RequestHeader>,
+}
+
+impl Default for FormLoginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            username_field: "username".to_string(),
+            password_field: "password".to_string(),
+            extra_fields: Vec::new(),
+        }
+    }
+}
+
+impl FormLoginConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if !Url::parse(self.url.trim())
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+        {
+            return Err("Form login needs an absolute HTTP or HTTPS login URL".to_string());
+        }
+        let field_ok = |name: &str| {
+            !name.trim().is_empty() && !name.chars().any(|c| c.is_control() || c == '=' || c == '&')
+        };
+        if !field_ok(&self.username_field)
+            || !field_ok(&self.password_field)
+            || self.extra_fields.iter().any(|field| !field_ok(&field.name))
+        {
+            return Err(
+                "Form field names must not be empty or contain control characters, '=' or '&'"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Persisted choice to send saved Basic credentials; the secret itself lives in the OS store.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct HttpAuthConfig {
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BasicCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+/// Actions the desktop app runs when a crawl finishes. The engine ignores these values.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AutomationConfig {
+    /// Export preset name (`basic`, `audit`, `full`) or empty for no automatic export.
+    pub export_preset: String,
+    /// HTTP(S) endpoint that receives a JSON summary, or empty.
+    pub webhook_url: String,
+    pub notify_on_completion: bool,
+}
+
+impl AutomationConfig {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !matches!(self.export_preset.trim(), "" | "basic" | "audit" | "full") {
+            return Err(format!(
+                "Unknown automatic export preset: {}",
+                self.export_preset
+            ));
+        }
+        let webhook = self.webhook_url.trim();
+        if !webhook.is_empty()
+            && !Url::parse(webhook)
+                .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some())
+        {
+            return Err("Webhook URL must be an absolute HTTP or HTTPS URL".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Retention choices for discovered URLs that are not crawled. Crawled types are always stored.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct StoreChoices {
+    pub images: bool,
+    pub css: bool,
+    pub javascript: bool,
+    pub other: bool,
+    pub internal_links: bool,
+    pub external_links: bool,
+}
+
+impl Default for StoreChoices {
+    fn default() -> Self {
+        Self {
+            images: true,
+            css: true,
+            javascript: true,
+            other: true,
+            internal_links: true,
+            external_links: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuerySettings {
@@ -259,6 +448,9 @@ impl Default for CrawlConfig {
             max_response_bytes: default_max_response_bytes(),
             max_urls: 5_000,
             max_depth: 3,
+            max_folder_depth: 0,
+            max_url_length: 0,
+            max_links_per_page: 0,
             concurrency: 8,
             requests_per_second: 10,
             request_delay_ms: 100,
@@ -275,15 +467,24 @@ impl Default for CrawlConfig {
             include_url_patterns: Vec::new(),
             exclude_url_patterns: Vec::new(),
             subdomain_scope: SubdomainScope::default(),
+            cdn_hosts: Vec::new(),
             folder_scope: FolderScope::default(),
             check_links_outside_start_folder: false,
             follow_nofollow: true,
             follow_internal_nofollow: None,
             follow_external_nofollow: None,
             resource_types: CrawlResourceTypes::default(),
+            store: StoreChoices::default(),
             reference_links: ReferenceLinksConfig::default(),
             query_settings: QuerySettings::default(),
             content: ContentConfig::default(),
+            thresholds: AuditThresholds::default(),
+            automation: AutomationConfig::default(),
+            http_auth: HttpAuthConfig::default(),
+            schedule: ScheduleConfig::default(),
+            form_login: FormLoginConfig::default(),
+            form_credentials: None,
+            basic_credentials: None,
             custom_extractors: Vec::new(),
             custom_searches: Vec::new(),
             rendering: JsRenderingConfig::default(),
@@ -585,11 +786,12 @@ pub async fn download_robots_txt(
     let started_at = Instant::now();
     let mut redirects = 0;
     let response = loop {
-        let response = request_with_headers(&client, &current_url, &root_url.origin(), &headers)
-            .timeout(timeout.saturating_sub(started_at.elapsed()))
-            .send()
-            .await
-            .context("failed to download robots.txt")?;
+        let response =
+            request_with_headers(&client, &current_url, &root_url.origin(), &headers, None)
+                .timeout(timeout.saturating_sub(started_at.elapsed()))
+                .send()
+                .await
+                .context("failed to download robots.txt")?;
         if !response.status().is_redirection() {
             break response;
         }
@@ -649,6 +851,8 @@ struct DiscoveredUrl {
     resource_type: DiscoveredResourceType,
     rel_nofollow: bool,
     reference_kind: Option<PageReferenceKind>,
+    /// False when the edge and counts were dropped by storage choices; the URL may still be queued.
+    stored: bool,
 }
 
 struct FetchOutput {
@@ -679,6 +883,7 @@ struct RequestPolicy {
     respect_robots: bool,
     header_origin: url::Origin,
     request_headers: HeaderMap,
+    basic_credentials: Option<BasicCredentials>,
     on_event: Arc<dyn Fn(CrawlerEvent) + Send + Sync>,
 }
 
@@ -740,14 +945,23 @@ where
         .redirect(Policy::none())
         .user_agent(config.user_agent.clone())
         .timeout(Duration::from_secs(config.timeout_secs))
+        .cookie_store(config.form_login.enabled)
         .build()
         .context("failed to build HTTP client")?;
+    if config.form_login.enabled {
+        submit_form_login(&client, &config, &root_url, on_event.as_ref()).await?;
+    }
     let request_policy = Arc::new(RequestPolicy {
         origins: Mutex::new(HashMap::new()),
         rate_limiter: host_rate_limiter(config.requests_per_second),
         respect_robots: config.respect_robots,
         header_origin: root_url.origin(),
         request_headers: parse_request_headers(&config.request_headers)?,
+        basic_credentials: config
+            .http_auth
+            .enabled
+            .then(|| config.basic_credentials.clone())
+            .flatten(),
         on_event: on_event.clone(),
     });
     let started_at = Instant::now();
@@ -804,7 +1018,7 @@ where
             discovered_sitemap_urls
                 .iter()
                 .filter(|url| {
-                    scope_host_allows(url, &root_url, config.subdomain_scope)
+                    host_is_internal(url, &root_url, &config)
                         && scope_allows(url, &root_url, &scope_rules, &config)
                 })
                 .map(ToString::to_string),
@@ -939,7 +1153,7 @@ where
 
             let mut record = output.record;
             record.classification = if Url::parse(&record.final_url)
-                .is_ok_and(|url| scope_host_allows(&url, &root_url, config.subdomain_scope))
+                .is_ok_and(|url| host_is_internal(&url, &root_url, &config))
             {
                 UrlClassification::Internal
             } else {
@@ -963,7 +1177,7 @@ where
                         let Ok(link_url) = Url::parse(&link.url) else {
                             continue;
                         };
-                        if !scope_host_allows(&link_url, &root_url, config.subdomain_scope)
+                        if !host_is_internal(&link_url, &root_url, &config)
                             || !scope_allows(&link_url, &root_url, &scope_rules, &config)
                             || (link.rel_nofollow
                                 && !config
@@ -991,7 +1205,7 @@ where
                         };
                         let mut new_sitemap_pages = Vec::new();
                         for url in discovered {
-                            if !scope_host_allows(&url, &root_url, config.subdomain_scope)
+                            if !host_is_internal(&url, &root_url, &config)
                                 || !scope_allows(&url, &root_url, &scope_rules, &config)
                             {
                                 continue;
@@ -1019,7 +1233,13 @@ where
                         }
                     }
                 }
+                let mut queued_from_page = 0_usize;
                 for link in &output.links {
+                    if config.max_links_per_page > 0
+                        && queued_from_page >= config.max_links_per_page
+                    {
+                        break;
+                    }
                     if link
                         .reference_kind
                         .is_some_and(|kind| !config.reference_links.allows(kind))
@@ -1039,13 +1259,12 @@ where
                     let Ok(mut link_url) = Url::parse(&link.url) else {
                         continue;
                     };
-                    let follow_nofollow =
-                        if scope_host_allows(&link_url, &root_url, config.subdomain_scope) {
-                            config.follow_internal_nofollow
-                        } else {
-                            config.follow_external_nofollow
-                        }
-                        .unwrap_or(config.follow_nofollow);
+                    let follow_nofollow = if host_is_internal(&link_url, &root_url, &config) {
+                        config.follow_internal_nofollow
+                    } else {
+                        config.follow_external_nofollow
+                    }
+                    .unwrap_or(config.follow_nofollow);
                     if link.rel_nofollow && !follow_nofollow {
                         continue;
                     }
@@ -1055,14 +1274,14 @@ where
                             &link_url,
                             &root_url,
                             link.resource_type,
-                            &config.resource_types,
-                            config.subdomain_scope,
+                            &config,
                         )
                     {
                         continue;
                     }
                     let normalized = link_url.to_string();
                     if seen.insert(normalized.clone()) {
+                        queued_from_page += 1;
                         queue.push_back(QueueItem {
                             url: link_url,
                             depth: next_depth,
@@ -1083,7 +1302,7 @@ where
             for link in output
                 .links
                 .iter()
-                .filter(|link| link.reference_kind.is_none())
+                .filter(|link| link.reference_kind.is_none() && link.stored)
             {
                 if let Ok(mut link_url) = Url::parse(&link.url) {
                     normalize_url_query(&mut link_url, &config.query_settings, &query_rules);
@@ -1193,6 +1412,24 @@ pub fn validate_configuration(config: &CrawlConfig) -> Result<()> {
         );
     }
     parse_request_headers(&config.request_headers)?;
+    config.thresholds.validate().map_err(anyhow::Error::msg)?;
+    config.automation.validate().map_err(anyhow::Error::msg)?;
+    config.schedule.validate().map_err(anyhow::Error::msg)?;
+    config.form_login.validate().map_err(anyhow::Error::msg)?;
+    for entry in config
+        .cdn_hosts
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+    {
+        let candidate = entry
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        anyhow::ensure!(
+            Url::parse(&format!("https://{candidate}")).is_ok_and(|url| url.host().is_some()),
+            "CDN entries must be a host with an optional path prefix: {entry}"
+        );
+    }
     compile_scope_rules(config)?;
     compile_query_rules(config)?;
     ContentSelectors::compile(&config.content).map_err(anyhow::Error::msg)?;
@@ -1331,7 +1568,7 @@ fn seed_frontier(
             break;
         }
         normalize_url_query(&mut sitemap_url, &config.query_settings, query_rules);
-        if scope_host_allows(&sitemap_url, root_url, config.subdomain_scope)
+        if host_is_internal(&sitemap_url, root_url, config)
             && scope_allows(&sitemap_url, root_url, scope_rules, config)
         {
             let normalized = sitemap_url.to_string();
@@ -1554,9 +1791,25 @@ fn scope_patterns_allow(url: &Url, rules: &ScopeRules) -> bool {
             .any(|pattern| pattern.is_match(url.as_str()))
 }
 
+fn folder_depth(url: &Url) -> usize {
+    let path = url.path();
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .count();
+    // The last segment is a page unless the path ends with a slash.
+    segments.saturating_sub(usize::from(!path.ends_with('/')))
+}
+
+fn url_limits_allow(url: &Url, config: &CrawlConfig) -> bool {
+    (config.max_url_length == 0 || url.as_str().len() <= config.max_url_length)
+        && (config.max_folder_depth == 0 || folder_depth(url) <= config.max_folder_depth)
+}
+
 fn scope_allows(url: &Url, root_url: &Url, rules: &ScopeRules, config: &CrawlConfig) -> bool {
-    scope_patterns_allow(url, rules)
-        && if scope_host_allows(url, root_url, config.subdomain_scope) {
+    url_limits_allow(url, config)
+        && scope_patterns_allow(url, rules)
+        && if host_is_internal(url, root_url, config) {
             folder_scope_allows(url, root_url, config.folder_scope)
         } else {
             config.resource_types.external && config.folder_scope != FolderScope::ExactUrl
@@ -1568,7 +1821,7 @@ fn check_scope_allows(url: &Url, root_url: &Url, rules: &ScopeRules, config: &Cr
         || (config.mode == CrawlMode::Spider
             && config.folder_scope == FolderScope::StartFolder
             && config.check_links_outside_start_folder
-            && scope_host_allows(url, root_url, config.subdomain_scope)
+            && host_is_internal(url, root_url, config)
             && scope_patterns_allow(url, rules))
 }
 
@@ -1577,10 +1830,38 @@ fn can_expand_record(record: &CrawlRecord, root_url: &Url, config: &CrawlConfig)
         || !config.check_links_outside_start_folder
         || [&record.url, &record.final_url].into_iter().all(|value| {
             Url::parse(value).is_ok_and(|url| {
-                scope_host_allows(&url, root_url, config.subdomain_scope)
+                host_is_internal(&url, root_url, config)
                     && folder_scope_allows(&url, root_url, FolderScope::StartFolder)
             })
         })
+}
+
+/// Internal classification: the configured host scope plus explicit CDN hosts.
+/// CDN entries never grant external crawl permission; they move URLs into the internal rules.
+fn host_is_internal(url: &Url, root_url: &Url, config: &CrawlConfig) -> bool {
+    scope_host_allows(url, root_url, config.subdomain_scope)
+        || cdn_host_matches(url, &config.cdn_hosts)
+}
+
+fn cdn_host_matches(url: &Url, cdn_hosts: &[String]) -> bool {
+    let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+        return false;
+    };
+    let host = host.trim_end_matches('.');
+    cdn_hosts.iter().any(|entry| {
+        let entry = entry
+            .trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        let (entry_host, entry_path) = entry.split_once('/').unwrap_or((entry, ""));
+        !entry_host.is_empty()
+            && entry_host.trim_end_matches('.').eq_ignore_ascii_case(host)
+            && (entry_path.is_empty()
+                || url
+                    .path()
+                    .trim_start_matches('/')
+                    .starts_with(entry_path.trim_end_matches('/')))
+    })
 }
 
 fn scope_host_allows(url: &Url, root_url: &Url, scope: SubdomainScope) -> bool {
@@ -1688,14 +1969,37 @@ fn normalize_url_query(url: &mut Url, settings: &QuerySettings, rules: &QueryRul
     }
 }
 
+/// Crawled types are always stored; store choices only govern evidence for URLs that are not requested.
+fn should_store_discovered(
+    url: &Url,
+    root_url: &Url,
+    resource_type: DiscoveredResourceType,
+    config: &CrawlConfig,
+) -> bool {
+    should_crawl_discovered(url, root_url, resource_type, config)
+        || match resource_type {
+            DiscoveredResourceType::Html | DiscoveredResourceType::Sitemap => {
+                if host_is_internal(url, root_url, config) {
+                    config.store.internal_links
+                } else {
+                    config.store.external_links
+                }
+            }
+            DiscoveredResourceType::Image => config.store.images,
+            DiscoveredResourceType::Css => config.store.css,
+            DiscoveredResourceType::JavaScript => config.store.javascript,
+            DiscoveredResourceType::Other => config.store.other,
+        }
+}
+
 fn should_crawl_discovered(
     url: &Url,
     root_url: &Url,
     resource_type: DiscoveredResourceType,
-    resource_types: &CrawlResourceTypes,
-    subdomain_scope: SubdomainScope,
+    config: &CrawlConfig,
 ) -> bool {
-    let is_internal = scope_host_allows(url, root_url, subdomain_scope);
+    let resource_types = &config.resource_types;
+    let is_internal = host_is_internal(url, root_url, config);
     if !is_internal && !resource_types.external {
         return false;
     }
@@ -1745,6 +2049,7 @@ fn discovered_reference(
         resource_type,
         rel_nofollow,
         reference_kind: Some(kind),
+        stored: true,
     })
 }
 
@@ -2166,7 +2471,7 @@ fn parse_sitemap_document(
                             if current_entry == Some(SitemapEntryKind::Url) {
                                 normalize_url_query(&mut url, &config.query_settings, &query_rules);
                                 if config.mode == CrawlMode::Spider
-                                    && (!scope_host_allows(&url, &root_url, config.subdomain_scope)
+                                    && (!host_is_internal(&url, &root_url, config)
                                         || !scope_allows(&url, &root_url, &scope_rules, config))
                                 {
                                     continue;
@@ -2210,6 +2515,13 @@ fn parse_sitemap_document(
             _ => {}
         }
     }
+}
+
+fn body_looks_like_html(body: &[u8]) -> bool {
+    let head = &body[..body.len().min(1024)];
+    let head = String::from_utf8_lossy(head).to_ascii_lowercase();
+    let head = head.trim_start_matches('\u{feff}').trim_start();
+    head.starts_with("<!doctype html") || head.starts_with("<html")
 }
 
 #[expect(
@@ -2442,7 +2754,11 @@ async fn fetch_one(
         network_timings.transfer_rate_bytes_per_sec =
             transfer_rate_bytes_per_sec(bytes.len(), network_timings.download_time_ms);
 
-        let content_type = header_string(&headers_for_record, CONTENT_TYPE);
+        let mut content_type = header_string(&headers_for_record, CONTENT_TYPE);
+        let inferred_html = content_type.is_none() && body_looks_like_html(&bytes);
+        if inferred_html {
+            content_type = Some(INFERRED_HTML_CONTENT_TYPE.to_string());
+        }
         let is_html = content_type
             .as_deref()
             .map(|value| value.to_ascii_lowercase().contains("text/html"))
@@ -2459,6 +2775,9 @@ async fn fetch_one(
             redirect_chain,
             None,
         );
+        if inferred_html {
+            record.content_type = content_type.clone();
+        }
         apply_network_timings(&mut record, network_timings);
         let mut edges = Vec::new();
         let mut image_assets = Vec::new();
@@ -2517,6 +2836,7 @@ async fn fetch_one(
             record.insecure_form_count = signals.insecure_form_count;
             record.viewport = signals.viewport;
             record.amphtml = signals.amphtml;
+            record.meta_keywords = signals.meta_keywords;
             record.rel_next = signals.rel_next;
             record.rel_prev = signals.rel_prev;
             record.hreflang_count = signals.hreflang_count;
@@ -2569,6 +2889,11 @@ async fn fetch_one(
             }
 
             for image in page_images {
+                if !Url::parse(&image.url).is_ok_and(|url| {
+                    should_store_discovered(&url, &root_url, DiscoveredResourceType::Image, &config)
+                }) {
+                    continue;
+                }
                 image_assets.push(ImageAsset {
                     id: 0,
                     page_url: current_url.to_string(),
@@ -2590,6 +2915,7 @@ async fn fetch_one(
                 resource_type: DiscoveredResourceType::Sitemap,
                 rel_nofollow: page_nofollow,
                 reference_kind: None,
+                stored: true,
             }));
             links.extend(signals.reference_links.into_iter().filter_map(|reference| {
                 discovered_reference(reference.url, reference.kind, reference.rel_nofollow)
@@ -2608,15 +2934,16 @@ async fn fetch_one(
                 } else {
                     classify_anchor_resource(&target_url)
                 };
-                let link_type = if scope_host_allows(&target_url, &root_url, config.subdomain_scope)
-                {
+                let link_type = if host_is_internal(&target_url, &root_url, &config) {
                     LinkType::Internal
                 } else {
                     LinkType::External
                 };
-                if link_type == LinkType::Internal {
+                let stored =
+                    should_store_discovered(&target_url, &root_url, resource_type, &config);
+                if stored && link_type == LinkType::Internal {
                     record.internal_outlink_count += 1;
-                } else {
+                } else if stored {
                     record.external_outlink_count += 1;
                 }
                 links.push(DiscoveredUrl {
@@ -2632,7 +2959,11 @@ async fn fetch_one(
                     resource_type,
                     rel_nofollow,
                     reference_kind: None,
+                    stored,
                 });
+                if !stored {
+                    continue;
+                }
                 edges.push(LinkEdge {
                     id: 0,
                     source_url: current_url.to_string(),
@@ -2655,15 +2986,16 @@ async fn fetch_one(
                 normalize_url_query(&mut target_url, &config.query_settings, &query_rules);
                 let target_url_string = target_url.to_string();
                 let resource_type = map_page_resource_type(resource.resource_type);
-                let link_type = if scope_host_allows(&target_url, &root_url, config.subdomain_scope)
-                {
+                let link_type = if host_is_internal(&target_url, &root_url, &config) {
                     LinkType::Internal
                 } else {
                     LinkType::External
                 };
-                if link_type == LinkType::Internal {
+                let stored =
+                    should_store_discovered(&target_url, &root_url, resource_type, &config);
+                if stored && link_type == LinkType::Internal {
                     record.internal_outlink_count += 1;
-                } else {
+                } else if stored {
                     record.external_outlink_count += 1;
                 }
                 links.push(DiscoveredUrl {
@@ -2671,7 +3003,11 @@ async fn fetch_one(
                     resource_type,
                     rel_nofollow: page_nofollow,
                     reference_kind: None,
+                    stored,
                 });
+                if !stored {
+                    continue;
+                }
                 edges.push(LinkEdge {
                     id: 0,
                     source_url: current_url.to_string(),
@@ -2866,15 +3202,184 @@ fn host_rate_limiter(requests_per_second: u32) -> Option<HostRateLimiter> {
         .map(Arc::new)
 }
 
+fn request_uri(url: &Url) -> String {
+    match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    }
+}
+
+fn md5_hex(input: &str) -> String {
+    use md5::Digest as _;
+    format!("{:x}", md5::Md5::digest(input.as_bytes()))
+}
+
+/// Parses `key=value` and `key="quoted"` pairs from a WWW-Authenticate challenge.
+fn digest_challenge_params(challenge: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    let mut rest = challenge.trim();
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches([',', ' ', '\t']);
+        let Some(equals) = rest.find('=') else { break };
+        let key = rest[..equals].trim().to_ascii_lowercase();
+        rest = &rest[equals + 1..];
+        let value = if let Some(stripped) = rest.strip_prefix('"') {
+            let end = stripped.find('"').unwrap_or(stripped.len());
+            let value = &stripped[..end];
+            rest = stripped.get(end + 1..).unwrap_or("");
+            value.to_string()
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            let value = rest[..end].trim().to_string();
+            rest = &rest[end..];
+            value
+        };
+        params.insert(key, value);
+    }
+    params
+}
+
+/// Builds an RFC 7616 MD5 `Authorization: Digest` value for `qop=auth` or legacy challenges.
+/// Returns `None` for non-Digest challenges and unsupported algorithms or `auth-int`.
+fn digest_authorization_header(
+    challenge: &str,
+    method: &str,
+    uri: &str,
+    credentials: &BasicCredentials,
+    cnonce: &str,
+) -> Option<String> {
+    let scheme_end = challenge
+        .find(char::is_whitespace)
+        .unwrap_or(challenge.len());
+    if !challenge[..scheme_end].eq_ignore_ascii_case("digest") {
+        return None;
+    }
+    let params = digest_challenge_params(&challenge[scheme_end..]);
+    let realm = params.get("realm")?;
+    let nonce = params.get("nonce")?;
+    let algorithm = params
+        .get("algorithm")
+        .map(|value| value.to_ascii_uppercase())
+        .unwrap_or_else(|| "MD5".to_string());
+    if !matches!(algorithm.as_str(), "MD5" | "MD5-SESS") {
+        return None;
+    }
+    let qop = params.get("qop").and_then(|offered| {
+        offered
+            .split(',')
+            .map(str::trim)
+            .find(|value| value.eq_ignore_ascii_case("auth"))
+            .map(|_| "auth")
+            .or(Some("unsupported"))
+    });
+    if qop == Some("unsupported") {
+        return None;
+    }
+    let mut ha1 = md5_hex(&format!(
+        "{}:{realm}:{}",
+        credentials.username, credentials.password
+    ));
+    if algorithm == "MD5-SESS" {
+        ha1 = md5_hex(&format!("{ha1}:{nonce}:{cnonce}"));
+    }
+    let ha2 = md5_hex(&format!("{method}:{uri}"));
+    let nc = "00000001";
+    let response = match qop {
+        Some(_) => md5_hex(&format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}")),
+        None => md5_hex(&format!("{ha1}:{nonce}:{ha2}")),
+    };
+    let quote = |value: &str| value.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut header = format!(
+        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{uri}\", response=\"{response}\", algorithm={algorithm}",
+        quote(&credentials.username),
+        quote(realm),
+        quote(nonce)
+    );
+    if qop.is_some() {
+        header.push_str(&format!(", qop=auth, nc={nc}, cnonce=\"{cnonce}\""));
+    }
+    if let Some(opaque) = params.get("opaque") {
+        header.push_str(&format!(", opaque=\"{}\"", quote(opaque)));
+    }
+    Some(header)
+}
+
+/// Posts the login form once. Cookies set by the response live in the client's jar for the crawl.
+async fn submit_form_login(
+    client: &Client,
+    config: &CrawlConfig,
+    root_url: &Url,
+    on_event: &(dyn Fn(CrawlerEvent) + Send + Sync),
+) -> Result<()> {
+    let credentials = config.form_credentials.as_ref().context(
+        "Form login is enabled but no credentials were provided; save them in Settings > HTTP headers",
+    )?;
+    let login_url = Url::parse(config.form_login.url.trim()).context("invalid form login URL")?;
+    let mut fields: Vec<(String, String)> = config
+        .form_login
+        .extra_fields
+        .iter()
+        .map(|field| (field.name.trim().to_string(), field.value.clone()))
+        .collect();
+    fields.push((
+        config.form_login.username_field.trim().to_string(),
+        credentials.username.clone(),
+    ));
+    fields.push((
+        config.form_login.password_field.trim().to_string(),
+        credentials.password.clone(),
+    ));
+    let body = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(
+            fields
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str())),
+        )
+        .finish();
+    let mut request = client.post(login_url.clone());
+    if login_url.origin() == root_url.origin() {
+        request = request.headers(parse_request_headers(&config.request_headers)?);
+        if config.http_auth.enabled
+            && let Some(auth) = &config.basic_credentials
+        {
+            request = request.basic_auth(&auth.username, Some(&auth.password));
+        }
+    }
+    let response = request
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(body)
+        .send()
+        .await
+        .context("form login request failed")?;
+    let status = response.status();
+    anyhow::ensure!(
+        status.is_success() || status.is_redirection(),
+        "Form login returned HTTP {status}; check the login URL and field names"
+    );
+    on_event(CrawlerEvent::notice(format!(
+        "Form login submitted to {login_url} (HTTP {})",
+        status.as_u16()
+    )));
+    Ok(())
+}
+
 fn request_with_headers(
     client: &Client,
     url: &Url,
     origin: &url::Origin,
     headers: &HeaderMap,
+    credentials: Option<&BasicCredentials>,
 ) -> reqwest::RequestBuilder {
     let request = client.get(url.clone());
     if url.origin() == *origin {
-        request.headers(headers.clone())
+        let request = request.headers(headers.clone());
+        match credentials {
+            Some(auth) => request.basic_auth(&auth.username, Some(&auth.password)),
+            None => request,
+        }
     } else {
         request
     }
@@ -2882,7 +3387,13 @@ fn request_with_headers(
 
 impl RequestPolicy {
     fn request(&self, client: &Client, url: &Url) -> reqwest::RequestBuilder {
-        request_with_headers(client, url, &self.header_origin, &self.request_headers)
+        request_with_headers(
+            client,
+            url,
+            &self.header_origin,
+            &self.request_headers,
+            self.basic_credentials.as_ref(),
+        )
     }
 
     async fn send(
@@ -2895,6 +3406,7 @@ impl RequestPolicy {
         measure_timings: bool,
     ) -> Result<FetchedResponse> {
         let mut attempt = 0;
+        let mut digest_authorization: Option<HeaderValue> = None;
         loop {
             wait_if_paused(control).await;
             ensure_not_cancelled(control)?;
@@ -2912,11 +3424,38 @@ impl RequestPolicy {
             }
             self.wait(url, delay_ms, control).await?;
             let request_started_at = Instant::now();
+            let mut request = self.request(client, url);
+            if let Some(authorization) = &digest_authorization {
+                request = request.header(reqwest::header::AUTHORIZATION, authorization.clone());
+            }
             let response = tokio::select! {
-                response = self.request(client, url).send() => response,
+                response = request.send() => response,
                 _ = wait_until_cancelled(control) => anyhow::bail!(CRAWL_CANCELLED_MESSAGE),
             };
             network_timings.total_network_time_ms = Some(elapsed_ms(request_started_at));
+            // Answer one Digest challenge per request with the same credentials as Basic auth.
+            if digest_authorization.is_none()
+                && let Ok(challenge) = &response
+                && challenge.status() == StatusCode::UNAUTHORIZED
+                && url.origin() == self.header_origin
+                && let Some(credentials) = &self.basic_credentials
+                && let Some(header) = challenge
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|value| value.to_str().ok())
+                && let Some(value) = digest_authorization_header(
+                    header,
+                    "GET",
+                    &request_uri(url),
+                    credentials,
+                    &format!("{:016x}", request_started_at.elapsed().as_nanos() ^ 0x5eed),
+                )
+                && let Ok(value) = HeaderValue::from_str(&value)
+            {
+                digest_authorization = Some(value);
+                drop(response);
+                continue;
+            }
             let retryable = match &response {
                 Ok(response) => {
                     network_timings.ttfb_ms = network_timings.total_network_time_ms;
@@ -3370,6 +3909,7 @@ fn status_record(
         title_len: 0,
         title_pixel_width: 0,
         meta_description: None,
+        meta_keywords: None,
         meta_description_count: None,
         meta_description_len: 0,
         meta_description_pixel_width: 0,
@@ -3431,6 +3971,15 @@ fn status_record(
         search_console_ctr: None,
         search_console_average_position: None,
         page_speed: None,
+        field_vitals: None,
+        ai_insights: None,
+        analytics_sessions: None,
+        analytics_engaged_sessions: None,
+        analytics_conversions: None,
+        analytics_revenue: None,
+        backlink_count: None,
+        referring_domain_count: None,
+        backlink_authority: None,
         error,
     }
 }
@@ -3483,6 +4032,7 @@ fn error_record(
         title_len: 0,
         title_pixel_width: 0,
         meta_description: None,
+        meta_keywords: None,
         meta_description_count: None,
         meta_description_len: 0,
         meta_description_pixel_width: 0,
@@ -3544,6 +4094,15 @@ fn error_record(
         search_console_ctr: None,
         search_console_average_position: None,
         page_speed: None,
+        field_vitals: None,
+        ai_insights: None,
+        analytics_sessions: None,
+        analytics_engaged_sessions: None,
+        analytics_conversions: None,
+        analytics_revenue: None,
+        backlink_count: None,
+        referring_domain_count: None,
+        backlink_authority: None,
         error: Some(error),
     }
 }
@@ -3587,6 +4146,7 @@ fn blocked_record(url: &Url, depth: usize, root_url: &Url) -> CrawlRecord {
         title_len: 0,
         title_pixel_width: 0,
         meta_description: None,
+        meta_keywords: None,
         meta_description_count: None,
         meta_description_len: 0,
         meta_description_pixel_width: 0,
@@ -3648,6 +4208,15 @@ fn blocked_record(url: &Url, depth: usize, root_url: &Url) -> CrawlRecord {
         search_console_ctr: None,
         search_console_average_position: None,
         page_speed: None,
+        field_vitals: None,
+        ai_insights: None,
+        analytics_sessions: None,
+        analytics_engaged_sessions: None,
+        analytics_conversions: None,
+        analytics_revenue: None,
+        backlink_count: None,
+        referring_domain_count: None,
+        backlink_authority: None,
         error: Some("Blocked by robots.txt".to_string()),
     }
 }
@@ -3827,7 +4396,7 @@ mod tests {
     }
 
     use super::*;
-    use ferrous_frog_storage::{GridQuery, IssueView, MemoryStore};
+    use ferrous_frog_storage::{GridQuery, ImageAssetQuery, IssueView, LinkEdgeQuery, MemoryStore};
     use std::sync::atomic::AtomicUsize;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -3857,7 +4426,7 @@ mod tests {
         let value = serde_json::to_value(restored).unwrap();
         assert_eq!(
             value["referenceLinks"],
-            serde_json::json!({"canonical":false,"hreflang":false,"pagination":false,"amp":false})
+            serde_json::json!({"canonical":false,"hreflang":false,"pagination":false,"amp":false,"metaRefresh":false,"iframe":false})
         );
         let config = config_with_controls(
             CrawlConfig::default(),
@@ -3865,8 +4434,994 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(config).unwrap()["referenceLinks"],
-            serde_json::json!({"canonical":true,"hreflang":false,"pagination":false,"amp":false})
+            serde_json::json!({"canonical":true,"hreflang":false,"pagination":false,"amp":false,"metaRefresh":false,"iframe":false})
         );
+    }
+
+    /// Deterministic xorshift generator so the property test needs no extra dependency.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, bound: usize) -> usize {
+            (self.next() % bound as u64) as usize
+        }
+
+        fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+            items[self.below(items.len())]
+        }
+    }
+
+    #[test]
+    fn frontier_normalization_properties_hold_for_generated_urls() {
+        let mut rng = Xorshift(0x9E37_79B9_7F4A_7C15);
+        let base = Url::parse("https://example.test/dir/").unwrap();
+        let names = ["a", "b", "utm_source", "page", "id"];
+        let values = ["1", "2", "x y", "", "%20"];
+        let hrefs = [
+            "/dir/page",
+            "page",
+            "../other",
+            "/dir/page/",
+            "//example.test/dir/page",
+        ];
+        for _ in 0..500 {
+            let settings = QuerySettings {
+                sort_parameters: rng.below(2) == 0,
+                strip_all: rng.below(4) == 0,
+                max_parameters: rng.below(4),
+                strip_parameter_patterns: if rng.below(2) == 0 {
+                    vec!["^utm_".to_string()]
+                } else {
+                    Vec::new()
+                },
+            };
+            let rules = compile_query_rules(&CrawlConfig {
+                query_settings: settings.clone(),
+                ..CrawlConfig::default()
+            })
+            .unwrap();
+            let pairs: Vec<(String, String)> = (0..rng.below(5))
+                .map(|_| (rng.pick(&names).to_string(), rng.pick(&values).to_string()))
+                .collect();
+            let mut url = ferrous_frog_parser::normalize_url(&base, rng.pick(&hrefs)).unwrap();
+            if !pairs.is_empty() {
+                url.query_pairs_mut().extend_pairs(pairs.iter().cloned());
+            }
+            url.set_fragment(Some("section"));
+
+            let mut once = url.clone();
+            normalize_url_query(&mut once, &settings, &rules);
+            let mut twice = once.clone();
+            normalize_url_query(&mut twice, &settings, &rules);
+            assert_eq!(once, twice, "normalization is idempotent: {url}");
+            assert!(
+                once.fragment().is_none(),
+                "fragments never reach the frontier"
+            );
+            if settings.strip_all {
+                assert!(once.query().is_none(), "strip-all removes every parameter");
+            }
+            if settings.max_parameters > 0 {
+                assert!(
+                    once.query_pairs().count() <= settings.max_parameters,
+                    "{once}"
+                );
+            }
+            if !settings.strip_parameter_patterns.is_empty() {
+                assert!(
+                    once.query_pairs()
+                        .all(|(name, _)| !name.starts_with("utm_")),
+                    "stripped names never survive: {once}"
+                );
+            }
+
+            // Sorting makes the frontier key independent of parameter order.
+            if settings.sort_parameters && settings.max_parameters == 0 {
+                let mut reversed = url.clone();
+                reversed.set_query(None);
+                if !pairs.is_empty() {
+                    reversed
+                        .query_pairs_mut()
+                        .extend_pairs(pairs.iter().rev().cloned());
+                }
+                normalize_url_query(&mut reversed, &settings, &rules);
+                assert_eq!(once, reversed, "parameter order does not create a new URL");
+            }
+
+            // Every variant collapses onto one seen-set entry, so a page is queued at most once.
+            let mut seen = HashSet::new();
+            for variant in [&url, &once, &twice] {
+                let mut key = variant.clone();
+                normalize_url_query(&mut key, &settings, &rules);
+                seen.insert(key.to_string());
+            }
+            assert_eq!(seen.len(), 1, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_content_type_is_inferred_from_html_bodies_only() {
+        assert!(body_looks_like_html(b"\xEF\xBB\xBF  <!DOCTYPE HTML><html>"));
+        assert!(body_looks_like_html(b"<HTML lang=en>"));
+        assert!(!body_looks_like_html(b"{\"html\": \"<html>\"}"));
+        let (base_url, requests, server) = spawn_recording_site(|path| {
+            let body = match path {
+                "/" => "<html><head><title>Inferred</title></head><body><a href=\"/next\">Next</a></body></html>",
+                "/next" => "plain text without a type",
+                _ => "",
+            };
+            let status = if body.is_empty() { "404 Not Found" } else { "200 OK" };
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        })
+        .await;
+        let store = MemoryStore::new();
+        let config = CrawlConfig {
+            start_url: base_url.clone(),
+            max_depth: 1,
+            respect_robots: false,
+            request_delay_ms: 0,
+            requests_per_second: 0,
+            sitemap: SitemapConfig {
+                enabled: false,
+                ..SitemapConfig::default()
+            },
+            ..CrawlConfig::default()
+        };
+        crawl(config, store.clone(), CrawlControl::default(), |_| {})
+            .await
+            .unwrap();
+        server.abort();
+        let records = store.records();
+        let root = records.iter().find(|row| row.url == base_url).unwrap();
+        assert_eq!(
+            root.content_type.as_deref(),
+            Some(INFERRED_HTML_CONTENT_TYPE)
+        );
+        assert_eq!(root.title.as_deref(), Some("Inferred"));
+        assert_eq!(root.outlink_count, 1);
+        let next = records
+            .iter()
+            .find(|row| row.url == format!("{base_url}next"))
+            .unwrap();
+        assert_eq!(next.status_code, Some(200));
+        assert_eq!(next.content_type, None);
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(path, _)| path == "/next")
+        );
+    }
+
+    #[tokio::test]
+    async fn basic_credentials_reach_only_the_starting_origin_when_enabled() {
+        let seen_external: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let seen_internal: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let external_seen = seen_external.clone();
+        let (external_url, _, external_server) =
+            spawn_recording_site_with_request(move |_, request| {
+                external_seen.lock().unwrap().push(request.to_string());
+                response(200, "OK", "text/html", "<html><body>external</body></html>")
+            })
+            .await;
+        let link = format!("{external_url}page");
+        let internal_seen = seen_internal.clone();
+        let (base_url, _, server) = spawn_recording_site_with_request(move |path, request| {
+            internal_seen.lock().unwrap().push(request.to_string());
+            if path == "/" {
+                response(
+                    200,
+                    "OK",
+                    "text/html",
+                    &format!(
+                        "<html><body><a href=\"/a\">A</a><a href=\"{link}\">Ext</a></body></html>"
+                    ),
+                )
+            } else {
+                response(200, "OK", "text/html", "<html><body>a</body></html>")
+            }
+        })
+        .await;
+        let config = |enabled: bool, credentials: Option<BasicCredentials>| CrawlConfig {
+            start_url: base_url.clone(),
+            max_depth: 1,
+            respect_robots: false,
+            request_delay_ms: 0,
+            requests_per_second: 0,
+            resource_types: CrawlResourceTypes {
+                external: true,
+                ..CrawlResourceTypes::default()
+            },
+            sitemap: SitemapConfig {
+                enabled: false,
+                ..SitemapConfig::default()
+            },
+            http_auth: HttpAuthConfig { enabled },
+            basic_credentials: credentials,
+            ..CrawlConfig::default()
+        };
+        let credentials = BasicCredentials {
+            username: "frog".into(),
+            password: "sécret pass".into(),
+        };
+        let expected = "authorization: Basic ZnJvZzpzw6ljcmV0IHBhc3M=";
+        let has_auth = |requests: &Arc<std::sync::Mutex<Vec<String>>>| -> Vec<bool> {
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|request| request.contains(expected))
+                .collect()
+        };
+        crawl(
+            config(true, Some(credentials.clone())),
+            MemoryStore::new(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let internal = has_auth(&seen_internal);
+        assert_eq!(internal.len(), 2);
+        assert!(
+            internal.iter().all(|sent| *sent),
+            "{internal:?} {:?}",
+            seen_internal.lock().unwrap()
+        );
+        let external = has_auth(&seen_external);
+        assert_eq!(external, vec![false]);
+
+        seen_internal.lock().unwrap().clear();
+        crawl(
+            config(false, Some(credentials)),
+            MemoryStore::new(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(has_auth(&seen_internal).iter().all(|sent| !*sent));
+        // Secrets never enter serialized configuration.
+        let json = serde_json::to_string(&config(
+            true,
+            Some(BasicCredentials {
+                username: "frog".into(),
+                password: "hidden".into(),
+            }),
+        ))
+        .unwrap();
+        assert!(!json.contains("hidden") && !json.contains("basicCredentials"));
+        assert!(json.contains("\"httpAuth\":{\"enabled\":true}"));
+        server.abort();
+        external_server.abort();
+    }
+
+    #[test]
+    fn digest_header_matches_the_rfc_example_and_rejects_unsupported_challenges() {
+        let credentials = BasicCredentials {
+            username: "Mufasa".into(),
+            password: "Circle Of Life".into(),
+        };
+        let challenge = "Digest realm=\"testrealm@host.com\", qop=\"auth,auth-int\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"";
+        let header = digest_authorization_header(
+            challenge,
+            "GET",
+            "/dir/index.html",
+            &credentials,
+            "0a4f113b",
+        )
+        .unwrap();
+        assert!(
+            header.contains("response=\"6629fae49393a05397450978507c4ef1\""),
+            "{header}"
+        );
+        assert!(header.contains("opaque=\"5ccc069c403ebaf9f0171e9517f40e41\""));
+        assert!(header.contains("qop=auth, nc=00000001, cnonce=\"0a4f113b\""));
+        let legacy = digest_authorization_header(
+            "Digest realm=\"r\", nonce=\"n\"",
+            "GET",
+            "/x?q=1",
+            &credentials,
+            "c",
+        )
+        .unwrap();
+        assert!(!legacy.contains("qop=") && legacy.contains("uri=\"/x?q=1\""));
+        assert!(
+            digest_authorization_header("Basic realm=\"r\"", "GET", "/", &credentials, "c")
+                .is_none()
+        );
+        assert!(
+            digest_authorization_header(
+                "Digest realm=\"r\", nonce=\"n\", qop=\"auth-int\"",
+                "GET",
+                "/",
+                &credentials,
+                "c"
+            )
+            .is_none()
+        );
+        assert!(
+            digest_authorization_header(
+                "Digest realm=\"r\", nonce=\"n\", algorithm=SHA-256",
+                "GET",
+                "/",
+                &credentials,
+                "c"
+            )
+            .is_none()
+        );
+        assert_eq!(
+            request_uri(&Url::parse("https://a.test/dir/page?x=1#frag").unwrap()),
+            "/dir/page?x=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn digest_challenges_are_answered_once_for_the_starting_origin() {
+        let credentials = BasicCredentials {
+            username: "frog".into(),
+            password: "Circle Of Life".into(),
+        };
+        let expected_response = {
+            let ha1 = md5_hex("frog:crawl:Circle Of Life");
+            let ha2 = md5_hex("GET:/");
+            move |cnonce: &str| md5_hex(&format!("{ha1}:nonce-1:00000001:{cnonce}:auth:{ha2}"))
+        };
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let recorder = seen.clone();
+        let (base_url, _, server) = spawn_recording_site_with_request(move |path, request| {
+            recorder.lock().unwrap().push(request.to_string());
+            let authorized = request.lines().any(|line| {
+                let Some(value) = line.strip_prefix("authorization: Digest ") else {
+                    return false;
+                };
+                let params = digest_challenge_params(value);
+                params.get("username").map(String::as_str) == Some("frog")
+                    && params.get("uri").map(String::as_str) == Some(path)
+                    && params
+                        .get("cnonce")
+                        .is_some_and(|cnonce| params.get("response") == Some(&expected_response(cnonce)))
+            });
+            if path == "/" && !authorized {
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"crawl\", qop=\"auth\", nonce=\"nonce-1\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            } else if path == "/" {
+                response(200, "OK", "text/html", "<html><head><title>Digest</title></head><body>ok</body></html>")
+            } else {
+                response(404, "Not Found", "text/plain", "missing")
+            }
+        })
+        .await;
+        let config = |credentials: Option<BasicCredentials>| CrawlConfig {
+            start_url: base_url.clone(),
+            max_depth: 0,
+            respect_robots: false,
+            request_delay_ms: 0,
+            requests_per_second: 0,
+            retry_attempts: 0,
+            sitemap: SitemapConfig {
+                enabled: false,
+                ..SitemapConfig::default()
+            },
+            http_auth: HttpAuthConfig {
+                enabled: credentials.is_some(),
+            },
+            basic_credentials: credentials,
+            ..CrawlConfig::default()
+        };
+        let store = MemoryStore::new();
+        crawl(
+            config(Some(credentials)),
+            store.clone(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.records()[0].status_code, Some(200));
+        let root_requests = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("GET / "))
+            .count();
+        assert_eq!(root_requests, 2, "one challenge and one authorized retry");
+        let store = MemoryStore::new();
+        crawl(config(None), store.clone(), CrawlControl::default(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(store.records()[0].status_code, Some(401));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn form_login_posts_credentials_once_and_keeps_session_cookies() {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let recorder = seen.clone();
+        let (base_url, _, server) = spawn_recording_site_with_request(move |path, request| {
+            recorder.lock().unwrap().push(request.to_string());
+            let logged_in = request.contains("cookie: session=frog-ok");
+            match path {
+                "/login" if request.starts_with("POST") => {
+                    "HTTP/1.1 302 Found\r\nLocation: /\r\nSet-Cookie: session=frog-ok; Path=/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                }
+                "/" if logged_in => response(
+                    200,
+                    "OK",
+                    "text/html",
+                    "<html><head><title>Members</title></head><body><a href=\"/a\">A</a></body></html>",
+                ),
+                "/a" if logged_in => response(200, "OK", "text/html", "<html><body>a</body></html>"),
+                _ => response(401, "Unauthorized", "text/html", "<h1>login required</h1>"),
+            }
+        })
+        .await;
+        let config = |enabled: bool, credentials: Option<BasicCredentials>| CrawlConfig {
+            start_url: base_url.clone(),
+            max_depth: 1,
+            respect_robots: false,
+            request_delay_ms: 0,
+            requests_per_second: 0,
+            sitemap: SitemapConfig {
+                enabled: false,
+                ..SitemapConfig::default()
+            },
+            form_login: FormLoginConfig {
+                enabled,
+                url: format!("{base_url}login"),
+                username_field: "user".into(),
+                password_field: "pass".into(),
+                extra_fields: vec![RequestHeader {
+                    name: "remember".into(),
+                    value: "1".into(),
+                }],
+            },
+            form_credentials: credentials,
+            ..CrawlConfig::default()
+        };
+        let credentials = BasicCredentials {
+            username: "frog".into(),
+            password: "p&ss=word".into(),
+        };
+        let notices: Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let sink = notices.clone();
+        let store = MemoryStore::new();
+        crawl(
+            config(true, Some(credentials.clone())),
+            store.clone(),
+            CrawlControl::default(),
+            move |event| {
+                if event.kind == "notice" {
+                    sink.lock().unwrap().push(event.message.unwrap_or_default());
+                }
+            },
+        )
+        .await
+        .unwrap();
+        let records = store.records();
+        assert!(
+            records.iter().all(|row| row.status_code == Some(200)),
+            "{records:?}"
+        );
+        assert_eq!(records.len(), 2);
+        let requests = seen.lock().unwrap().clone();
+        let posts: Vec<&String> = requests
+            .iter()
+            .filter(|r| r.starts_with("POST /login"))
+            .collect();
+        assert_eq!(posts.len(), 1);
+        assert!(
+            posts[0].contains("remember=1&user=frog&pass=p%26ss%3Dword"),
+            "{}",
+            posts[0]
+        );
+        let notices = notices.lock().unwrap().clone();
+        assert!(
+            notices.iter().any(|n| n.contains("Form login submitted")),
+            "{notices:?}"
+        );
+        // Without credentials the crawl refuses to start; disabled login sends no cookies.
+        assert!(
+            crawl(
+                config(true, None),
+                MemoryStore::new(),
+                CrawlControl::default(),
+                |_| {}
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no credentials")
+        );
+        let store = MemoryStore::new();
+        crawl(
+            config(false, Some(credentials)),
+            store.clone(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.records()[0].status_code, Some(401));
+        let json = serde_json::to_string(&config(
+            true,
+            Some(BasicCredentials {
+                username: "frog".into(),
+                password: "hidden".into(),
+            }),
+        ))
+        .unwrap();
+        assert!(!json.contains("hidden") && json.contains("\"usernameField\":\"user\""));
+        server.abort();
+    }
+
+    #[test]
+    fn automation_settings_validate_presets_and_webhooks() {
+        let valid = |automation: AutomationConfig| {
+            validate_configuration(&CrawlConfig {
+                automation,
+                ..CrawlConfig::default()
+            })
+            .is_ok()
+        };
+        assert!(valid(AutomationConfig::default()));
+        assert!(valid(AutomationConfig {
+            export_preset: "audit".into(),
+            webhook_url: "https://hooks.example.test/crawl".into(),
+            notify_on_completion: true,
+        }));
+        assert!(!valid(AutomationConfig {
+            export_preset: "everything".into(),
+            ..AutomationConfig::default()
+        }));
+        assert!(!valid(AutomationConfig {
+            webhook_url: "ftp://hooks.example.test/".into(),
+            ..AutomationConfig::default()
+        }));
+        let mut value = serde_json::to_value(CrawlConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("automation");
+        value.as_object_mut().unwrap().remove("schedule");
+        let legacy: CrawlConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.automation, AutomationConfig::default());
+        assert_eq!(legacy.schedule, ScheduleConfig::default());
+        let schedule_ok = |schedule: ScheduleConfig| schedule.validate().is_ok();
+        assert!(schedule_ok(ScheduleConfig::default()));
+        assert!(!schedule_ok(ScheduleConfig {
+            mode: ScheduleMode::Once,
+            ..ScheduleConfig::default()
+        }));
+        assert!(schedule_ok(ScheduleConfig {
+            mode: ScheduleMode::Once,
+            run_at: "2026-09-12T10:00".into(),
+            interval_minutes: 0,
+        }));
+        assert!(!schedule_ok(ScheduleConfig {
+            mode: ScheduleMode::Interval,
+            interval_minutes: 4,
+            ..ScheduleConfig::default()
+        }));
+        assert!(schedule_ok(ScheduleConfig {
+            mode: ScheduleMode::Interval,
+            interval_minutes: 60,
+            ..ScheduleConfig::default()
+        }));
+    }
+
+    #[test]
+    fn cdn_hosts_classify_internal_without_external_permission() {
+        let root = Url::parse("https://example.com/").unwrap();
+        let config = CrawlConfig {
+            cdn_hosts: vec![
+                "https://cdn.assets.net/media".to_string(),
+                "Static.Example.org".to_string(),
+                "".to_string(),
+            ],
+            ..CrawlConfig::default()
+        };
+        let internal = |value: &str| host_is_internal(&Url::parse(value).unwrap(), &root, &config);
+        assert!(internal("https://cdn.assets.net/media/logo.png"));
+        assert!(!internal("https://cdn.assets.net/other/logo.png"));
+        assert!(internal("https://static.example.org/app.js"));
+        assert!(!internal("https://other.net/app.js"));
+        assert!(internal("https://www.example.com/page"));
+        // External fetching stays off: a CDN image follows the internal image toggle only.
+        let image = Url::parse("https://cdn.assets.net/media/logo.png").unwrap();
+        assert!(!should_crawl_discovered(
+            &image,
+            &root,
+            DiscoveredResourceType::Image,
+            &config
+        ));
+        let config = CrawlConfig {
+            resource_types: CrawlResourceTypes {
+                images: true,
+                ..CrawlResourceTypes::default()
+            },
+            ..config
+        };
+        assert!(should_crawl_discovered(
+            &image,
+            &root,
+            DiscoveredResourceType::Image,
+            &config
+        ));
+        assert!(!should_crawl_discovered(
+            &Url::parse("https://other.net/logo.png").unwrap(),
+            &root,
+            DiscoveredResourceType::Image,
+            &config
+        ));
+        assert!(validate_configuration(&config).is_ok());
+        assert!(
+            validate_configuration(&CrawlConfig {
+                cdn_hosts: vec!["not a host".to_string()],
+                ..CrawlConfig::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn folder_depth_counts_directories_only() {
+        let depth = |value: &str| folder_depth(&Url::parse(value).unwrap());
+        assert_eq!(depth("https://a.test/"), 0);
+        assert_eq!(depth("https://a.test/page"), 0);
+        assert_eq!(depth("https://a.test/docs/"), 1);
+        assert_eq!(depth("https://a.test/docs/page.html"), 1);
+        assert_eq!(depth("https://a.test/docs/guide/intro"), 2);
+    }
+
+    async fn spawn_limits_site() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 2048];
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let page = |title: &str| {
+                        response(
+                            200,
+                            "OK",
+                            "text/html",
+                            &format!(
+                                "<html><head><title>{title}</title></head><body><h1>{title}</h1></body></html>"
+                            ),
+                        )
+                    };
+                    let output = match path {
+                        "/" => response(
+                            200,
+                            "OK",
+                            "text/html",
+                            r#"<html><head><title>Limits</title></head><body>
+                                <a href="/one">One</a>
+                                <a href="/docs/page">Docs page</a>
+                                <a href="/docs/guide/intro">Deep page</a>
+                                <a href="/this-is-a-deliberately-long-path-name-for-limits">Long</a>
+                                <a href="/five">Five</a></body></html>"#,
+                        ),
+                        "/one"
+                        | "/docs/page"
+                        | "/docs/guide/intro"
+                        | "/five"
+                        | "/this-is-a-deliberately-long-path-name-for-limits" => page(path),
+                        _ => response(404, "Not Found", "text/plain", "not found"),
+                    };
+                    let _ = stream.write_all(output.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (base_url, handle)
+    }
+
+    #[tokio::test]
+    async fn url_limits_bound_discovery_without_dropping_link_evidence() {
+        let (base_url, server) = spawn_limits_site().await;
+        let run = |config: CrawlConfig| {
+            let store = MemoryStore::new();
+            let config = CrawlConfig {
+                start_url: base_url.clone(),
+                max_urls: 20,
+                max_depth: 2,
+                requests_per_second: 50,
+                respect_robots: false,
+                timeout_secs: 5,
+                retry_backoff_ms: 10,
+                sitemap: SitemapConfig {
+                    enabled: false,
+                    ..SitemapConfig::default()
+                },
+                ..config
+            };
+            async move {
+                crawl(config, store.clone(), CrawlControl::default(), |_| {})
+                    .await
+                    .unwrap();
+                let mut urls: Vec<String> = store.records().into_iter().map(|r| r.url).collect();
+                urls.sort();
+                (store, urls)
+            }
+        };
+
+        let (store, urls) = run(CrawlConfig {
+            max_folder_depth: 1,
+            max_url_length: base_url.len() + 20,
+            ..CrawlConfig::default()
+        })
+        .await;
+        assert_eq!(
+            urls,
+            vec![
+                base_url.clone(),
+                format!("{base_url}docs/page"),
+                format!("{base_url}five"),
+                format!("{base_url}one"),
+            ]
+        );
+        // Link evidence stays complete even when targets are not requested.
+        assert_eq!(
+            store
+                .link_edges(LinkEdgeQuery {
+                    limit: 100,
+                    ..LinkEdgeQuery::default()
+                })
+                .total,
+            5
+        );
+
+        let (_, urls) = run(CrawlConfig {
+            max_links_per_page: 2,
+            ..CrawlConfig::default()
+        })
+        .await;
+        assert_eq!(
+            urls,
+            vec![
+                base_url.clone(),
+                format!("{base_url}docs/page"),
+                format!("{base_url}one")
+            ]
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn store_choices_default_on_for_legacy_configs() {
+        let mut value = serde_json::to_value(CrawlConfig::default()).unwrap();
+        value.as_object_mut().unwrap().remove("store");
+        let restored: CrawlConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap()["store"],
+            serde_json::json!({"images":true,"css":true,"javascript":true,"other":true,"internalLinks":true,"externalLinks":true})
+        );
+    }
+
+    async fn spawn_store_site() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}/");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 2048];
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    let request = String::from_utf8_lossy(&buffer[..read]);
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let output = match path {
+                        "/" => response(
+                            200,
+                            "OK",
+                            "text/html",
+                            r#"<html><head><title>Store</title>
+                                <link rel="stylesheet" href="/assets/site.css">
+                                <script src="/assets/app.js"></script></head>
+                                <body><h1>Store</h1><img src="/assets/logo.png" alt="Logo">
+                                <a href="/a">A</a>
+                                <a href="http://external.invalid/page">External</a></body></html>"#,
+                        ),
+                        "/a" => response(
+                            200,
+                            "OK",
+                            "text/html",
+                            "<html><head><title>A</title></head><body><h1>A</h1></body></html>",
+                        ),
+                        "/assets/logo.png" => response(200, "OK", "image/png", "png"),
+                        "/assets/site.css" => response(200, "OK", "text/css", "body{}"),
+                        "/assets/app.js" => response(200, "OK", "application/javascript", "1;"),
+                        _ => response(404, "Not Found", "text/plain", "not found"),
+                    };
+                    let _ = stream.write_all(output.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (base_url, handle)
+    }
+
+    async fn crawl_store_site(
+        base_url: &str,
+        resource_types: CrawlResourceTypes,
+        store_choices: StoreChoices,
+    ) -> MemoryStore {
+        let store = MemoryStore::new();
+        let config = CrawlConfig {
+            start_url: base_url.to_string(),
+            max_urls: 20,
+            max_depth: 1,
+            concurrency: 2,
+            requests_per_second: 50,
+            respect_robots: false,
+            timeout_secs: 5,
+            retry_attempts: 1,
+            retry_backoff_ms: 10,
+            resource_types,
+            store: store_choices,
+            sitemap: SitemapConfig {
+                enabled: false,
+                ..SitemapConfig::default()
+            },
+            ..CrawlConfig::default()
+        };
+        crawl(config, store.clone(), CrawlControl::default(), |_| {})
+            .await
+            .unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn store_choices_drop_uncrawled_evidence_and_keep_crawled_types() {
+        let (base_url, server) = spawn_store_site().await;
+        let edge_targets = |store: &MemoryStore| -> Vec<String> {
+            let mut targets: Vec<String> = store
+                .link_edges(LinkEdgeQuery {
+                    limit: 100,
+                    ..LinkEdgeQuery::default()
+                })
+                .edges
+                .into_iter()
+                .map(|edge| edge.target_url)
+                .collect();
+            targets.sort();
+            targets
+        };
+        let home = |store: &MemoryStore, url: &str| -> CrawlRecord {
+            store
+                .records()
+                .into_iter()
+                .find(|record| record.url == url)
+                .expect("record exists")
+        };
+
+        // Uncrawled images, CSS and external hyperlinks are dropped; JavaScript and internal links stay.
+        let store = crawl_store_site(
+            &base_url,
+            CrawlResourceTypes::default(),
+            StoreChoices {
+                images: false,
+                css: false,
+                external_links: false,
+                ..StoreChoices::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            edge_targets(&store),
+            vec![format!("{base_url}a"), format!("{base_url}assets/app.js")]
+        );
+        assert_eq!(store.image_assets(ImageAssetQuery::default()).total, 0);
+        let root = home(&store, &base_url);
+        assert_eq!(root.internal_outlink_count, 2);
+        assert_eq!(root.external_outlink_count, 0);
+        assert_eq!(root.outlink_count, 2);
+        assert!(
+            !store
+                .records()
+                .iter()
+                .any(|record| record.url.ends_with("logo.png"))
+        );
+
+        // Crawling a type stores it even when its store choice is off.
+        let store = crawl_store_site(
+            &base_url,
+            CrawlResourceTypes {
+                images: true,
+                ..CrawlResourceTypes::default()
+            },
+            StoreChoices {
+                images: false,
+                ..StoreChoices::default()
+            },
+        )
+        .await;
+        assert!(edge_targets(&store).contains(&format!("{base_url}assets/logo.png")));
+        assert_eq!(store.image_assets(ImageAssetQuery::default()).total, 1);
+        assert!(
+            store
+                .records()
+                .iter()
+                .any(|record| record.url.ends_with("logo.png"))
+        );
+        assert_eq!(home(&store, &base_url).internal_outlink_count, 4);
+
+        // Crawled hyperlinks are always stored; the choice applies to links that are not requested.
+        let uncrawled_html = CrawlResourceTypes {
+            html: false,
+            ..CrawlResourceTypes::default()
+        };
+        let store =
+            crawl_store_site(&base_url, uncrawled_html.clone(), StoreChoices::default()).await;
+        assert!(edge_targets(&store).contains(&format!("{base_url}a")));
+        assert!(
+            !store
+                .records()
+                .iter()
+                .any(|record| record.url == format!("{base_url}a"))
+        );
+        assert_eq!(home(&store, &base_url).internal_outlink_count, 4);
+
+        let store = crawl_store_site(
+            &base_url,
+            uncrawled_html,
+            StoreChoices {
+                internal_links: false,
+                ..StoreChoices::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            edge_targets(&store),
+            vec![
+                format!("{base_url}assets/app.js"),
+                format!("{base_url}assets/logo.png"),
+                format!("{base_url}assets/site.css"),
+                "http://external.invalid/page".to_string(),
+            ]
+        );
+        let root = home(&store, &base_url);
+        assert_eq!(root.internal_outlink_count, 3);
+        assert_eq!(root.external_outlink_count, 1);
+        server.abort();
     }
 
     #[tokio::test]
@@ -3882,13 +5437,23 @@ mod tests {
                     <link rel="next" href="/next"><link rel="previous" href="/previous"><link rel="prev" href="/older">
                     <link rel="amphtml NEXT" href="/amp-page">
                     <link rel="alternate" media="screen" href="/mobile">
-                    </head><body><main>Selected text</main><footer><a href="/shared">Ordinary link</a></footer></body>"#)
+                    <meta http-equiv="refresh" content="3; url=/refreshed">
+                    </head><body><main>Selected text</main><iframe src="/embedded"></iframe><footer><a href="/shared">Ordinary link</a></footer></body>"#)
                     .replacen("Content-Type:", "Link: </http-canonical>; rel=canonical\r\nLink: </html-canonical>; rel=canonical\r\nContent-Type:", 1)
             } else {
                 response(200, "OK", "text/html", "<main>Target page</main><link rel='canonical' href='/deeper'>")
             }
         }).await;
-        for selected in ["none", "canonical", "hreflang", "pagination", "amp", "all"] {
+        for selected in [
+            "none",
+            "canonical",
+            "hreflang",
+            "pagination",
+            "amp",
+            "metaRefresh",
+            "iframe",
+            "all",
+        ] {
             requests.lock().unwrap().clear();
             let config = config_with_controls(
                 CrawlConfig {
@@ -3911,7 +5476,9 @@ mod tests {
                     "canonical": selected == "canonical" || selected == "all",
                     "hreflang": selected == "hreflang" || selected == "all",
                     "pagination": selected == "pagination" || selected == "all",
-                    "amp": selected == "amp" || selected == "all"
+                    "amp": selected == "amp" || selected == "all",
+                    "metaRefresh": selected == "metaRefresh" || selected == "all",
+                    "iframe": selected == "iframe" || selected == "all"
                 }}),
             );
             let store = MemoryStore::new();
@@ -3929,6 +5496,12 @@ mod tests {
                 expected.extend(["/next", "/previous", "/older", "/amp-page"]);
             } else if selected == "amp" {
                 expected.push("/amp-page");
+            }
+            if matches!(selected, "metaRefresh" | "all") {
+                expected.push("/refreshed");
+            }
+            if matches!(selected, "iframe" | "all") {
+                expected.push("/embedded");
             }
             expected.sort_unstable();
             let mut actual = requests
@@ -3993,6 +5566,7 @@ mod tests {
                 hreflang: true,
                 pagination: true,
                 amp: true,
+                ..ReferenceLinksConfig::default()
             },
             ..CrawlConfig::default()
         }
@@ -4442,6 +6016,7 @@ mod tests {
             respect_robots: false,
             header_origin: url.origin(),
             request_headers: HeaderMap::new(),
+            basic_credentials: None,
             on_event: Arc::new(|_| {}),
         });
         let mut headers = HeaderMap::new();
@@ -7557,15 +9132,13 @@ mod tests {
             &candidates[0],
             &root,
             DiscoveredResourceType::Html,
-            &config.resource_types,
-            config.subdomain_scope
+            &config
         ));
         assert!(!should_crawl_discovered(
             &candidates[2],
             &root,
             DiscoveredResourceType::Html,
-            &config.resource_types,
-            config.subdomain_scope
+            &config
         ));
     }
 
@@ -7785,6 +9358,7 @@ mod tests {
             respect_robots: true,
             header_origin: url.origin(),
             request_headers: HeaderMap::new(),
+            basic_credentials: None,
             on_event: Arc::new(|_| {}),
         };
         let origin = policy.origin(&url).await;

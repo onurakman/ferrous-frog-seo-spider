@@ -400,6 +400,7 @@ mod tests {
             respect_robots: true,
             header_origin: url.origin(),
             request_headers: Default::default(),
+            basic_credentials: None,
             on_event: std::sync::Arc::new(|_| {}),
         };
         let rendered = render_page_if_enabled(

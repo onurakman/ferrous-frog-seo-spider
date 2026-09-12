@@ -82,6 +82,7 @@ test: ## Run all Rust tests.
 .PHONY: test-ui
 test-ui: build-web ## Exercise the React workspace and production shell in headless Chrome.
 	node scripts/check-crawl-graph.mjs
+	node scripts/check-schedule.mjs
 	node scripts/smoke-ui.mjs
 
 BENCH_URLS ?= 1000000

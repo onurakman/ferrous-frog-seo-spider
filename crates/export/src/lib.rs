@@ -1,19 +1,20 @@
 use csv::Writer;
 use ferrous_frog_storage::{
-    CrawlRecord, CrawlSummary, GraphNode, GridQuery, GridResponse, IssueView, LinkEdge,
-    SitemapValidationRow, is_broken_record, is_success_html_record, is_success_record, summarize,
-    validate_grid_query,
+    AuditThresholds, CrawlRecord, CrawlStore, CrawlSummary, GraphNode, GridQuery, GridResponse,
+    IssueView, LinkEdge, LinkEdgeQuery, SitemapValidationRow, is_broken_record,
+    is_success_html_record, is_success_record, summarize, validate_grid_query,
 };
 use minijinja::{Environment, context};
 use rust_xlsxwriter::{Format, Workbook, Worksheet, XlsxError};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 mod workbook_tests;
 
-const HEADERS: [&str; 91] = [
+const HEADERS: [&str; 111] = [
     "id",
     "url",
     "final_url",
@@ -105,7 +106,73 @@ const HEADERS: [&str; 91] = [
     "search_console_average_position",
     "title_count",
     "meta_description_count",
+    "meta_keywords",
+    "page_speed_strategy",
+    "page_speed_performance_score",
+    "page_speed_accessibility_score",
+    "page_speed_best_practices_score",
+    "page_speed_seo_score",
+    "page_speed_lcp_ms",
+    "page_speed_cls",
+    "page_speed_tbt_ms",
+    "field_form_factor",
+    "field_lcp_ms_p75",
+    "field_inp_ms_p75",
+    "field_cls_p75",
+    "analytics_sessions",
+    "analytics_engaged_sessions",
+    "analytics_conversions",
+    "analytics_revenue",
+    "backlinks",
+    "referring_domains",
+    "backlink_authority",
 ];
+
+fn optional_number(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+}
+
+/// Lab (PageSpeed), field (Chrome UX Report) and GA4 columns in HEADERS order.
+fn performance_columns(record: &CrawlRecord) -> [String; 19] {
+    let lab = record.page_speed.as_ref();
+    let field = record
+        .field_vitals
+        .as_ref()
+        .filter(|snapshot| snapshot.has_data);
+    [
+        lab.map(|s| format!("{:?}", s.strategy).to_ascii_lowercase())
+            .unwrap_or_default(),
+        optional_number(lab.and_then(|s| s.performance_score)),
+        optional_number(lab.and_then(|s| s.accessibility_score)),
+        optional_number(lab.and_then(|s| s.best_practices_score)),
+        optional_number(lab.and_then(|s| s.seo_score)),
+        optional_number(lab.and_then(|s| s.lcp_ms)),
+        optional_number(lab.and_then(|s| s.cls)),
+        optional_number(lab.and_then(|s| s.tbt_ms)),
+        field
+            .map(|s| format!("{:?}", s.form_factor).to_ascii_lowercase())
+            .unwrap_or_default(),
+        optional_number(field.and_then(|s| s.lcp_ms_p75)),
+        optional_number(field.and_then(|s| s.inp_ms_p75)),
+        optional_number(field.and_then(|s| s.cls_p75)),
+        optional_number(record.analytics_sessions),
+        optional_number(record.analytics_engaged_sessions),
+        optional_number(record.analytics_conversions),
+        optional_number(record.analytics_revenue),
+        record
+            .backlink_count
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        record
+            .referring_domain_count
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        optional_number(record.backlink_authority),
+    ]
+}
 
 const LINK_EDGE_HEADERS: [&str; 13] = [
     "id",
@@ -165,169 +232,306 @@ const SITEMAP_VALIDATION_HEADERS: [&str; 11] = [
 ];
 
 const HTML_REPORT_ROW_LIMIT: usize = 50;
-const TITLE_MIN_LENGTH: usize = 30;
-const TITLE_MAX_LENGTH: usize = 60;
-const META_MIN_LENGTH: usize = 70;
-const META_MAX_LENGTH: usize = 160;
-const H1_MAX_LENGTH: usize = 70;
-const LARGE_IMAGE_BYTES: usize = 200 * 1024;
 const LARGE_PAGE_BYTES: usize = 1_000_000;
 const SLOW_TTFB_MS: u64 = 800;
 const SLOW_RESPONSE_MS: u64 = 3_000;
 const HTML_REPORT_TEMPLATE: &str = include_str!("../templates/seo_report.html.j2");
+
+/// Bulk export formats that can be produced from a finished crawl.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportKind {
+    Csv,
+    Xlsx,
+    Sitemap,
+    HtmlReport,
+    AuditWorkbook,
+    LinksCsv,
+    RedirectsCsv,
+}
+
+impl ExportKind {
+    pub const ALL: [ExportKind; 7] = [
+        ExportKind::Csv,
+        ExportKind::Xlsx,
+        ExportKind::Sitemap,
+        ExportKind::HtmlReport,
+        ExportKind::AuditWorkbook,
+        ExportKind::LinksCsv,
+        ExportKind::RedirectsCsv,
+    ];
+
+    /// Accepts the short names used by the CLI and presets.
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "csv" => Self::Csv,
+            "xlsx" => Self::Xlsx,
+            "sitemap" => Self::Sitemap,
+            "html" | "report" => Self::HtmlReport,
+            "workbook" | "audit" => Self::AuditWorkbook,
+            "links" => Self::LinksCsv,
+            "redirects" => Self::RedirectsCsv,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Csv => "csv",
+            Self::Xlsx => "xlsx",
+            Self::Sitemap => "sitemap",
+            Self::HtmlReport => "html",
+            Self::AuditWorkbook => "workbook",
+            Self::LinksCsv => "links",
+            Self::RedirectsCsv => "redirects",
+        }
+    }
+
+    pub fn file_name(self) -> &'static str {
+        match self {
+            Self::Csv => "crawl.csv",
+            Self::Xlsx => "crawl.xlsx",
+            Self::Sitemap => "sitemap.xml",
+            Self::HtmlReport => "seo-report.html",
+            Self::AuditWorkbook => "audit-workbook.xlsx",
+            Self::LinksCsv => "links.csv",
+            Self::RedirectsCsv => "redirects.csv",
+        }
+    }
+}
+
+/// Writes each requested format for a finished crawl into `dir`, returning the created files.
+/// Files are written directly; callers that need atomic publication should export into a fresh folder.
+pub fn write_export_files<S: CrawlStore>(
+    store: &S,
+    thresholds: &AuditThresholds,
+    kinds: &[ExportKind],
+    dir: &Path,
+) -> Result<Vec<PathBuf>, String> {
+    if kinds.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    let records = store.records();
+    let edges = store
+        .link_edges(LinkEdgeQuery {
+            offset: 0,
+            limit: 1_000_000,
+            ..LinkEdgeQuery::default()
+        })
+        .edges;
+    let mut written = Vec::new();
+    for kind in kinds {
+        let path = dir.join(kind.file_name());
+        let file = std::fs::File::create(&path)
+            .map_err(|error| format!("create {}: {error}", path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
+        let result: Result<(), String> = match kind {
+            ExportKind::Csv => records_to_csv(&records, &mut writer).map_err(|e| e.to_string()),
+            ExportKind::Xlsx => records_to_xlsx_bytes(&records)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| writer.write_all(&bytes).map_err(|e| e.to_string())),
+            ExportKind::Sitemap => writer
+                .write_all(records_to_sitemap_xml(&records).as_bytes())
+                .map_err(|e| e.to_string()),
+            ExportKind::HtmlReport => records_to_html_report(&records, &edges, thresholds)
+                .map_err(|e| e.to_string())
+                .and_then(|html| writer.write_all(html.as_bytes()).map_err(|e| e.to_string())),
+            ExportKind::AuditWorkbook => audit_workbook_to_writer(
+                |mut query: GridQuery| {
+                    query.thresholds = *thresholds;
+                    Ok(store.query(query))
+                },
+                &mut writer,
+            )
+            .map(|_| ()),
+            ExportKind::LinksCsv => {
+                link_edges_to_csv(&edges, &mut writer).map_err(|e| e.to_string())
+            }
+            ExportKind::RedirectsCsv => {
+                redirect_chains_to_csv(&records, &mut writer).map_err(|e| e.to_string())
+            }
+        };
+        result
+            .and_then(|()| writer.flush().map_err(|e| e.to_string()))
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        written.push(path);
+    }
+    Ok(written)
+}
+
+/// Named export bundles shared by the CLI and automation: `basic`, `audit` and `full`.
+pub fn export_preset(name: &str) -> Option<Vec<ExportKind>> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "basic" => vec![ExportKind::Csv],
+        "audit" => vec![
+            ExportKind::Csv,
+            ExportKind::AuditWorkbook,
+            ExportKind::HtmlReport,
+        ],
+        "full" => ExportKind::ALL.to_vec(),
+        _ => return None,
+    })
+}
 
 pub fn records_to_csv<W: Write>(records: &[CrawlRecord], writer: W) -> csv::Result<()> {
     let mut writer = Writer::from_writer(writer);
     writer.write_record(HEADERS)?;
 
     for record in records {
-        writer.write_record([
-            record.id.to_string(),
-            record.url.clone(),
-            record.final_url.clone(),
-            format!("{:?}", record.classification),
-            record
-                .status_code
-                .map(|code| code.to_string())
-                .unwrap_or_default(),
-            record.status_text.clone(),
-            record.content_type.clone().unwrap_or_default(),
-            record.indexability.clone(),
-            record.indexability_status.clone(),
-            record.response_time_ms.to_string(),
-            record
-                .dns_lookup_time_ms
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record
-                .ttfb_ms
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record
-                .download_time_ms
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record
-                .total_network_time_ms
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record
-                .transfer_rate_bytes_per_sec
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record.resolved_ip_count.to_string(),
-            record.size_bytes.to_string(),
-            record.response_hash.clone().unwrap_or_default(),
-            record.word_count.to_string(),
-            format!("{:.4}", record.text_to_code_ratio),
-            record
-                .simhash
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record
-                .near_duplicate_cluster_id
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record.depth.to_string(),
-            record.redirect_target.clone().unwrap_or_default(),
-            record.title.clone().unwrap_or_default(),
-            record.title_len.to_string(),
-            record.meta_description.clone().unwrap_or_default(),
-            record.meta_description_len.to_string(),
-            record.meta_robots.clone().unwrap_or_default(),
-            record.x_robots_tag.clone().unwrap_or_default(),
-            record.h1.clone().unwrap_or_default(),
-            record.h1_len.to_string(),
-            record.h1_count.to_string(),
-            record.h2.clone().unwrap_or_default(),
-            record.h2_len.to_string(),
-            record.h2_count.to_string(),
-            record.canonical.clone().unwrap_or_default(),
-            record.canonical_count.to_string(),
-            record.image_count.to_string(),
-            record.images_missing_alt.to_string(),
-            record.images_alt_too_long.to_string(),
-            record.mixed_content_count.to_string(),
-            record.insecure_form_count.to_string(),
-            record.hsts_header.to_string(),
-            record.content_security_policy_header.to_string(),
-            record.x_frame_options_header.to_string(),
-            record.x_content_type_options_header.to_string(),
-            record.viewport.to_string(),
-            record.amphtml.clone().unwrap_or_default(),
-            record.rel_next.clone().unwrap_or_default(),
-            record.rel_prev.clone().unwrap_or_default(),
-            record.hreflang_count.to_string(),
-            record.hreflang_invalid_count.to_string(),
-            record.hreflang_missing_self_reference.to_string(),
-            record.json_ld_count.to_string(),
-            record.json_ld_invalid_count.to_string(),
-            record.structured_data_error_count.to_string(),
-            record.structured_data_warning_count.to_string(),
-            serde_json::to_string(&record.structured_data_issues).unwrap_or_default(),
-            record.open_graph_count.to_string(),
-            record.twitter_card_count.to_string(),
-            record.deprecated_html_tag_count.to_string(),
-            record.duplicate_id_count.to_string(),
-            record.js_rendered.to_string(),
-            record.rendered_dom_changed.to_string(),
-            record.rendered_word_count_delta.to_string(),
-            record.rendered_link_count_delta.to_string(),
-            record.inlink_count.to_string(),
-            record.outlink_count.to_string(),
-            record.internal_outlink_count.to_string(),
-            record.external_outlink_count.to_string(),
-            serde_json::to_string(&record.custom_extractions).unwrap_or_default(),
-            serde_json::to_string(&record.custom_searches).unwrap_or_default(),
-            record.error.clone().unwrap_or_default(),
-            record.in_sitemap.to_string(),
-            record.storage_key.clone(),
-            record
-                .list_position
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record.list_duplicate_index.to_string(),
-            record.first_inlink_source_url.clone().unwrap_or_default(),
-            record.first_inlink_anchor_text.clone().unwrap_or_default(),
-            record
-                .first_inlink_source_position
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record
-                .tcp_connect_time_ms
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record
-                .tls_handshake_time_ms
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record.title_pixel_width.to_string(),
-            record.meta_description_pixel_width.to_string(),
-            record
-                .search_console_clicks
-                .map(|value| format!("{value:.4}"))
-                .unwrap_or_default(),
-            record
-                .search_console_impressions
-                .map(|value| format!("{value:.4}"))
-                .unwrap_or_default(),
-            record
-                .search_console_ctr
-                .map(|value| format!("{value:.6}"))
-                .unwrap_or_default(),
-            record
-                .search_console_average_position
-                .map(|value| format!("{value:.4}"))
-                .unwrap_or_default(),
-            record
-                .title_count
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-            record
-                .meta_description_count
-                .map(|value| value.to_string())
-                .unwrap_or_default(),
-        ])?;
+        writer.write_record(
+            [
+                record.id.to_string(),
+                record.url.clone(),
+                record.final_url.clone(),
+                format!("{:?}", record.classification),
+                record
+                    .status_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_default(),
+                record.status_text.clone(),
+                record.content_type.clone().unwrap_or_default(),
+                record.indexability.clone(),
+                record.indexability_status.clone(),
+                record.response_time_ms.to_string(),
+                record
+                    .dns_lookup_time_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record
+                    .ttfb_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record
+                    .download_time_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record
+                    .total_network_time_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record
+                    .transfer_rate_bytes_per_sec
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record.resolved_ip_count.to_string(),
+                record.size_bytes.to_string(),
+                record.response_hash.clone().unwrap_or_default(),
+                record.word_count.to_string(),
+                format!("{:.4}", record.text_to_code_ratio),
+                record
+                    .simhash
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record
+                    .near_duplicate_cluster_id
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record.depth.to_string(),
+                record.redirect_target.clone().unwrap_or_default(),
+                record.title.clone().unwrap_or_default(),
+                record.title_len.to_string(),
+                record.meta_description.clone().unwrap_or_default(),
+                record.meta_description_len.to_string(),
+                record.meta_robots.clone().unwrap_or_default(),
+                record.x_robots_tag.clone().unwrap_or_default(),
+                record.h1.clone().unwrap_or_default(),
+                record.h1_len.to_string(),
+                record.h1_count.to_string(),
+                record.h2.clone().unwrap_or_default(),
+                record.h2_len.to_string(),
+                record.h2_count.to_string(),
+                record.canonical.clone().unwrap_or_default(),
+                record.canonical_count.to_string(),
+                record.image_count.to_string(),
+                record.images_missing_alt.to_string(),
+                record.images_alt_too_long.to_string(),
+                record.mixed_content_count.to_string(),
+                record.insecure_form_count.to_string(),
+                record.hsts_header.to_string(),
+                record.content_security_policy_header.to_string(),
+                record.x_frame_options_header.to_string(),
+                record.x_content_type_options_header.to_string(),
+                record.viewport.to_string(),
+                record.amphtml.clone().unwrap_or_default(),
+                record.rel_next.clone().unwrap_or_default(),
+                record.rel_prev.clone().unwrap_or_default(),
+                record.hreflang_count.to_string(),
+                record.hreflang_invalid_count.to_string(),
+                record.hreflang_missing_self_reference.to_string(),
+                record.json_ld_count.to_string(),
+                record.json_ld_invalid_count.to_string(),
+                record.structured_data_error_count.to_string(),
+                record.structured_data_warning_count.to_string(),
+                serde_json::to_string(&record.structured_data_issues).unwrap_or_default(),
+                record.open_graph_count.to_string(),
+                record.twitter_card_count.to_string(),
+                record.deprecated_html_tag_count.to_string(),
+                record.duplicate_id_count.to_string(),
+                record.js_rendered.to_string(),
+                record.rendered_dom_changed.to_string(),
+                record.rendered_word_count_delta.to_string(),
+                record.rendered_link_count_delta.to_string(),
+                record.inlink_count.to_string(),
+                record.outlink_count.to_string(),
+                record.internal_outlink_count.to_string(),
+                record.external_outlink_count.to_string(),
+                serde_json::to_string(&record.custom_extractions).unwrap_or_default(),
+                serde_json::to_string(&record.custom_searches).unwrap_or_default(),
+                record.error.clone().unwrap_or_default(),
+                record.in_sitemap.to_string(),
+                record.storage_key.clone(),
+                record
+                    .list_position
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record.list_duplicate_index.to_string(),
+                record.first_inlink_source_url.clone().unwrap_or_default(),
+                record.first_inlink_anchor_text.clone().unwrap_or_default(),
+                record
+                    .first_inlink_source_position
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record
+                    .tcp_connect_time_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record
+                    .tls_handshake_time_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record.title_pixel_width.to_string(),
+                record.meta_description_pixel_width.to_string(),
+                record
+                    .search_console_clicks
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_default(),
+                record
+                    .search_console_impressions
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_default(),
+                record
+                    .search_console_ctr
+                    .map(|value| format!("{value:.6}"))
+                    .unwrap_or_default(),
+                record
+                    .search_console_average_position
+                    .map(|value| format!("{value:.4}"))
+                    .unwrap_or_default(),
+                record
+                    .title_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record
+                    .meta_description_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                record.meta_keywords.clone().unwrap_or_default(),
+            ]
+            .into_iter()
+            .chain(performance_columns(record))
+            .collect::<Vec<String>>(),
+        )?;
     }
 
     writer.flush()?;
@@ -680,6 +884,16 @@ fn write_xlsx_record(
     }
     if let Some(value) = record.meta_description_count {
         worksheet.write_number(row, 90, value as f64)?;
+    }
+    worksheet.write_string(row, 91, record.meta_keywords.as_deref().unwrap_or_default())?;
+    for (offset, value) in performance_columns(record).into_iter().enumerate() {
+        if !value.is_empty() {
+            let column = 92 + offset as u16;
+            match value.parse::<f64>() {
+                Ok(number) => worksheet.write_number(row, column, number)?,
+                Err(_) => worksheet.write_string(row, column, &value)?,
+            };
+        }
     }
     Ok(())
 }
@@ -1190,8 +1404,9 @@ pub fn records_to_sitemap_xml(records: &[CrawlRecord]) -> String {
 pub fn records_to_html_report(
     records: &[CrawlRecord],
     edges: &[LinkEdge],
+    thresholds: &AuditThresholds,
 ) -> Result<String, minijinja::Error> {
-    let report = build_html_report(records, edges);
+    let report = build_html_report(records, edges, thresholds);
     let mut env = Environment::new();
     env.add_template("seo_report.html", HTML_REPORT_TEMPLATE)?;
     env.get_template("seo_report.html")?
@@ -1254,7 +1469,11 @@ struct ReportRow {
     cells: Vec<String>,
 }
 
-fn build_html_report(records: &[CrawlRecord], edges: &[LinkEdge]) -> HtmlReport {
+fn build_html_report(
+    records: &[CrawlRecord],
+    edges: &[LinkEdge],
+    thresholds: &AuditThresholds,
+) -> HtmlReport {
     let summary = summarize(records);
     let failed_urls =
         records
@@ -1278,7 +1497,7 @@ fn build_html_report(records: &[CrawlRecord], edges: &[LinkEdge]) -> HtmlReport 
         .count();
     let image_issue_count = records
         .iter()
-        .filter(|record| !image_issues(record).is_empty())
+        .filter(|record| !image_issues(record, thresholds).is_empty())
         .count();
     let security_issue_count = records
         .iter()
@@ -1319,9 +1538,9 @@ fn build_html_report(records: &[CrawlRecord], edges: &[LinkEdge]) -> HtmlReport 
         sections: vec![
             broken_url_section(records),
             broken_link_section(edges, &failed_urls),
-            metadata_section(records),
-            headings_and_canonicals_section(records),
-            image_section(records),
+            metadata_section(records, thresholds),
+            headings_and_canonicals_section(records, thresholds),
+            image_section(records, thresholds),
             performance_section(records),
             security_section(records),
             structured_data_section(records),
@@ -1453,7 +1672,7 @@ fn broken_link_section(edges: &[LinkEdge], failed_urls: &HashSet<&str>) -> Repor
     )
 }
 
-fn metadata_section(records: &[CrawlRecord]) -> ReportSection {
+fn metadata_section(records: &[CrawlRecord], thresholds: &AuditThresholds) -> ReportSection {
     let records = records
         .iter()
         .filter(|record| is_success_html_record(record));
@@ -1467,7 +1686,7 @@ fn metadata_section(records: &[CrawlRecord]) -> ReportSection {
     let mut total_count = 0;
 
     for record in records {
-        let issues = metadata_issues(record, &title_counts, &meta_counts);
+        let issues = metadata_issues(record, &title_counts, &meta_counts, thresholds);
         if issues.is_empty() {
             continue;
         }
@@ -1501,7 +1720,10 @@ fn metadata_section(records: &[CrawlRecord]) -> ReportSection {
     )
 }
 
-fn headings_and_canonicals_section(records: &[CrawlRecord]) -> ReportSection {
+fn headings_and_canonicals_section(
+    records: &[CrawlRecord],
+    thresholds: &AuditThresholds,
+) -> ReportSection {
     let records = records
         .iter()
         .filter(|record| is_success_html_record(record));
@@ -1510,7 +1732,7 @@ fn headings_and_canonicals_section(records: &[CrawlRecord]) -> ReportSection {
     let mut total_count = 0;
 
     for record in records {
-        let issues = heading_canonical_issues(record, &h1_counts);
+        let issues = heading_canonical_issues(record, &h1_counts, thresholds);
         if issues.is_empty() {
             continue;
         }
@@ -1539,12 +1761,12 @@ fn headings_and_canonicals_section(records: &[CrawlRecord]) -> ReportSection {
     )
 }
 
-fn image_section(records: &[CrawlRecord]) -> ReportSection {
+fn image_section(records: &[CrawlRecord], thresholds: &AuditThresholds) -> ReportSection {
     let mut rows = Vec::new();
     let mut total_count = 0;
 
     for record in records {
-        let issues = image_issues(record);
+        let issues = image_issues(record, thresholds);
         if issues.is_empty() {
             continue;
         }
@@ -1790,6 +2012,7 @@ fn metadata_issues(
     record: &CrawlRecord,
     title_counts: &HashMap<String, usize>,
     meta_counts: &HashMap<String, usize>,
+    thresholds: &AuditThresholds,
 ) -> Vec<String> {
     let mut issues = Vec::new();
     let title = record.title.as_deref().unwrap_or("").trim();
@@ -1805,11 +2028,11 @@ fn metadata_issues(
     if title.is_empty() {
         issues.push("Missing title".to_string());
     } else {
-        if record.title_len < TITLE_MIN_LENGTH {
-            issues.push(format!("Title under {TITLE_MIN_LENGTH} chars"));
+        if record.title_len < thresholds.title_min_chars {
+            issues.push(format!("Title under {} chars", thresholds.title_min_chars));
         }
-        if record.title_len > TITLE_MAX_LENGTH {
-            issues.push(format!("Title over {TITLE_MAX_LENGTH} chars"));
+        if record.title_len > thresholds.title_max_chars {
+            issues.push(format!("Title over {} chars", thresholds.title_max_chars));
         }
         if title_counts
             .get(&normalize_text_key(title))
@@ -1824,11 +2047,17 @@ fn metadata_issues(
     if meta.is_empty() {
         issues.push("Missing meta description".to_string());
     } else {
-        if record.meta_description_len < META_MIN_LENGTH {
-            issues.push(format!("Meta description under {META_MIN_LENGTH} chars"));
+        if record.meta_description_len < thresholds.meta_min_chars {
+            issues.push(format!(
+                "Meta description under {} chars",
+                thresholds.meta_min_chars
+            ));
         }
-        if record.meta_description_len > META_MAX_LENGTH {
-            issues.push(format!("Meta description over {META_MAX_LENGTH} chars"));
+        if record.meta_description_len > thresholds.meta_max_chars {
+            issues.push(format!(
+                "Meta description over {} chars",
+                thresholds.meta_max_chars
+            ));
         }
         if meta_counts
             .get(&normalize_text_key(meta))
@@ -1852,6 +2081,7 @@ fn metadata_issues(
 fn heading_canonical_issues(
     record: &CrawlRecord,
     h1_counts: &HashMap<String, usize>,
+    thresholds: &AuditThresholds,
 ) -> Vec<String> {
     let mut issues = Vec::new();
     let h1 = record.h1.as_deref().unwrap_or("").trim();
@@ -1862,8 +2092,8 @@ fn heading_canonical_issues(
         if record.h1_count > 1 {
             issues.push("Multiple H1 tags".to_string());
         }
-        if record.h1_len > H1_MAX_LENGTH {
-            issues.push(format!("H1 over {H1_MAX_LENGTH} chars"));
+        if record.h1_len > thresholds.h1_max_chars {
+            issues.push(format!("H1 over {} chars", thresholds.h1_max_chars));
         }
         if h1_counts.get(&normalize_text_key(h1)).copied().unwrap_or(0) > 1 {
             issues.push("Duplicate H1".to_string());
@@ -1889,7 +2119,7 @@ fn heading_canonical_issues(
     issues
 }
 
-fn image_issues(record: &CrawlRecord) -> Vec<String> {
+fn image_issues(record: &CrawlRecord, thresholds: &AuditThresholds) -> Vec<String> {
     let mut issues = Vec::new();
     if is_success_html_record(record) && record.images_missing_alt > 0 {
         issues.push(format!("{} images missing alt", record.images_missing_alt));
@@ -1900,10 +2130,10 @@ fn image_issues(record: &CrawlRecord) -> Vec<String> {
             record.images_alt_too_long
         ));
     }
-    if large_image_record(record) {
+    if large_image_record(record, thresholds) {
         issues.push(format!(
             "Image asset response over {}",
-            format_bytes(LARGE_IMAGE_BYTES)
+            format_bytes(thresholds.large_image_bytes)
         ));
     }
     issues
@@ -2025,14 +2255,14 @@ fn html_validation_issues(record: &CrawlRecord) -> Vec<String> {
     issues
 }
 
-fn large_image_record(record: &CrawlRecord) -> bool {
+fn large_image_record(record: &CrawlRecord, thresholds: &AuditThresholds) -> bool {
     is_success_record(record)
         && record
             .content_type
             .as_deref()
             .map(|value| value.to_ascii_lowercase().starts_with("image/"))
             .unwrap_or(false)
-        && record.size_bytes > LARGE_IMAGE_BYTES
+        && record.size_bytes > thresholds.large_image_bytes
 }
 
 fn text_counts<'a>(values: impl Iterator<Item = &'a str>) -> HashMap<String, usize> {
@@ -2160,10 +2390,19 @@ mod tests {
         unreachable.error = Some("Connection refused".to_string());
         assert!(!has_security_issue(&failed));
         let records = vec![page, image, blocked, failed, unreachable];
-        assert_eq!(metadata_section(&records).count, 1);
-        assert_eq!(headings_and_canonicals_section(&records).count, 1);
+        assert_eq!(
+            metadata_section(&records, &AuditThresholds::default()).count,
+            1
+        );
+        assert_eq!(
+            headings_and_canonicals_section(&records, &AuditThresholds::default()).count,
+            1
+        );
         assert_eq!(broken_url_section(&records).count, 2);
-        assert_eq!(image_section(&records).count, 1);
+        assert_eq!(
+            image_section(&records, &AuditThresholds::default()).count,
+            1
+        );
         assert_eq!(structured_data_section(&records).count, 1);
         assert_eq!(html_validation_section(&records).count, 1);
         assert_eq!(rendering_section(&records).count, 1);
@@ -2196,7 +2435,7 @@ mod tests {
             source_position: 0,
             discovery_order: 0,
         });
-        let report = build_html_report(&records, &edges);
+        let report = build_html_report(&records, &edges, &AuditThresholds::default());
         assert_eq!(
             report
                 .sections
@@ -2257,14 +2496,26 @@ mod tests {
         image.final_url = "https://example.test/image.png".to_string();
         image.content_type = Some("image/png".to_string());
         let mut records = vec![page.clone(), failed, image];
-        assert_eq!(metadata_section(&records).count, 0);
-        assert_eq!(headings_and_canonicals_section(&records).count, 0);
+        assert_eq!(
+            metadata_section(&records, &AuditThresholds::default()).count,
+            0
+        );
+        assert_eq!(
+            headings_and_canonicals_section(&records, &AuditThresholds::default()).count,
+            0
+        );
 
         page.final_url = "https://example.test/duplicate".to_string();
         page.canonical = Some(page.final_url.clone());
         records.push(page);
-        assert_eq!(metadata_section(&records).count, 2);
-        assert_eq!(headings_and_canonicals_section(&records).count, 2);
+        assert_eq!(
+            metadata_section(&records, &AuditThresholds::default()).count,
+            2
+        );
+        assert_eq!(
+            headings_and_canonicals_section(&records, &AuditThresholds::default()).count,
+            2
+        );
     }
 
     #[test]
@@ -2353,7 +2604,8 @@ mod tests {
             discovery_order: 1,
         };
 
-        let html = records_to_html_report(&[page, broken], &[edge]).unwrap();
+        let html =
+            records_to_html_report(&[page, broken], &[edge], &AuditThresholds::default()).unwrap();
 
         assert!(html.contains("Technical SEO Report"));
         assert!(html.contains("Broken Links"));

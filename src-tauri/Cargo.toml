@@ -28,6 +28,7 @@ semver = "1.0.28"
 serde.workspace = true
 serde_json.workspace = true
 tauri = { workspace = true, features = [] }
+tauri-plugin-notification.workspace = true
 tauri-plugin-opener.workspace = true
 tauri-plugin-window-state.workspace = true
 tempfile.workspace = true
