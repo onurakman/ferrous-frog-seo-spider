@@ -8,7 +8,8 @@ use ferrous_frog_parser::{
 use ferrous_frog_storage::{
     AuditThresholds, CrawlFrontierItem, CrawlFrontierState, CrawlRecord, CrawlStore, CrawlSummary,
     CustomExtractionValue, CustomSearchSource, CustomSearchValue, HreflangLink, ImageAsset,
-    LinkEdge, LinkType, RedirectHop, StructuredDataIssue, UrlClassification,
+    LinkEdge, LinkType, PageReference, PageReferenceKind as StoredPageReferenceKind, RedirectHop,
+    StructuredDataIssue, UrlClassification,
 };
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
@@ -39,7 +40,12 @@ use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
 use url::Url;
 
+mod capture;
+#[cfg(test)]
+mod capture_tests;
 mod rendering;
+
+pub use capture::CaptureConfig;
 
 pub use ferrous_frog_parser::ContentConfig;
 pub use rendering::{
@@ -136,6 +142,8 @@ pub struct CrawlConfig {
     pub query_settings: QuerySettings,
     #[serde(default)]
     pub content: ContentConfig,
+    #[serde(default)]
+    pub capture: CaptureConfig,
     #[serde(default)]
     pub thresholds: AuditThresholds,
     #[serde(default)]
@@ -399,7 +407,7 @@ impl AutomationConfig {
     }
 }
 
-/// Retention choices for discovered URLs that are not crawled. Crawled types are always stored.
+/// Retention choices for discovered resources and reference evidence. Crawled types are stored.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct StoreChoices {
@@ -409,6 +417,12 @@ pub struct StoreChoices {
     pub other: bool,
     pub internal_links: bool,
     pub external_links: bool,
+    pub canonical: bool,
+    pub hreflang: bool,
+    pub pagination: bool,
+    pub amp: bool,
+    pub meta_refresh: bool,
+    pub iframe: bool,
 }
 
 impl Default for StoreChoices {
@@ -420,6 +434,12 @@ impl Default for StoreChoices {
             other: true,
             internal_links: true,
             external_links: true,
+            canonical: true,
+            hreflang: true,
+            pagination: true,
+            amp: true,
+            meta_refresh: true,
+            iframe: true,
         }
     }
 }
@@ -478,6 +498,7 @@ impl Default for CrawlConfig {
             reference_links: ReferenceLinksConfig::default(),
             query_settings: QuerySettings::default(),
             content: ContentConfig::default(),
+            capture: CaptureConfig::default(),
             thresholds: AuditThresholds::default(),
             automation: AutomationConfig::default(),
             http_auth: HttpAuthConfig::default(),
@@ -861,6 +882,7 @@ struct FetchOutput {
     edges: Vec<LinkEdge>,
     images: Vec<ImageAsset>,
     from_sitemap: bool,
+    capture: Option<ferrous_frog_storage::PageCapture>,
 }
 
 #[derive(Default)]
@@ -1096,8 +1118,8 @@ where
             let task_query_rules = query_rules.clone();
             let task_content_selectors = content_selectors.clone();
             let task_control = control.clone();
+            // Dispatch only moves an already checkpointed URL from waiting to active.
             active_items.insert(item_key.clone(), item.clone());
-            save_frontier_state(&store, &queue, &active_items, &seen, crawled);
             active.spawn(async move {
                 let result = fetch_one(
                     task_client,
@@ -1151,6 +1173,8 @@ where
                 }
             };
 
+            let previous_queue_len = queue.len();
+            let mut frontier_sitemap_urls = Vec::new();
             let mut record = output.record;
             record.classification = if Url::parse(&record.final_url)
                 .is_ok_and(|url| host_is_internal(&url, &root_url, &config))
@@ -1230,6 +1254,7 @@ where
                             for item in queue.iter_mut().chain(active_items.values_mut()) {
                                 item.from_sitemap |= sitemap_pages.contains(item.url.as_str());
                             }
+                            frontier_sitemap_urls.extend(new_sitemap_pages);
                         }
                     }
                 }
@@ -1316,6 +1341,46 @@ where
             record.in_sitemap = output.from_sitemap
                 || sitemap_pages.contains(&record.url)
                 || sitemap_pages.contains(&record.final_url);
+            let references = output
+                .links
+                .iter()
+                .filter_map(|link| {
+                    let kind = link.reference_kind?;
+                    let (stored_kind, retain) = match kind {
+                        PageReferenceKind::Canonical => {
+                            (StoredPageReferenceKind::Canonical, config.store.canonical)
+                        }
+                        PageReferenceKind::Hreflang => {
+                            (StoredPageReferenceKind::Hreflang, config.store.hreflang)
+                        }
+                        PageReferenceKind::Pagination => {
+                            (StoredPageReferenceKind::Pagination, config.store.pagination)
+                        }
+                        PageReferenceKind::Amp => (StoredPageReferenceKind::Amp, config.store.amp),
+                        PageReferenceKind::MetaRefresh => (
+                            StoredPageReferenceKind::MetaRefresh,
+                            config.store.meta_refresh,
+                        ),
+                        PageReferenceKind::Iframe => {
+                            (StoredPageReferenceKind::Iframe, config.store.iframe)
+                        }
+                    };
+                    let crawl_reference = config.mode == CrawlMode::Spider
+                        && config.folder_scope != FolderScope::ExactUrl
+                        && config.reference_links.allows(kind);
+                    (retain || crawl_reference).then(|| PageReference {
+                        id: 0,
+                        source_storage_key: record.storage_key.clone(),
+                        source_url: record.final_url.clone(),
+                        target_url: link.url.clone(),
+                        kind: stored_kind,
+                        rel_nofollow: link.rel_nofollow,
+                    })
+                })
+                .collect();
+            // Replace even empty evidence for this exact List/Spider occurrence. Audit
+            // metadata and hyperlink counts are independent of reference retention.
+            store.add_page_references(&record.storage_key, references);
             store.add_image_assets(&record.final_url, output.images);
             assign_near_duplicate_cluster(
                 &mut record,
@@ -1323,8 +1388,17 @@ where
                 config.near_duplicate_threshold,
             );
             let record = store.upsert(record);
+            store.replace_page_capture(&record.storage_key, output.capture);
             crawled += 1;
-            save_frontier_state(&store, &queue, &active_items, &seen, crawled);
+            store.update_frontier_state(
+                &item_key,
+                queue
+                    .range(previous_queue_len..)
+                    .map(frontier_item_from_queue)
+                    .collect(),
+                &frontier_sitemap_urls,
+                crawled,
+            );
             on_event(CrawlerEvent::record(
                 record,
                 progress(
@@ -1377,6 +1451,10 @@ fn normalize_config(mut config: CrawlConfig) -> CrawlConfig {
 }
 
 pub fn validate_configuration(config: &CrawlConfig) -> Result<()> {
+    anyhow::ensure!(
+        (1024..=ferrous_frog_storage::MAX_CAPTURE_BYTES).contains(&config.capture.max_bytes),
+        "Maximum retained source size must be between 1 KiB and 1 MiB"
+    );
     anyhow::ensure!(
         (1..=1024 * 1024 * 1024).contains(&config.max_response_bytes),
         "Maximum response size must be greater than zero and at most 1 GiB"
@@ -1444,24 +1522,7 @@ fn parse_request_headers(headers: &[RequestHeader]) -> Result<HeaderMap> {
         let name = HeaderName::from_bytes(header.name.trim().as_bytes())
             .with_context(|| format!("Invalid HTTP request header name at row {}", index + 1))?;
         let key = name.as_str();
-        let reserved = [
-            "auth",
-            "token",
-            "secret",
-            "password",
-            "credential",
-            "cookie",
-            "api-key",
-            "apikey",
-            "csrf",
-            "xsrf",
-            "session",
-            "access-key",
-        ]
-        .iter()
-        .any(|part| key.contains(part))
-            || key == "key"
-            || key.ends_with("-key")
+        let reserved = capture::sensitive_header_name(key)
             || ["proxy-", "sec-", "x-forwarded-"]
                 .iter()
                 .any(|prefix| key.starts_with(prefix))
@@ -2574,6 +2635,7 @@ async fn fetch_one(
                     Vec::new(),
                     Vec::new(),
                     &queue_identity,
+                    None,
                 ));
             }
         };
@@ -2609,6 +2671,7 @@ async fn fetch_one(
                     Vec::new(),
                     Vec::new(),
                     &queue_identity,
+                    None,
                 ));
             }
         };
@@ -2617,6 +2680,13 @@ async fn fetch_one(
 
         let status = response.status();
         let headers = response.headers().clone();
+        let mut retained = capture::observed_response(
+            &config.capture,
+            &headers,
+            &queue_identity.storage_key,
+            &original_url,
+            &current_url,
+        );
 
         if status.is_redirection() {
             let Some(location) = redirect_location(&headers) else {
@@ -2639,6 +2709,7 @@ async fn fetch_one(
                     Vec::new(),
                     Vec::new(),
                     &queue_identity,
+                    retained,
                 ));
             };
 
@@ -2662,6 +2733,7 @@ async fn fetch_one(
                         Vec::new(),
                         Vec::new(),
                         &queue_identity,
+                        retained,
                     ));
                 }
             };
@@ -2697,6 +2769,7 @@ async fn fetch_one(
                     Vec::new(),
                     Vec::new(),
                     &queue_identity,
+                    retained,
                 ));
             }
             current_url = next_url;
@@ -2746,6 +2819,7 @@ async fn fetch_one(
                     Vec::new(),
                     Vec::new(),
                     &queue_identity,
+                    retained,
                 ));
             }
         };
@@ -2782,8 +2856,20 @@ async fn fetch_one(
         let mut edges = Vec::new();
         let mut image_assets = Vec::new();
 
+        if !is_html {
+            record.content_hash = Some(blake3::hash(&bytes).to_hex().to_string());
+            record.content_hash_context = Some("response-bytes-v1".into());
+        }
+
         if is_html {
             let raw_html = String::from_utf8_lossy(&bytes);
+            if let Some(retained) = retained.as_mut()
+                && config.capture.raw_html
+            {
+                let (text, truncated) = capture::bounded_text(&raw_html, config.capture.max_bytes);
+                retained.raw_html = Some(text);
+                retained.raw_html_truncated = truncated;
+            }
             let rendered_html = match rendering::render_page_if_enabled(
                 &config,
                 &current_url,
@@ -2800,6 +2886,14 @@ async fn fetch_one(
                     None
                 }
             };
+            if let Some(retained) = retained.as_mut()
+                && config.capture.rendered_html
+                && let Some(html) = rendered_html.as_deref()
+            {
+                let (text, truncated) = capture::bounded_text(html, config.capture.max_bytes);
+                retained.rendered_html = Some(text);
+                retained.rendered_html_truncated = truncated;
+            }
             let raw_signals = rendered_html
                 .as_ref()
                 .map(|_| parse_html_with_content(&current_url, &raw_html, &content_selectors));
@@ -2807,6 +2901,30 @@ async fn fetch_one(
             let signals = parse_html_with_content(&current_url, html, &content_selectors);
             if let Some(raw_signals) = raw_signals.as_ref() {
                 apply_rendered_dom_diff(&mut record, raw_signals, &signals);
+            }
+            if !config.rendering.enabled || record.js_rendered {
+                record.content_hash = Some(
+                    blake3::hash(signals.comparison_text.as_bytes())
+                        .to_hex()
+                        .to_string(),
+                );
+                let selection = blake3::hash(&serde_json::to_vec(&config.content)?);
+                let source = if record.js_rendered {
+                    "rendered"
+                } else {
+                    "http"
+                };
+                record.content_hash_context =
+                    Some(format!("text-v1:{source}:{}", selection.to_hex()));
+            }
+            if let Some(retained) = retained.as_mut()
+                && config.capture.visible_text
+                && (!config.rendering.enabled || record.js_rendered)
+            {
+                let (text, truncated) =
+                    capture::bounded_text(&signals.comparison_text, config.capture.max_bytes);
+                retained.visible_text = Some(text);
+                retained.visible_text_truncated = truncated;
             }
             let page_images = signals.images;
             let visible_text = signals.visible_text;
@@ -3034,6 +3152,7 @@ async fn fetch_one(
             edges,
             image_assets,
             &queue_identity,
+            retained,
         ));
     }
 
@@ -3051,6 +3170,7 @@ async fn fetch_one(
         Vec::new(),
         Vec::new(),
         &queue_identity,
+        None,
     ))
 }
 
@@ -3060,6 +3180,7 @@ fn fetch_output(
     edges: Vec<LinkEdge>,
     images: Vec<ImageAsset>,
     identity: &QueueIdentity,
+    capture: Option<ferrous_frog_storage::PageCapture>,
 ) -> FetchOutput {
     let page_nofollow = contains_robots_directive(record.meta_robots.as_deref(), "nofollow")
         || contains_robots_directive(record.x_robots_tag.as_deref(), "nofollow");
@@ -3078,6 +3199,7 @@ fn fetch_output(
         edges,
         images,
         from_sitemap: identity.from_sitemap,
+        capture,
     }
 }
 
@@ -3900,6 +4022,8 @@ fn status_record(
         resolved_ip_count: 0,
         size_bytes,
         response_hash,
+        content_hash: None,
+        content_hash_context: None,
         depth,
         redirect_target,
         redirect_type,
@@ -4023,6 +4147,8 @@ fn error_record(
         resolved_ip_count: 0,
         size_bytes: 0,
         response_hash: None,
+        content_hash: None,
+        content_hash_context: None,
         depth,
         redirect_target: redirect_chain.last().and_then(|hop| hop.location.clone()),
         redirect_type: redirect_chain.last().map(|hop| hop.status_code.to_string()),
@@ -4137,6 +4263,8 @@ fn blocked_record(url: &Url, depth: usize, root_url: &Url) -> CrawlRecord {
         resolved_ip_count: 0,
         size_bytes: 0,
         response_hash: None,
+        content_hash: None,
+        content_hash_context: None,
         depth,
         redirect_target: None,
         redirect_type: None,
@@ -5221,7 +5349,7 @@ mod tests {
         let restored: CrawlConfig = serde_json::from_value(value).unwrap();
         assert_eq!(
             serde_json::to_value(restored).unwrap()["store"],
-            serde_json::json!({"images":true,"css":true,"javascript":true,"other":true,"internalLinks":true,"externalLinks":true})
+            serde_json::json!({"images":true,"css":true,"javascript":true,"other":true,"internalLinks":true,"externalLinks":true,"canonical":true,"hreflang":true,"pagination":true,"amp":true,"metaRefresh":true,"iframe":true})
         );
     }
 
@@ -5524,6 +5652,27 @@ mod tests {
             assert!(root.rel_next.as_deref().unwrap().ends_with("/next"));
             assert!(root.rel_prev.as_deref().unwrap().ends_with("/previous"));
             assert!(root.amphtml.as_deref().unwrap().ends_with("/amp-page"));
+            let references = store.page_references(ferrous_frog_storage::PageReferenceQuery {
+                source_storage_key: Some(root.storage_key.clone()),
+                ..ferrous_frog_storage::PageReferenceQuery::default()
+            });
+            assert_eq!(references.total, 14);
+            assert_eq!(
+                references
+                    .references
+                    .iter()
+                    .filter(|reference| reference.target_url.ends_with("/html-canonical"))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                references
+                    .references
+                    .iter()
+                    .filter(|reference| reference.target_url.ends_with("/amp-page"))
+                    .count(),
+                2
+            );
             assert_eq!(root.outlink_count, 1);
             assert_eq!(
                 store
@@ -5543,6 +5692,118 @@ mod tests {
                 } else {
                     assert_eq!(row.inlink_count, 0, "{}", row.url);
                     assert_eq!(row.first_inlink_source_url, None);
+                }
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reference_retention_choices_preserve_metadata_and_force_only_effective_discovery() {
+        use ferrous_frog_storage::{ActiveStore, PageReferenceQuery};
+
+        let (base_url, requests, server) = spawn_recording_site(|_| {
+            response(200, "OK", "text/html", "<head><meta name='robots' content='nofollow'><link rel='canonical' href='/canonical?keep=1'><link rel='alternate' hreflang='en' href='/english'><link rel='next' href='/next'><link rel='amphtml' href='/amp'><meta http-equiv='refresh' content='0; url=/refresh'></head><body><iframe src='/frame'></iframe><a href='/ordinary'>Ordinary</a></body>")
+                .replacen("Content-Type:", "Link: </header>; rel=canonical\r\nContent-Type:", 1)
+        }).await;
+        let kinds = [
+            "canonical",
+            "hreflang",
+            "pagination",
+            "amp",
+            "metaRefresh",
+            "iframe",
+        ];
+        for sqlite in [false, true] {
+            for (mode, folder_scope, discover) in [
+                (CrawlMode::Spider, FolderScope::default(), false),
+                (CrawlMode::Spider, FolderScope::default(), true),
+                (CrawlMode::Spider, FolderScope::ExactUrl, true),
+                (CrawlMode::List, FolderScope::default(), true),
+            ] {
+                for selected in std::iter::once("none").chain(kinds) {
+                    requests.lock().unwrap().clear();
+                    let store = if sqlite {
+                        ActiveStore::Sqlite(ferrous_frog_storage::SqliteStore::in_memory().unwrap())
+                    } else {
+                        ActiveStore::memory()
+                    };
+                    let mut config = CrawlConfig {
+                        mode,
+                        folder_scope,
+                        list_urls: vec![base_url.clone(), base_url.clone()],
+                        max_depth: 0,
+                        query_settings: QuerySettings {
+                            strip_all: true,
+                            ..QuerySettings::default()
+                        },
+                        ..reference_test_config(&base_url)
+                    };
+                    config.reference_links = serde_json::from_value(serde_json::Value::Object(
+                        kinds
+                            .map(|kind| (kind.into(), discover.into()))
+                            .into_iter()
+                            .collect(),
+                    ))
+                    .unwrap();
+                    config.store = serde_json::from_value(serde_json::Value::Object(
+                        kinds
+                            .map(|kind| (kind.into(), (selected == kind).into()))
+                            .into_iter()
+                            .collect(),
+                    ))
+                    .unwrap();
+                    crawl(config, store.clone(), CrawlControl::default(), |_| {})
+                        .await
+                        .unwrap();
+                    let rows = store.records();
+                    let copies = if mode == CrawlMode::List { 2 } else { 1 };
+                    assert_eq!(requests.lock().unwrap().len(), copies);
+                    assert_eq!(rows.len(), copies);
+                    let forced = discover
+                        && mode == CrawlMode::Spider
+                        && folder_scope != FolderScope::ExactUrl;
+                    let expected = if forced {
+                        7
+                    } else if selected == "none" {
+                        0
+                    } else if selected == "canonical" {
+                        2
+                    } else {
+                        1
+                    };
+                    for row in rows {
+                        let evidence = store.page_references(PageReferenceQuery {
+                            source_storage_key: Some(row.storage_key.clone()),
+                            ..PageReferenceQuery::default()
+                        });
+                        assert_eq!(
+                            evidence.total, expected,
+                            "sqlite={sqlite}, {mode:?}, {folder_scope:?}, {selected}, discover={discover}"
+                        );
+                        for reference in evidence.references {
+                            assert_eq!(reference.source_storage_key, row.storage_key);
+                            assert_eq!(reference.source_url, row.final_url);
+                            assert!(reference.rel_nofollow);
+                            if reference.target_url.contains("/canonical") {
+                                assert!(reference.target_url.ends_with("?keep=1"));
+                            }
+                        }
+                        assert_eq!(
+                            row.canonical.as_deref(),
+                            Some(format!("{base_url}canonical?keep=1").as_str())
+                        );
+                        assert_eq!(row.canonical_count, 2);
+                        assert_eq!(row.hreflang_count, 1);
+                        assert!(row.rel_next.as_deref().unwrap().ends_with("/next"));
+                        assert!(row.amphtml.as_deref().unwrap().ends_with("/amp"));
+                        assert_eq!(row.indexability_status, "Canonicalized");
+                        assert_eq!(row.outlink_count, 1);
+                    }
+                    assert_eq!(
+                        store.page_references(PageReferenceQuery::default()).total,
+                        copies * expected
+                    );
                 }
             }
         }
@@ -5702,6 +5963,24 @@ mod tests {
                 .unwrap();
             assert!(redirect.final_url.ends_with("/outside/final"));
             assert_eq!(redirect.redirect_chain.len(), 1);
+            let references = store.page_references(ferrous_frog_storage::PageReferenceQuery {
+                source_storage_key: Some(redirect.storage_key.clone()),
+                ..ferrous_frog_storage::PageReferenceQuery::default()
+            });
+            assert_eq!(references.total, 1);
+            assert_eq!(references.references[0].source_url, redirect.final_url);
+            let targets = store
+                .page_references(ferrous_frog_storage::PageReferenceQuery::default())
+                .references;
+            for target in [
+                "follow?utm=one",
+                "follow?utm=two",
+                "excluded",
+                "image.png",
+                "blocked",
+            ] {
+                assert!(targets.iter().any(|reference| reference.target_url == format!("{base_url}docs/{target}")));
+            }
             assert_eq!(
                 records
                     .iter()
@@ -5794,6 +6073,17 @@ mod tests {
             let source = records.iter().find(|row| row.url == seed).unwrap();
             assert!(source.canonical.as_deref().unwrap().ends_with("/first"));
             assert_eq!(source.canonical_count, expected - 1);
+            let references = store.page_references(ferrous_frog_storage::PageReferenceQuery {
+                source_storage_key: Some(source.storage_key.clone()),
+                ..ferrous_frog_storage::PageReferenceQuery::default()
+            });
+            assert_eq!(references.total, expected - 1);
+            assert!(
+                references
+                    .references
+                    .iter()
+                    .all(|reference| reference.kind == StoredPageReferenceKind::Canonical)
+            );
             if path == "incomplete" {
                 assert_eq!(source.indexability_status, "Response body incomplete");
                 assert!(source.title.is_none());
@@ -6389,6 +6679,142 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn content_fingerprints_ignore_volatile_markup_and_track_text_and_selector_context() {
+        let revision = Arc::new(AtomicUsize::new(0));
+        let served_revision = revision.clone();
+        let (base_url, _, server) = spawn_recording_site(move |_| {
+            let version = served_revision.load(Ordering::SeqCst);
+            let text = match version { 0 => "Stable copy", 1 => "Stable\n  copy", _ => "Updated copy" };
+            response(200, "OK", "text/html", &format!("<head><title>Stable title</title><meta name='csrf' content='{version}'></head><body><main data-nonce='{version}'>{text}</main><script>const nonce = {version};</script><style>.n{version} {{color:red}}</style><template>Token {version}</template></body>"))
+        }).await;
+        let config = CrawlConfig {
+            start_url: base_url,
+            max_urls: 1,
+            respect_robots: false,
+            requests_per_second: 0,
+            request_delay_ms: 0,
+            sitemap: SitemapConfig {
+                enabled: false,
+                ..SitemapConfig::default()
+            },
+            ..CrawlConfig::default()
+        };
+        let mut records = Vec::new();
+        for version in 0..3 {
+            revision.store(version, Ordering::SeqCst);
+            let store = MemoryStore::new();
+            crawl(
+                config.clone(),
+                store.clone(),
+                CrawlControl::default(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+            records.push(store.records().remove(0));
+        }
+        assert!(records[0].content_hash.is_some());
+        assert_eq!(records[0].content_hash, records[1].content_hash);
+        assert_ne!(records[0].response_hash, records[1].response_hash);
+        assert_ne!(records[1].content_hash, records[2].content_hash);
+        assert_eq!(
+            records[0].content_hash_context,
+            records[2].content_hash_context
+        );
+        assert_eq!(records[0].title, records[2].title);
+        let store = MemoryStore::new();
+        crawl(
+            CrawlConfig {
+                content: ContentConfig {
+                    include_selectors: vec!["main".into()],
+                    ..ContentConfig::default()
+                },
+                ..config
+            },
+            store.clone(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let scoped = store.records().remove(0);
+        assert_eq!(records[2].content_hash, scoped.content_hash);
+        assert_ne!(records[2].content_hash_context, scoped.content_hash_context);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn content_fingerprints_preserve_complete_binary_and_empty_text_evidence() {
+        let (base_url, _, server) = spawn_recording_site(|path| match path {
+            "/first.bin" => response(200, "OK", "application/octet-stream", "first bytes"),
+            "/second.bin" => response(200, "OK", "application/octet-stream", "second bytes"),
+            "/empty.bin" => response(200, "OK", "application/octet-stream", ""),
+            _ => response(
+                200,
+                "OK",
+                "text/html",
+                "<title>Empty body</title><script>volatile()</script>",
+            ),
+        })
+        .await;
+        let store = MemoryStore::new();
+        crawl(
+            CrawlConfig {
+                mode: CrawlMode::List,
+                start_url: base_url.clone(),
+                list_urls: ["first.bin", "second.bin", "empty.bin", "empty.html"]
+                    .map(|path| format!("{base_url}{path}"))
+                    .to_vec(),
+                respect_robots: false,
+                requests_per_second: 0,
+                request_delay_ms: 0,
+                ..CrawlConfig::default()
+            },
+            store.clone(),
+            CrawlControl::default(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let rows = store.records();
+        assert_eq!(rows.len(), 4);
+        let empty_hash = blake3::hash(b"").to_hex().to_string();
+        for row in &rows {
+            if row.url.ends_with("empty.html") {
+                assert_eq!(row.content_hash.as_deref(), Some(empty_hash.as_str()));
+                assert!(
+                    row.content_hash_context
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("text-v1:http:")
+                );
+            } else {
+                assert_eq!(
+                    row.content_hash_context.as_deref(),
+                    Some("response-bytes-v1")
+                );
+                if row.url.ends_with("empty.bin") {
+                    assert_eq!(row.content_hash.as_deref(), Some(empty_hash.as_str()));
+                    assert!(row.response_hash.is_none());
+                } else {
+                    assert_eq!(row.content_hash, row.response_hash);
+                }
+            }
+        }
+        assert_ne!(
+            rows.iter()
+                .find(|row| row.url.ends_with("first.bin"))
+                .unwrap()
+                .content_hash,
+            rows.iter()
+                .find(|row| row.url.ends_with("second.bin"))
+                .unwrap()
+                .content_hash
+        );
+        server.abort();
+    }
+
     #[test]
     fn content_regions_default_for_saved_configs_and_validate_selectors() {
         let mut value = serde_json::to_value(CrawlConfig::default()).unwrap();
@@ -6624,6 +7050,8 @@ mod tests {
                 assert!(row.error.is_some(), "{}", row.url);
                 assert!(row.title.is_none());
                 assert!(row.response_hash.is_none());
+                assert!(row.content_hash.is_none());
+                assert!(row.content_hash_context.is_none());
                 assert_eq!(row.indexability_status, "Response body incomplete");
                 assert_eq!(
                     row.indexability,
@@ -8186,6 +8614,17 @@ mod tests {
         assert_eq!(root.word_count, 2);
         assert_eq!(root.canonical_count, 2);
         assert_eq!(root.hreflang_count, 1);
+        let references = store.page_references(ferrous_frog_storage::PageReferenceQuery {
+            source_storage_key: Some(root.storage_key.clone()),
+            ..ferrous_frog_storage::PageReferenceQuery::default()
+        });
+        assert_eq!(references.total, 5);
+        assert!(
+            references
+                .references
+                .iter()
+                .any(|reference| reference.target_url.ends_with("/http-canonical"))
+        );
         assert!(
             store
                 .link_edges(ferrous_frog_storage::LinkEdgeQuery::default())
@@ -8294,6 +8733,12 @@ mod tests {
                 include_selectors: vec!["main".into()],
                 exclude_selectors: Vec::new(),
             },
+            capture: CaptureConfig {
+                raw_html: true,
+                rendered_html: true,
+                visible_text: true,
+                ..Default::default()
+            },
             rendering: JsRenderingConfig {
                 enabled: true,
                 wait_after_load_ms: 50,
@@ -8318,8 +8763,47 @@ mod tests {
             Some(simhash::simhash("Rendered content has four"))
         );
         assert_eq!(
+            root.content_hash,
+            Some(
+                blake3::hash(b"Rendered content has four")
+                    .to_hex()
+                    .to_string()
+            )
+        );
+        assert!(
+            root.content_hash_context
+                .as_deref()
+                .unwrap()
+                .starts_with("text-v1:rendered:")
+        );
+        assert_eq!(
             root.response_hash,
             Some(blake3::hash(HTML.as_bytes()).to_hex().to_string())
+        );
+        let captured = store
+            .page_captures(ferrous_frog_storage::PageCaptureQuery {
+                source_storage_key: Some(root.storage_key.clone()),
+                ..Default::default()
+            })
+            .captures
+            .pop()
+            .unwrap();
+        assert_eq!(captured.raw_html.as_deref(), Some(HTML));
+        assert!(
+            captured
+                .rendered_html
+                .as_deref()
+                .unwrap()
+                .contains("<main>Rendered content has four</main>")
+        );
+        assert_eq!(
+            captured.visible_text.as_deref(),
+            Some("Rendered content has four")
+        );
+        assert!(
+            !captured.raw_html_truncated
+                && !captured.rendered_html_truncated
+                && !captured.visible_text_truncated
         );
         server.abort();
     }
@@ -10420,6 +10904,204 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aborted_dispatch_preserves_active_and_waiting_frontier_for_resume() {
+        use ferrous_frog_storage::ActiveStore;
+
+        for sqlite in [false, true] {
+            for mode in [CrawlMode::List, CrawlMode::Spider] {
+                let arrived = Arc::new(tokio::sync::Semaphore::new(0));
+                let release = Arc::new(tokio::sync::Semaphore::new(0));
+                let server_arrived = arrived.clone();
+                let server_release = release.clone();
+                let (base_url, requests, server) =
+                    spawn_recording_site_with_async_response(move |path, _| {
+                        let sitemap = path == "/linked.xml";
+                        let blocked = !matches!(path, "/" | "/completed" | "/linked.xml");
+                        let html = match path {
+                            "/" => "<title>Seed</title><a href='/completed'>Discover</a><a href='/a'>A</a>",
+                            "/completed" => "<title>Discovery</title><link rel='sitemap' href='/linked.xml'><a href='/b'>B</a><a href='/c'>C</a><a href='/d'>D</a>",
+                            "/linked.xml" => "<urlset><url><loc>/a</loc></url><url><loc>/c</loc></url></urlset>",
+                            _ => "<title>Resumed page</title>",
+                        };
+                        let arrived = server_arrived.clone();
+                        let release = server_release.clone();
+                        async move {
+                            if blocked {
+                                arrived.add_permits(1);
+                                release.acquire().await.unwrap().forget();
+                            }
+                            response(200, "OK", if sitemap { "application/xml" } else { "text/html" }, html)
+                        }
+                    })
+                    .await;
+                let list = mode == CrawlMode::List;
+                let specs = if list {
+                    [
+                        ("a", 0, false, 1),
+                        ("b", 2, true, 1),
+                        ("a", 3, false, 2),
+                        ("c", 1, true, 1),
+                    ]
+                } else {
+                    [
+                        ("a", 1, true, 0),
+                        ("b", 2, false, 0),
+                        ("c", 0, true, 0),
+                        ("d", 2, false, 0),
+                    ]
+                };
+                let mut expected = CrawlFrontierState {
+                    queued: specs
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (path, depth, from_sitemap, duplicate))| {
+                            let url = format!("{base_url}{path}");
+                            CrawlFrontierItem {
+                                storage_key: if list {
+                                    format!("list:{}:{url}", index + 1)
+                                } else {
+                                    url.clone()
+                                },
+                                url,
+                                depth,
+                                from_sitemap,
+                                list_position: list.then_some(index as u32 + 1),
+                                list_duplicate_index: duplicate,
+                            }
+                        })
+                        .collect(),
+                    seen: Vec::new(),
+                    crawled: if list { 0 } else { 2 },
+                };
+                expected.seen = expected
+                    .queued
+                    .iter()
+                    .map(|item| item.storage_key.clone())
+                    .collect();
+                if !list {
+                    expected.seen.push(base_url.clone());
+                    expected.seen.push(format!("{base_url}completed"));
+                }
+                expected.seen.sort();
+
+                let directory = std::env::temp_dir().join(format!(
+                    "ferrous-frog-aborted-dispatch-{}-{}",
+                    std::process::id(),
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+                let database = directory.join("crawl.sqlite3");
+                let mut store = if sqlite {
+                    std::fs::create_dir(&directory).unwrap();
+                    ActiveStore::sqlite(&database).unwrap()
+                } else {
+                    ActiveStore::memory()
+                };
+                if list {
+                    store.save_frontier_state(expected.clone());
+                }
+                let config = CrawlConfig {
+                    start_url: base_url.clone(),
+                    mode,
+                    max_urls: expected.queued.len() + expected.crawled,
+                    concurrency: 2,
+                    requests_per_second: 0,
+                    request_delay_ms: 0,
+                    respect_robots: false,
+                    resume_from_state: list,
+                    sitemap: SitemapConfig {
+                        enabled: !list,
+                        discover_from_robots: false,
+                        probe_default: false,
+                        follow_linked: true,
+                        ..SitemapConfig::default()
+                    },
+                    ..CrawlConfig::default()
+                };
+                let task = tokio::spawn(crawl(
+                    config.clone(),
+                    store.clone(),
+                    CrawlControl::default(),
+                    |_| {},
+                ));
+                tokio::time::timeout(Duration::from_secs(5), arrived.acquire_many(2))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .forget();
+                assert_eq!(
+                    requests.lock().unwrap().len(),
+                    2 + expected.crawled + usize::from(!list)
+                );
+                // Abort skips the final Stop checkpoint, exposing the last durable snapshot.
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                if sqlite {
+                    drop(store);
+                    store = ActiveStore::sqlite(&database).unwrap();
+                }
+                let mut saved = store.load_frontier_state().unwrap();
+                saved
+                    .queued
+                    .sort_by(|a, b| a.storage_key.cmp(&b.storage_key));
+                expected
+                    .queued
+                    .sort_by(|a, b| a.storage_key.cmp(&b.storage_key));
+                assert_eq!(saved, expected);
+                let completed = store.records();
+                assert_eq!(completed.len(), expected.crawled);
+                requests.lock().unwrap().clear();
+                release.add_permits(2 + expected.queued.len());
+
+                let resumed = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    crawl(
+                        CrawlConfig {
+                            resume_from_state: true,
+                            ..config
+                        },
+                        store.clone(),
+                        CrawlControl::default(),
+                        |_| {},
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(resumed.status, "finished");
+                assert_eq!(resumed.crawled, expected.queued.len() + expected.crawled);
+                assert!(store.load_frontier_state().is_none());
+                assert_eq!(requests.lock().unwrap().len(), expected.queued.len());
+                let rows = store.records();
+                assert_eq!(rows.len(), resumed.crawled);
+                for item in expected.queued {
+                    let row = rows
+                        .iter()
+                        .find(|row| row.storage_key == item.storage_key)
+                        .unwrap();
+                    assert_eq!(row.url, item.url);
+                    assert_eq!(row.depth, item.depth);
+                    assert_eq!(row.in_sitemap, item.from_sitemap);
+                    assert_eq!(row.list_position, item.list_position);
+                    assert_eq!(row.list_duplicate_index, item.list_duplicate_index);
+                    assert_eq!(row.status_code, Some(200));
+                }
+                for previous in completed {
+                    let row = rows.iter().find(|row| row.id == previous.id).unwrap();
+                    assert_eq!(row.storage_key, previous.storage_key);
+                }
+                server.abort();
+                drop(store);
+                if sqlite {
+                    std::fs::remove_dir_all(directory).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn flags_redirect_loops_before_redirect_limit() {
         let (base_url, server) = spawn_mock_site().await;
         let store = MemoryStore::new();
@@ -11615,7 +12297,7 @@ mod tests {
         )
     }
 
-    async fn spawn_recording_site(
+    pub(super) async fn spawn_recording_site(
         handler: impl Fn(&str) -> String + Send + Sync + 'static,
     ) -> (String, RecordedRequests, tokio::task::JoinHandle<()>) {
         spawn_recording_site_with_request(move |path, _| handler(path)).await
@@ -12061,7 +12743,7 @@ mod tests {
         )
     }
 
-    fn response(status: u16, reason: &str, content_type: &str, body: &str) -> String {
+    pub(super) fn response(status: u16, reason: &str, content_type: &str, body: &str) -> String {
         format!(
             "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()

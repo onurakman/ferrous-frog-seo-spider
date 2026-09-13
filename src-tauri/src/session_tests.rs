@@ -31,6 +31,7 @@ fn idle_state() -> AppState {
         control: Mutex::new(None),
         crawl_task: tokio::sync::Mutex::new(None),
         current_session_id: Mutex::new(None),
+        comparison: Mutex::new(crate::ComparisonState::default()),
         frontend_ready: AtomicBool::new(true),
         exit_confirmed: AtomicBool::new(false),
     }
@@ -45,6 +46,160 @@ fn record(path: &str) -> CrawlRecord {
     record.title = Some("Shared title".to_string());
     record.meta_description = Some("Shared description".to_string());
     record
+}
+
+#[tokio::test]
+async fn comparison_workspace_keeps_snapshots_and_preserves_the_open_crawl() {
+    let dir = TestDirectory::new();
+    let state = idle_state();
+    let index = sessions::index_connection(&dir.0).unwrap();
+    let (baseline, old) =
+        sessions::create_session(&index, &dir.0, "Baseline", "", None, "ready").unwrap();
+    let (current, new) =
+        sessions::create_session(&index, &dir.0, "Current", "", None, "ready").unwrap();
+    old.upsert(record("changed"));
+    let mut changed = record("changed");
+    changed.title = Some("Updated title".into());
+    new.upsert(changed);
+    state
+        .store
+        .lock()
+        .unwrap()
+        .upsert(record("active-workbench"));
+    *state.current_session_id.lock().unwrap() = Some("untouched".into());
+    // A comparison must not run library initialization and register this legacy file.
+    let legacy = SqliteStore::open(dir.0.join("ferrous-frog-current.sqlite3")).unwrap();
+    legacy.upsert(record("unregistered-legacy"));
+
+    let page = prepare_crawl_comparison(
+        &state,
+        dir.0.clone(),
+        OpenCrawlComparisonRequest {
+            comparison_id: "first".into(),
+            baseline_session_id: Some(baseline.id),
+            current_session_id: Some(current.id),
+            archive_path: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.total, 1);
+    let key = page.rows[0].key;
+    new.upsert(record("later"));
+    let detail = with_comparison_worker(&state, "first", move |workspace| workspace.detail(key))
+        .await
+        .unwrap();
+    assert_eq!(
+        detail.current.unwrap().title.as_deref(),
+        Some("Updated title")
+    );
+    let page = with_comparison_worker(&state, "first", |workspace| {
+        workspace.query(&ComparisonQuery::default())
+    })
+    .await
+    .unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(
+        state.current_session_id.lock().unwrap().as_deref(),
+        Some("untouched")
+    );
+    assert_eq!(
+        state.store.lock().unwrap().records()[0].url,
+        "https://example.test/active-workbench"
+    );
+    assert_eq!(query_sessions(&index, None).unwrap().len(), 2);
+
+    let path = dir.0.join("comparison.csv");
+    let export = with_comparison_worker(&state, "first", move |workspace| {
+        write_atomic_export(&path, |file| {
+            workspace.write_csv(&ComparisonQuery::default(), file)
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(export.row_count, 1);
+    assert!(
+        fs::read_to_string(&export.path)
+            .unwrap()
+            .contains("Updated title")
+    );
+    state.comparison.lock().unwrap().close("first");
+    assert!(
+        with_comparison_worker(&state, "first", |workspace| workspace
+            .query(&ComparisonQuery::default()))
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn comparison_archive_survives_removal_and_failed_replacement_clears_pending_state() {
+    let dir = TestDirectory::new();
+    let state = idle_state();
+    state.store.lock().unwrap().upsert(record("current"));
+    let path = dir.0.join("baseline.json");
+    let mut baseline = record("previous");
+    baseline.id = 1;
+    fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1, "records": [baseline], "linkEdges": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let request = |id: &str| OpenCrawlComparisonRequest {
+        comparison_id: id.into(),
+        baseline_session_id: None,
+        current_session_id: None,
+        archive_path: Some(path.to_string_lossy().into_owned()),
+    };
+    let page = prepare_crawl_comparison(&state, dir.0.clone(), request("archive"))
+        .await
+        .unwrap();
+    assert_eq!(page.total, 2);
+    fs::remove_file(&path).unwrap();
+    assert_eq!(
+        with_comparison_worker(&state, "archive", |workspace| workspace
+            .query(&ComparisonQuery::default()))
+        .await
+        .unwrap()
+        .total,
+        2
+    );
+    assert!(
+        prepare_crawl_comparison(&state, dir.0.clone(), request("missing"))
+            .await
+            .is_err()
+    );
+    assert!(state.comparison.lock().unwrap().id.is_none());
+    assert_eq!(state.store.lock().unwrap().records().len(), 1);
+    assert!(!dir.0.join("ferrous-frog-sessions.sqlite3").exists());
+}
+
+#[test]
+fn comparison_lifecycle_rejects_late_work_and_close_for_an_older_id() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive = directory.path().join("empty.json");
+    fs::write(&archive, r#"{"schemaVersion":1,"records":[]}"#).unwrap();
+    let sources =
+        comparison_sources::ComparisonSources::archive(&archive, &ActiveStore::memory()).unwrap();
+    let workspace = ComparisonWorkspace::new(sources).unwrap();
+    let mut state = ComparisonState::default();
+    assert!(state.reserve("").is_err());
+    let first_generation = state.reserve("first").unwrap();
+    assert!(state.reserve("first").is_err());
+    assert!(state.get("first").is_err());
+    state.reserve("second").unwrap();
+    state.close("first");
+    assert_eq!(state.id.as_deref(), Some("second"));
+    assert!(state.get("first").is_err());
+    state.close("second");
+    assert!(state.id.is_none());
+    state.reserve("first").unwrap();
+    assert!(state.publish("first", first_generation, workspace).is_err());
+    assert_eq!(state.id.as_deref(), Some("first"));
+    assert!(state.workspace.is_none());
 }
 
 #[test]
@@ -341,11 +496,13 @@ fn archive_import_creates_a_saved_file_without_replacing_previous_data() {
         &state,
         &dir.0,
         CrawlArchive {
+            page_captures: Vec::new(),
             schema_version: 1,
             exported_at_ms: 1,
             records: vec![imported],
             link_edges: Vec::new(),
             image_assets: Vec::new(),
+            page_references: Vec::new(),
             frontier_state: None,
         },
     )
@@ -379,6 +536,7 @@ fn sql_comparison_matches_existing_semantics_without_decoding_full_records() {
     let (current, new) =
         sessions::create_session(&index, &dir.0, "Current", "", None, "ready").unwrap();
     let mut changed = record("changed");
+    changed.response_hash = Some("previous-hash".into());
     changed.near_duplicate_cluster_id = Some(7);
     let mut removed = record("removed");
     removed.near_duplicate_cluster_id = Some(7);
@@ -411,7 +569,11 @@ fn sql_comparison_matches_existing_semantics_without_decoding_full_records() {
     incomplete.error = Some("Response exceeds configured limit".into());
     old.try_upsert(incomplete.clone()).unwrap();
     new.try_upsert(incomplete).unwrap();
-    let expected = compare_records(&old.try_records().unwrap(), &new.try_records().unwrap());
+    let expected = compare_records(
+        &old.try_records().unwrap(),
+        &new.try_records().unwrap(),
+        false,
+    );
     // A full CrawlRecord decoder rejects this; comparison needs only scalar columns.
     Connection::open(&baseline.database_path)
         .unwrap()
@@ -421,9 +583,10 @@ fn sql_comparison_matches_existing_semantics_without_decoding_full_records() {
         )
         .unwrap();
     activate_session(&state, &index, &current.id).unwrap();
-    let result = sessions::compare_sessions(&index, &baseline.id, &current.id, None).unwrap();
+    let result =
+        sessions::compare_sessions(&index, &baseline.id, &current.id, None, false).unwrap();
     assert_eq!((result.baseline_records, result.current_records), (5, 4));
-    assert_eq!((result.added, result.removed, result.changed), (1, 1, 1));
+    assert_eq!((result.added, result.removed, result.changed), (1, 2, 1));
     assert_eq!(
         (
             result.status_changed,
@@ -451,11 +614,218 @@ fn sql_comparison_matches_existing_semantics_without_decoding_full_records() {
             .total,
         4
     );
-    assert!(sessions::compare_sessions(&index, &baseline.id, &baseline.id, None).is_err());
+    assert!(sessions::compare_sessions(&index, &baseline.id, &baseline.id, None, false).is_err());
     assert!(
-        sessions::compare_sessions(&index, &baseline.id, &current.id, Some(&current.id)).is_err()
+        sessions::compare_sessions(&index, &baseline.id, &current.id, Some(&current.id), false)
+            .is_err()
     );
-    assert!(sessions::compare_sessions(&index, "missing", &current.id, None).is_err());
+    assert!(sessions::compare_sessions(&index, "missing", &current.id, None, false).is_err());
+}
+
+#[test]
+fn sql_comparison_separates_response_noise_content_changes_and_unavailable_evidence() {
+    let dir = TestDirectory::new();
+    let index = sessions::index_connection(&dir.0).unwrap();
+    let (baseline, old) =
+        sessions::create_session(&index, &dir.0, "Baseline", "", None, "ready").unwrap();
+    let (current, new) =
+        sessions::create_session(&index, &dir.0, "Current", "", None, "ready").unwrap();
+    for path in [
+        "unchanged",
+        "nonce-only",
+        "content",
+        "metadata",
+        "status",
+        "raw-gained",
+        "raw-lost",
+        "content-gained",
+        "context-gained",
+        "different-context",
+        "legacy",
+        "legacy-response",
+        "content-lost",
+        "context-lost",
+        "counts-gained",
+        "counts-lost",
+    ] {
+        let mut previous = record(path);
+        previous.response_hash = Some("response-before".into());
+        previous.content_hash = Some("stable-text".into());
+        previous.content_hash_context = Some("html-text-v1".into());
+        previous.title_count = Some(1);
+        previous.meta_description_count = Some(1);
+        let mut next = previous.clone();
+        match path {
+            "nonce-only" => next.response_hash = Some("response-with-new-nonce".into()),
+            "content" => {
+                next.response_hash = Some("response-after".into());
+                next.content_hash = Some("edited-text".into());
+            }
+            "metadata" => {
+                next.title_count = Some(2);
+                next.meta_description_count = Some(2);
+                next.h1 = Some("New heading".into());
+                next.h2_count = 2;
+                next.canonical_count = 2;
+                next.x_robots_tag = Some("nofollow".into());
+            }
+            "status" => {
+                next.status_code = Some(404);
+                next.indexability_status = "Client error".into();
+            }
+            "raw-gained" => previous.response_hash = None,
+            "raw-lost" => next.response_hash = None,
+            "content-gained" => previous.content_hash = None,
+            "context-gained" => previous.content_hash_context = None,
+            "different-context" => {
+                next.response_hash = Some("response-after".into());
+                next.content_hash = Some("different-region-text".into());
+                next.content_hash_context = Some("another-content-region".into());
+            }
+            "legacy" | "legacy-response" => {
+                previous.content_hash = None;
+                previous.content_hash_context = None;
+                next.content_hash = None;
+                next.content_hash_context = None;
+                if path == "legacy" {
+                    previous.response_hash = None;
+                    next.response_hash = None;
+                } else {
+                    next.response_hash = Some("response-after".into());
+                }
+            }
+            "content-lost" => next.content_hash = None,
+            "context-lost" => next.content_hash_context = None,
+            "counts-gained" => {
+                previous.title_count = None;
+                previous.meta_description_count = None;
+            }
+            "counts-lost" => {
+                next.title_count = None;
+                next.meta_description_count = None;
+            }
+            _ => {}
+        }
+        old.try_upsert(previous).unwrap();
+        new.try_upsert(next).unwrap();
+    }
+    old.try_upsert(record("removed")).unwrap();
+    new.try_upsert(record("added")).unwrap();
+    let previous = old.try_records().unwrap();
+    let next = new.try_records().unwrap();
+    Connection::open(&baseline.database_path)
+        .unwrap()
+        .execute(
+            "UPDATE crawl_records SET custom_extractions = 'invalid json'",
+            [],
+        )
+        .unwrap();
+    for include_response_only in [false, true] {
+        let result = sessions::compare_sessions(
+            &index,
+            &baseline.id,
+            &current.id,
+            None,
+            include_response_only,
+        )
+        .unwrap();
+        assert_eq!((result.added, result.removed, result.changed), (1, 1, 3));
+        assert_eq!(
+            (
+                result.hash_changed,
+                result.content_changed,
+                result.response_only,
+                result.content_unavailable
+            ),
+            (4, 1, 3, 7)
+        );
+        assert_eq!(result.rows.len(), if include_response_only { 8 } else { 5 });
+        for row in &result.rows {
+            let (fields, comparison): (&[&str], &str) = match row.url.rsplit('/').next().unwrap() {
+                "added" | "removed" => (&[], "notApplicable"),
+                "content" => (&["content", "responseHash"], "changed"),
+                "metadata" => (
+                    &[
+                        "title",
+                        "metaDescription",
+                        "headings",
+                        "canonical",
+                        "robotsDirectives",
+                    ],
+                    "unchanged",
+                ),
+                "status" => (&["statusCode", "indexability"], "unchanged"),
+                "nonce-only" => (&["responseHash"], "unchanged"),
+                "different-context" | "legacy-response" => (&["responseHash"], "unavailable"),
+                other => panic!("unexpected comparison row {other}"),
+            };
+            assert_eq!(row.changed_fields, fields);
+            assert_eq!(row.content_comparison, comparison);
+            if fields == ["responseHash"] {
+                assert_eq!(row.change, "responseOnly");
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::to_value(compare_records(&previous, &next, include_response_only)).unwrap(),
+        );
+    }
+}
+
+#[test]
+fn sql_comparison_filters_response_noise_before_limiting_details() {
+    let dir = TestDirectory::new();
+    let index = sessions::index_connection(&dir.0).unwrap();
+    let (baseline, old) =
+        sessions::create_session(&index, &dir.0, "Baseline", "", None, "ready").unwrap();
+    let (current, new) =
+        sessions::create_session(&index, &dir.0, "Current", "", None, "ready").unwrap();
+    for number in 0..1_005 {
+        let mut previous = record(&format!("{number:04}"));
+        previous.response_hash = Some("before".into());
+        previous.content_hash = Some("stable".into());
+        previous.content_hash_context = Some("html-text-v1".into());
+        old.try_upsert(previous.clone()).unwrap();
+        previous.response_hash = Some("after".into());
+        new.try_upsert(previous).unwrap();
+    }
+    let mut changed = record("zz-meaningful");
+    old.try_upsert(changed.clone()).unwrap();
+    changed.meta_description = Some("Edited description".into());
+    new.try_upsert(changed).unwrap();
+    for include_response_only in [false, true] {
+        let result = sessions::compare_sessions(
+            &index,
+            &baseline.id,
+            &current.id,
+            None,
+            include_response_only,
+        )
+        .unwrap();
+        assert_eq!(
+            (result.changed, result.response_only, result.hash_changed),
+            (1, 1_005, 1_005)
+        );
+        assert_eq!(
+            result.rows.len(),
+            if include_response_only { 1_000 } else { 1 }
+        );
+        assert!(
+            result
+                .rows
+                .iter()
+                .any(|row| row.url.ends_with("/zz-meaningful"))
+        );
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::to_value(compare_records(
+                &old.try_records().unwrap(),
+                &new.try_records().unwrap(),
+                include_response_only
+            ))
+            .unwrap(),
+        );
+    }
 }
 
 #[test]
@@ -469,7 +839,8 @@ fn sql_comparison_caps_details_but_counts_every_change() {
     for number in 0..1_005 {
         new.try_upsert(record(&format!("{number:04}"))).unwrap();
     }
-    let result = sessions::compare_sessions(&index, &baseline.id, &current.id, None).unwrap();
+    let result =
+        sessions::compare_sessions(&index, &baseline.id, &current.id, None, false).unwrap();
     assert_eq!(result.added, 1_005);
     assert_eq!(result.current_records, 1_005);
     assert_eq!(result.rows.len(), 1_000);
@@ -483,7 +854,7 @@ fn sql_comparison_caps_details_but_counts_every_change() {
         )
         .unwrap();
     assert!(
-        sessions::compare_sessions(&index, &baseline.id, &current.id, None)
+        sessions::compare_sessions(&index, &baseline.id, &current.id, None, false)
             .unwrap_err()
             .contains("unavailable")
     );
@@ -673,11 +1044,13 @@ fn queued_only_list_archives_restore_targets_and_can_resume() {
         &state,
         &dir.0,
         CrawlArchive {
+            page_captures: Vec::new(),
             schema_version: 1,
             exported_at_ms: 1,
             records: Vec::new(),
             link_edges: Vec::new(),
             image_assets: Vec::new(),
+            page_references: Vec::new(),
             frontier_state: Some(frontier.clone()),
         },
     )

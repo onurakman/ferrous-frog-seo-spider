@@ -313,13 +313,15 @@ pub fn write_export_files<S: CrawlStore>(
     }
     std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
     let records = store.records();
-    let edges = store
-        .link_edges(LinkEdgeQuery {
-            offset: 0,
-            limit: 1_000_000,
-            ..LinkEdgeQuery::default()
-        })
-        .edges;
+    let edges = store.link_edges(LinkEdgeQuery {
+        offset: 0,
+        limit: 1_000_000,
+        ..LinkEdgeQuery::default()
+    });
+    if kinds.contains(&ExportKind::HtmlReport) && edges.edges.len() != edges.total {
+        return Err("HTML report requires all link edges; this crawl exceeds the 1,000,000-edge report limit".into());
+    }
+    let edges = edges.edges;
     let mut written = Vec::new();
     for kind in kinds {
         let path = dir.join(kind.file_name());
@@ -334,9 +336,10 @@ pub fn write_export_files<S: CrawlStore>(
             ExportKind::Sitemap => writer
                 .write_all(records_to_sitemap_xml(&records).as_bytes())
                 .map_err(|e| e.to_string()),
-            ExportKind::HtmlReport => records_to_html_report(&records, &edges, thresholds)
-                .map_err(|e| e.to_string())
-                .and_then(|html| writer.write_all(html.as_bytes()).map_err(|e| e.to_string())),
+            ExportKind::HtmlReport => {
+                records_to_html_report_writer(&records, &edges, thresholds, &mut writer)
+                    .map_err(|e| e.to_string())
+            }
             ExportKind::AuditWorkbook => audit_workbook_to_writer(
                 |mut query: GridQuery| {
                     query.thresholds = *thresholds;
@@ -1411,6 +1414,22 @@ pub fn records_to_html_report(
     env.add_template("seo_report.html", HTML_REPORT_TEMPLATE)?;
     env.get_template("seo_report.html")?
         .render(context! { report => report })
+}
+
+/// Renders HTML directly to the writer. Callers must flush buffered writers before publication.
+/// The report still requires record and link snapshots to compute its summary and sample rows.
+pub fn records_to_html_report_writer<W: Write>(
+    records: &[CrawlRecord],
+    edges: &[LinkEdge],
+    thresholds: &AuditThresholds,
+    writer: W,
+) -> Result<(), minijinja::Error> {
+    let report = build_html_report(records, edges, thresholds);
+    let mut env = Environment::new();
+    env.add_template("seo_report.html", HTML_REPORT_TEMPLATE)?;
+    env.get_template("seo_report.html")?
+        .render_captured_to(context! { report => report }, writer)
+        .map(|_| ())
 }
 
 #[derive(Debug, Serialize)]
@@ -2611,6 +2630,64 @@ mod tests {
         assert!(html.contains("Broken Links"));
         assert!(html.contains("Missing meta description"));
         assert!(html.contains("Toggle theme"));
+    }
+
+    #[test]
+    fn html_report_streams_escaped_rows_with_complete_issue_counts() {
+        struct ChunkWriter(Vec<u8>);
+
+        impl Write for ChunkWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert!(
+                    bytes.len() <= 16 * 1024,
+                    "HTML must be written incrementally"
+                );
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let records = (0..51)
+            .map(|index| {
+                let mut record = CrawlRecord::pending(format!("https://example.test/{index}"), 0);
+                record.status_code = Some(404);
+                record.status_text = "<script>alert(\"🐸\")</script>".into();
+                record
+            })
+            .collect::<Vec<_>>();
+        let mut writer = ChunkWriter(Vec::new());
+        records_to_html_report_writer(&records, &[], &AuditThresholds::default(), &mut writer)
+            .unwrap();
+        let html = String::from_utf8(writer.0).unwrap();
+        assert!(html.len() > 16 * 1024);
+        assert!(html.contains("51 issues"));
+        assert!(html.contains("example.test&#x2f;49"));
+        assert!(!html.contains("example.test&#x2f;50"));
+        assert!(html.contains("&lt;script&gt;alert(&quot;🐸&quot;)&lt;&#x2f;script&gt;"));
+        assert!(!html.contains("<script>alert("));
+        assert!(html.trim_end().ends_with("</html>"));
+
+        let mut full = [0; 32];
+        let error = records_to_html_report_writer(
+            &records,
+            &[],
+            &AuditThresholds::default(),
+            full.as_mut_slice(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), minijinja::ErrorKind::WriteFailure);
+        assert_eq!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::WriteZero
+        );
     }
 
     #[test]

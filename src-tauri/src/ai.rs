@@ -489,6 +489,7 @@ mod tests {
             control: Mutex::new(None),
             crawl_task: tokio::sync::Mutex::new(None),
             current_session_id: Mutex::new(None),
+            comparison: Mutex::new(crate::ComparisonState::default()),
             frontend_ready: AtomicBool::new(true),
             exit_confirmed: AtomicBool::new(false),
         }

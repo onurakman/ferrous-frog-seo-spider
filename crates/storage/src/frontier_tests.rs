@@ -133,6 +133,170 @@ fn sqlite_frontier_insert_failures_roll_back_the_complete_checkpoint() {
 }
 
 #[test]
+fn frontier_updates_preserve_order_list_identity_sitemap_flags_and_seen_keys() {
+    for store in [
+        ActiveStore::memory(),
+        ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+    ] {
+        let mut previous = checkpoint(4, 7);
+        previous.queued[1].url = previous.queued[0].url.clone();
+        let mut added = previous.queued[0].clone();
+        added.storage_key = "list:8:duplicate".into();
+        added.list_position = Some(8);
+        added.list_duplicate_index = 3;
+        added.depth = 42;
+        added.from_sitemap = false;
+        store.save_frontier_state(previous.clone());
+        store.update_frontier_state(
+            &previous.queued[0].storage_key,
+            vec![added.clone()],
+            &[added.url.clone()],
+            4,
+        );
+        let mut retained = previous.queued[1].clone();
+        retained.from_sitemap = true;
+        added.from_sitemap = true;
+        let mut seen = previous.seen;
+        seen.push(added.storage_key.clone());
+        seen.sort();
+        let mut expected = CrawlFrontierState {
+            queued: vec![
+                retained,
+                previous.queued[2].clone(),
+                previous.queued[3].clone(),
+                added,
+            ],
+            seen,
+            crawled: 4,
+        };
+        assert_eq!(store.load_frontier_state(), Some(expected.clone()));
+        for item in expected.queued.clone().into_iter().rev() {
+            expected.crawled += 1;
+            store.update_frontier_state(&item.storage_key, Vec::new(), &[], expected.crawled);
+            expected.queued.pop();
+            assert_eq!(store.load_frontier_state(), Some(expected.clone()));
+        }
+        store.clear_frontier_state();
+        assert!(store.load_frontier_state().is_none());
+    }
+}
+
+#[test]
+fn sqlite_frontier_updates_write_only_changed_entries() {
+    for size in [100, 10_000] {
+        let sqlite = SqliteStore::in_memory().unwrap();
+        let previous = checkpoint(size / 2, size);
+        sqlite.try_save_frontier_state(previous.clone()).unwrap();
+        let revision = crawl_audit_revision(&sqlite.connection().unwrap()).unwrap();
+        let changes = sqlite.connection().unwrap().total_changes();
+        let mut added = previous.queued[0].clone();
+        added.url = "https://example.test/new".into();
+        added.storage_key = added.url.clone();
+        sqlite
+            .try_update_frontier_state(
+                &previous.queued[0].storage_key,
+                vec![added.clone()],
+                &[previous.queued[1].url.clone()],
+                previous.crawled + 1,
+            )
+            .unwrap();
+        let work = sqlite.connection().unwrap().total_changes() - changes;
+        assert!(
+            work <= 5,
+            "Updating one completion/discovery wrote {work} rows with {size} seen URLs"
+        );
+        assert_eq!(
+            crawl_audit_revision(&sqlite.connection().unwrap()).unwrap(),
+            revision
+        );
+        let saved = sqlite.try_load_frontier_state().unwrap().unwrap();
+        assert_eq!(saved.queued.len(), previous.queued.len());
+        assert_eq!(saved.seen.len(), size + 1);
+        assert_eq!(saved.queued.last(), Some(&added));
+        assert!(saved.queued[0].from_sitemap);
+    }
+}
+
+#[test]
+fn sqlite_frontier_update_failures_roll_back_and_reopen() {
+    let path = std::env::temp_dir().join(format!(
+        "ferrous-frog-frontier-update-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let previous = checkpoint(4, 7);
+    {
+        let sqlite = SqliteStore::open(&path).unwrap();
+        sqlite.try_save_frontier_state(previous.clone()).unwrap();
+        let mut added = previous.queued[0].clone();
+        added.url = "https://example.test/new".into();
+        added.storage_key = added.url.clone();
+        for (event, table, condition) in [
+            (
+                "INSERT",
+                "crawl_frontier_queue",
+                "NEW.storage_key = 'https://example.test/new'",
+            ),
+            (
+                "INSERT",
+                "crawl_frontier_seen",
+                "NEW.url = 'https://example.test/new'",
+            ),
+            ("UPDATE", "crawl_frontier_queue", "NEW.from_sitemap = 1"),
+            ("INSERT", "crawl_frontier_meta", "NEW.value = '42'"),
+        ] {
+            sqlite.connection().unwrap().execute_batch(&format!(
+                "CREATE TRIGGER reject_update BEFORE {event} ON {table}
+                 WHEN {condition} BEGIN SELECT RAISE(ABORT, 'injected frontier update failure'); END;"
+            )).unwrap();
+            let error = sqlite
+                .try_update_frontier_state(
+                    &previous.queued[0].storage_key,
+                    vec![added.clone()],
+                    &[previous.queued[1].url.clone()],
+                    42,
+                )
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected frontier update failure")
+            );
+            assert_eq!(
+                sqlite.try_load_frontier_state().unwrap(),
+                Some(previous.clone())
+            );
+            sqlite
+                .connection()
+                .unwrap()
+                .execute_batch("DROP TRIGGER reject_update")
+                .unwrap();
+        }
+        sqlite
+            .try_update_frontier_state(&previous.queued[0].storage_key, vec![added.clone()], &[], 4)
+            .unwrap();
+    }
+    {
+        let sqlite = SqliteStore::open(&path).unwrap();
+        let saved = sqlite.try_load_frontier_state().unwrap().unwrap();
+        assert_eq!(saved.crawled, 4);
+        assert_eq!(saved.queued.len(), 4);
+        assert_eq!(saved.queued.last().unwrap().url, "https://example.test/new");
+        assert_eq!(saved.seen.len(), 8);
+        assert!(
+            !saved
+                .queued
+                .iter()
+                .any(|item| item.storage_key == previous.queued[0].storage_key)
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 #[ignore = "measures complete SQLite frontier checkpoint replacement"]
 fn sqlite_frontier_checkpoint_workload() {
     for (queued, seen) in [(1_000, 2_000), (5_000, 10_000), (500, 10_500)] {
@@ -163,5 +327,54 @@ fn sqlite_frontier_checkpoint_workload() {
             samples[samples.len() / 2].as_secs_f64() * 1_000.0,
             samples[samples.len() - 1].as_secs_f64() * 1_000.0,
         );
+    }
+}
+
+#[test]
+#[ignore = "compares complete and incremental SQLite frontier checkpoints"]
+fn sqlite_incremental_frontier_workload() {
+    for (pending, seen) in [(1_000, 2_000), (5_000, 10_000), (500, 100_000)] {
+        for incremental in [false, true] {
+            let sqlite = SqliteStore::in_memory().unwrap();
+            let mut state = checkpoint(pending, seen);
+            sqlite.try_save_frontier_state(state.clone()).unwrap();
+            let mut samples = Vec::new();
+            let mut writes = Vec::new();
+            for pass in 0..7 {
+                let completed = state.queued.remove(0);
+                let mut added = completed.clone();
+                added.url = format!("https://example.test/new/{pass}");
+                added.storage_key = added.url.clone();
+                state.queued.push(added.clone());
+                state.seen.push(added.storage_key.clone());
+                state.seen.sort();
+                state.crawled += 1;
+                let snapshot = state.clone();
+                let changes = sqlite.connection().unwrap().total_changes();
+                let started = std::time::Instant::now();
+                if incremental {
+                    sqlite
+                        .try_update_frontier_state(
+                            &completed.storage_key,
+                            vec![added],
+                            &[],
+                            state.crawled,
+                        )
+                        .unwrap();
+                } else {
+                    sqlite.try_save_frontier_state(snapshot).unwrap();
+                }
+                samples.push(started.elapsed());
+                writes.push(sqlite.connection().unwrap().total_changes() - changes);
+            }
+            assert_eq!(sqlite.try_load_frontier_state().unwrap(), Some(state));
+            samples.sort();
+            eprintln!(
+                "frontier pending={pending} seen={seen} incremental={incremental} median_ms={:.3} writes_min={} writes_max={}",
+                samples[3].as_secs_f64() * 1_000.0,
+                writes.iter().min().unwrap(),
+                writes.iter().max().unwrap(),
+            );
+        }
     }
 }

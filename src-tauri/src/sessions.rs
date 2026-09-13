@@ -482,6 +482,7 @@ pub(crate) fn compare_sessions(
     baseline_id: &str,
     current_id: &str,
     active_id: Option<&str>,
+    include_response_only: bool,
 ) -> Result<crate::CrawlComparisonResponse, String> {
     if baseline_id == current_id {
         return Err("choose two different saved crawls to compare".to_string());
@@ -507,26 +508,41 @@ pub(crate) fn compare_sessions(
         .map_err(|error| format!("failed to open comparison database: {error}"))?;
     conn.execute_batch("PRAGMA query_only = ON; BEGIN;")
         .map_err(|error| error.to_string())?;
-    compare_databases(&conn).map_err(|error| format!("failed to compare saved crawls: {error}"))
+    compare_databases(&conn, include_response_only)
+        .map_err(|error| format!("failed to compare saved crawls: {error}"))
 }
 
-fn comparison_projection(conn: &Connection, schema: &str) -> rusqlite::Result<String> {
+pub(super) fn comparison_projection(conn: &Connection, schema: &str) -> rusqlite::Result<String> {
     let columns = conn
         .prepare(&format!("PRAGMA {schema}.table_info(crawl_records)"))?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
     let fields = [
         "id",
+        "url",
+        "storage_key",
         "final_url",
         "status_code",
         "title",
+        "title_count",
         "meta_description",
+        "meta_description_count",
         "indexability",
         "indexability_status",
         "response_hash",
+        "content_hash",
+        "content_hash_context",
         "list_position",
+        "list_duplicate_index",
         "content_type",
         "h1",
+        "h1_count",
+        "h2",
+        "h2_count",
+        "canonical",
+        "canonical_count",
+        "meta_robots",
+        "x_robots_tag",
         "error",
         "status_text",
         "near_duplicate_cluster_id",
@@ -544,7 +560,38 @@ fn comparison_projection(conn: &Connection, schema: &str) -> rusqlite::Result<St
     Ok(format!("SELECT {fields} FROM {schema}.crawl_records"))
 }
 
-fn compare_databases(conn: &Connection) -> rusqlite::Result<crate::CrawlComparisonResponse> {
+fn compare_databases(
+    conn: &Connection,
+    include_response_only: bool,
+) -> rusqlite::Result<crate::CrawlComparisonResponse> {
+    register_comparison_functions(conn)?;
+    let baseline_sql = comparison_projection(conn, "main")?;
+    let current_sql = comparison_projection(conn, "comparison")?;
+    let cte = comparison_cte(&baseline_sql, &current_sql);
+    let mut result = conn.query_row(
+        &format!(
+            "{cte} SELECT
+            (SELECT COUNT(*) FROM baseline_rows), (SELECT COUNT(*) FROM current_rows),
+            {COMPARISON_COUNTS_SQL} FROM classified"
+        ),
+        [],
+        comparison_counts_from_row,
+    )?;
+    result.rows = conn
+        .prepare(&format!(
+            "{cte} SELECT * FROM changes WHERE ?1 OR change_order != 3
+             ORDER BY change_order, url, occurrence LIMIT 1000"
+        ))?
+        .query_map([include_response_only], comparison_row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    result.metric_deltas = crate::comparison_metric_deltas(
+        &comparison_summary(conn, &baseline_sql)?,
+        &comparison_summary(conn, &current_sql)?,
+    );
+    Ok(result)
+}
+
+pub(super) fn register_comparison_functions(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function(
         "ff_comparison_text_key",
         1,
@@ -560,104 +607,206 @@ fn compare_databases(conn: &Connection) -> rusqlite::Result<crate::CrawlComparis
                 .to_lowercase())
         },
     )?;
-    let baseline_sql = comparison_projection(conn, "main")?;
-    let current_sql = comparison_projection(conn, "comparison")?;
-    let cte = comparison_cte(&baseline_sql, &current_sql);
-    let count = |row: &rusqlite::Row<'_>, index| {
-        row.get::<_, i64>(index).map(|value| value.max(0) as usize)
-    };
-    let mut result = conn.query_row(
-        &format!(
-            "{cte} SELECT
-            (SELECT COUNT(*) FROM baseline_rows), (SELECT COUNT(*) FROM current_rows),
+    conn.create_scalar_function(
+        "ff_comparison_request_url",
+        3,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            Ok(crate::comparison_request_url(
+                context.get::<Option<String>>(0)?.as_deref(),
+                context.get::<Option<String>>(1)?.as_deref(),
+                context.get::<Option<String>>(2)?.as_deref(),
+            ))
+        },
+    )?;
+    conn.create_scalar_function(
+        "ff_comparison_position",
+        3,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            Ok(crate::comparison_position(
+                context
+                    .get::<Option<i64>>(0)?
+                    .and_then(|value| u32::try_from(value).ok()),
+                context
+                    .get::<Option<String>>(1)?
+                    .as_deref()
+                    .unwrap_or_default(),
+                context.get::<i64>(2)?.max(0) as u64,
+            ) as i64)
+        },
+    )
+}
+
+pub(super) const COMPARISON_COUNTS_SQL: &str = "
             COALESCE(SUM(change_order = 0), 0), COALESCE(SUM(change_order = 1), 0),
             COALESCE(SUM(change_order = 2), 0), COALESCE(SUM(status_diff), 0),
             COALESCE(SUM(title_diff), 0), COALESCE(SUM(meta_diff), 0),
-            COALESCE(SUM(indexability_diff), 0), COALESCE(SUM(hash_diff), 0)
-         FROM changes"
-        ),
-        [],
-        |row| {
-            Ok(crate::CrawlComparisonResponse {
-                baseline_records: count(row, 0)?,
-                current_records: count(row, 1)?,
-                added: count(row, 2)?,
-                removed: count(row, 3)?,
-                changed: count(row, 4)?,
-                status_changed: count(row, 5)?,
-                title_changed: count(row, 6)?,
-                meta_description_changed: count(row, 7)?,
-                indexability_changed: count(row, 8)?,
-                hash_changed: count(row, 9)?,
-                rows: Vec::new(),
-                metric_deltas: Vec::new(),
-            })
-        },
-    )?;
-    result.rows = conn
-        .prepare(&format!(
-            "{cte} SELECT url, change, previous_status_code, current_status_code,
-            previous_title, current_title, previous_indexability, current_indexability,
-            previous_response_hash, current_response_hash
-         FROM changes ORDER BY change_order, url LIMIT 1000"
-        ))?
-        .query_map([], |row| {
-            Ok(crate::CrawlComparisonRow {
-                url: row.get(0)?,
-                change: row.get(1)?,
-                previous_status_code: row.get(2)?,
-                current_status_code: row.get(3)?,
-                previous_title: row.get(4)?,
-                current_title: row.get(5)?,
-                previous_indexability: row.get(6)?,
-                current_indexability: row.get(7)?,
-                previous_response_hash: row.get(8)?,
-                current_response_hash: row.get(9)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    result.metric_deltas = crate::comparison_metric_deltas(
-        &comparison_summary(conn, &baseline_sql)?,
-        &comparison_summary(conn, &current_sql)?,
-    );
-    Ok(result)
+            COALESCE(SUM(indexability_diff), 0), COALESCE(SUM(hash_diff), 0),
+            COALESCE(SUM(content_diff), 0), COALESCE(SUM(change_order = 3), 0),
+            COALESCE(SUM(presence_order = 2 AND NOT content_comparable), 0)";
+
+pub(super) fn comparison_counts_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::CrawlComparisonResponse> {
+    let count = |row: &rusqlite::Row<'_>, index| {
+        row.get::<_, i64>(index).map(|value| value.max(0) as usize)
+    };
+    Ok(crate::CrawlComparisonResponse {
+        baseline_records: count(row, 0)?,
+        current_records: count(row, 1)?,
+        added: count(row, 2)?,
+        removed: count(row, 3)?,
+        changed: count(row, 4)?,
+        status_changed: count(row, 5)?,
+        title_changed: count(row, 6)?,
+        meta_description_changed: count(row, 7)?,
+        indexability_changed: count(row, 8)?,
+        hash_changed: count(row, 9)?,
+        content_changed: count(row, 10)?,
+        response_only: count(row, 11)?,
+        content_unavailable: count(row, 12)?,
+        rows: Vec::new(),
+        metric_deltas: Vec::new(),
+    })
 }
 
-fn comparison_cte(baseline_sql: &str, current_sql: &str) -> String {
-    let fields = "COALESCE(p.final_url, c.final_url) AS url,
-                CASE WHEN p.id IS NULL THEN 0 WHEN c.id IS NULL THEN 1 ELSE 2 END AS change_order,
+pub(super) fn comparison_row_from_sql(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<crate::CrawlComparisonRow> {
+    let mut changed_fields = Vec::new();
+    for (column, field) in [
+        ("final_url_diff", "finalUrl"),
+        ("status_diff", "statusCode"),
+        ("title_diff", "title"),
+        ("meta_diff", "metaDescription"),
+        ("indexability_diff", "indexability"),
+        ("headings_diff", "headings"),
+        ("canonical_diff", "canonical"),
+        ("robots_diff", "robotsDirectives"),
+        ("content_diff", "content"),
+        ("hash_diff", "responseHash"),
+    ] {
+        if row.get::<_, bool>(column)? {
+            changed_fields.push(field.to_string());
+        }
+    }
+    let content_comparison = match (
+        row.get::<_, i64>("presence_order")?,
+        row.get::<_, bool>("content_comparable")?,
+        row.get::<_, bool>("content_diff")?,
+    ) {
+        (0 | 1, _, _) => "notApplicable",
+        (_, false, _) => "unavailable",
+        (_, _, true) => "changed",
+        _ => "unchanged",
+    };
+    Ok(crate::CrawlComparisonRow {
+        url: row.get("url")?,
+        identity_key: row.get("identity_key")?,
+        occurrence: row.get::<_, i64>("occurrence")? as usize,
+        change: row.get("change")?,
+        previous_url: row.get("previous_url")?,
+        current_url: row.get("current_url")?,
+        previous_final_url: row.get("previous_final_url")?,
+        current_final_url: row.get("current_final_url")?,
+        previous_list_position: row.get("previous_list_position")?,
+        current_list_position: row.get("current_list_position")?,
+        previous_status_code: row.get("previous_status_code")?,
+        current_status_code: row.get("current_status_code")?,
+        previous_title: row.get("previous_title")?,
+        current_title: row.get("current_title")?,
+        previous_indexability: row.get("previous_indexability")?,
+        current_indexability: row.get("current_indexability")?,
+        previous_response_hash: row.get("previous_response_hash")?,
+        current_response_hash: row.get("current_response_hash")?,
+        previous_meta_description: row.get("previous_meta_description")?,
+        current_meta_description: row.get("current_meta_description")?,
+        changed_fields,
+        content_comparison: content_comparison.to_string(),
+    })
+}
+
+pub(super) fn comparison_cte(baseline_sql: &str, current_sql: &str) -> String {
+    let identities = |side| {
+        format!(
+            "{side}_inputs AS MATERIALIZED (
+            SELECT *, ff_comparison_request_url(url, storage_key, final_url) AS request_url,
+                ff_comparison_position(list_position, storage_key, id) AS identity_position
+            FROM {side}_rows
+         ), {side}_groups AS (
+            SELECT request_url, MIN(COALESCE(list_duplicate_index, 0)) > 0
+                AND COUNT(DISTINCT list_duplicate_index) = COUNT(*) AS known_occurrences
+            FROM {side}_inputs GROUP BY request_url
+         ), {side}_identified AS (
+            SELECT records.*, CASE WHEN groups.known_occurrences THEN records.list_duplicate_index
+                ELSE ROW_NUMBER() OVER (PARTITION BY records.request_url
+                    ORDER BY identity_position, COALESCE(storage_key, ''), id) END AS occurrence
+            FROM {side}_inputs records JOIN {side}_groups groups USING (request_url)
+         )"
+        )
+    };
+    let baseline_identities = identities("baseline");
+    let current_identities = identities("current");
+    let fields = "COALESCE(p.request_url, c.request_url) AS url,
+                COALESCE(p.occurrence, c.occurrence) AS occurrence,
+                CAST(COALESCE(p.occurrence, c.occurrence) AS TEXT) || ':' || COALESCE(p.request_url, c.request_url) AS identity_key,
+                p.id AS previous_id, c.id AS current_id,
+                CASE WHEN p.id IS NULL THEN 0 WHEN c.id IS NULL THEN 1 ELSE 2 END AS presence_order,
+                p.url AS previous_url, c.url AS current_url,
+                p.final_url AS previous_final_url, c.final_url AS current_final_url,
+                p.list_position AS previous_list_position, c.list_position AS current_list_position,
                 p.status_code AS previous_status_code, c.status_code AS current_status_code,
                 p.title AS previous_title, c.title AS current_title,
+                p.meta_description AS previous_meta_description, c.meta_description AS current_meta_description,
                 p.indexability_status AS previous_indexability, c.indexability_status AS current_indexability,
                 p.response_hash AS previous_response_hash, c.response_hash AS current_response_hash,
+                (p.id IS NOT NULL AND c.id IS NOT NULL
+                    AND ff_comparison_request_url(p.final_url, NULL, NULL) IS NOT ff_comparison_request_url(c.final_url, NULL, NULL)) AS final_url_diff,
                 (p.id IS NOT NULL AND c.id IS NOT NULL AND p.status_code IS NOT c.status_code) AS status_diff,
-                (p.id IS NOT NULL AND c.id IS NOT NULL AND p.title IS NOT c.title) AS title_diff,
-                (p.id IS NOT NULL AND c.id IS NOT NULL AND p.meta_description IS NOT c.meta_description) AS meta_diff,
+                (p.id IS NOT NULL AND c.id IS NOT NULL AND (p.title IS NOT c.title
+                    OR (p.title_count IS NOT NULL AND c.title_count IS NOT NULL AND p.title_count IS NOT c.title_count))) AS title_diff,
+                (p.id IS NOT NULL AND c.id IS NOT NULL AND (p.meta_description IS NOT c.meta_description
+                    OR (p.meta_description_count IS NOT NULL AND c.meta_description_count IS NOT NULL AND p.meta_description_count IS NOT c.meta_description_count))) AS meta_diff,
                 (p.id IS NOT NULL AND c.id IS NOT NULL AND (p.indexability IS NOT c.indexability OR p.indexability_status IS NOT c.indexability_status)) AS indexability_diff,
-                (p.id IS NOT NULL AND c.id IS NOT NULL AND p.response_hash IS NOT c.response_hash) AS hash_diff";
+                (p.id IS NOT NULL AND c.id IS NOT NULL AND (p.h1 IS NOT c.h1 OR p.h1_count IS NOT c.h1_count
+                    OR p.h2 IS NOT c.h2 OR p.h2_count IS NOT c.h2_count)) AS headings_diff,
+                (p.id IS NOT NULL AND c.id IS NOT NULL AND (p.canonical IS NOT c.canonical OR p.canonical_count IS NOT c.canonical_count)) AS canonical_diff,
+                (p.id IS NOT NULL AND c.id IS NOT NULL AND (p.meta_robots IS NOT c.meta_robots OR p.x_robots_tag IS NOT c.x_robots_tag)) AS robots_diff,
+                (p.id IS NOT NULL AND c.id IS NOT NULL AND p.response_hash IS NOT NULL
+                    AND c.response_hash IS NOT NULL AND p.response_hash IS NOT c.response_hash) AS hash_diff,
+                (p.id IS NOT NULL AND c.id IS NOT NULL AND p.content_hash IS NOT NULL AND c.content_hash IS NOT NULL
+                    AND p.content_hash_context IS NOT NULL AND c.content_hash_context IS NOT NULL
+                    AND p.content_hash_context IS c.content_hash_context) AS content_comparable,
+                (p.content_hash IS NOT c.content_hash) AS content_hash_diff";
     format!(
         "WITH baseline_rows AS ({baseline_sql}), current_rows AS ({current_sql}),
-         baseline_ranked AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY final_url ORDER BY COALESCE(list_position, id) DESC, id DESC) AS position
-            FROM baseline_rows
-         ), current_ranked AS (
-            SELECT *, ROW_NUMBER() OVER (PARTITION BY final_url ORDER BY COALESCE(list_position, id) DESC, id DESC) AS position
-            FROM current_rows
-         ), previous AS MATERIALIZED (SELECT * FROM baseline_ranked WHERE position = 1),
-         current AS MATERIALIZED (SELECT * FROM current_ranked WHERE position = 1),
+         {baseline_identities}, {current_identities},
+         previous AS MATERIALIZED (SELECT * FROM baseline_identified),
+         current AS MATERIALIZED (SELECT * FROM current_identified),
          joined AS (
-            SELECT {fields} FROM previous p LEFT JOIN current c ON p.final_url = c.final_url
+            SELECT {fields} FROM previous p LEFT JOIN current c ON p.request_url = c.request_url AND p.occurrence = c.occurrence
             UNION ALL
-            SELECT {fields} FROM current c LEFT JOIN previous p ON p.final_url = c.final_url
+            SELECT {fields} FROM current c LEFT JOIN previous p ON p.request_url = c.request_url AND p.occurrence = c.occurrence
             WHERE p.id IS NULL
+         ), compared AS (
+            SELECT *, (content_comparable AND content_hash_diff) AS content_diff FROM joined
+         ), classified AS (
+            SELECT *, CASE WHEN presence_order != 2 THEN presence_order
+                WHEN final_url_diff OR status_diff OR title_diff OR meta_diff OR indexability_diff OR headings_diff
+                    OR canonical_diff OR robots_diff OR content_diff THEN 2
+                WHEN hash_diff THEN 3 ELSE 4 END AS change_order FROM compared
          ), changes AS (
-            SELECT *, CASE change_order WHEN 0 THEN 'added' WHEN 1 THEN 'removed' ELSE 'changed' END AS change
-            FROM joined WHERE change_order != 2 OR status_diff OR title_diff OR meta_diff OR indexability_diff OR hash_diff
+            SELECT *, CASE change_order WHEN 0 THEN 'added' WHEN 1 THEN 'removed'
+                WHEN 2 THEN 'changed' ELSE 'responseOnly' END AS change
+            FROM classified WHERE change_order != 4
          )"
     )
 }
 
-fn comparison_summary(
+pub(super) fn comparison_summary(
     conn: &Connection,
     projection: &str,
 ) -> rusqlite::Result<ferrous_frog_storage::CrawlSummary> {
@@ -734,6 +883,7 @@ mod comparison_scaling_tests {
     #[test]
     fn comparison_work_grows_with_records_instead_of_record_pairs() {
         let conn = Connection::open_in_memory().unwrap();
+        register_comparison_functions(&conn).unwrap();
         conn.execute_batch("ATTACH DATABASE ':memory:' AS comparison;
             CREATE TABLE main.crawl_records (id INTEGER PRIMARY KEY, final_url TEXT NOT NULL);
             CREATE TABLE comparison.crawl_records (id INTEGER PRIMARY KEY, final_url TEXT NOT NULL);").unwrap();

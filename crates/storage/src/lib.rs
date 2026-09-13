@@ -3,18 +3,29 @@ use rusqlite::{Connection, OptionalExtension, params, types::Value};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
 mod native_exports;
+mod page_captures;
+pub use page_captures::{
+    CapturedHeader, MAX_CAPTURE_BYTES, MAX_CAPTURE_HEADER_BYTES, MAX_CAPTURE_HEADERS,
+    MAX_CAPTURE_PAGE_SIZE, PageCapture, PageCaptureQuery, PageCaptureResponse,
+};
+
+#[cfg(test)]
+mod content_hash_tests;
 
 #[cfg(test)]
 mod frontier_tests;
 
 #[cfg(test)]
 mod image_assets_tests;
+
+#[cfg(test)]
+mod reference_tests;
 
 #[cfg(test)]
 mod metadata_whitespace_tests;
@@ -317,6 +328,10 @@ pub struct CrawlRecord {
     pub resolved_ip_count: u32,
     pub size_bytes: usize,
     pub response_hash: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub content_hash_context: Option<String>,
     pub depth: usize,
     pub redirect_target: Option<String>,
     pub redirect_type: Option<String>,
@@ -451,6 +466,8 @@ impl CrawlRecord {
             resolved_ip_count: 0,
             size_bytes: 0,
             response_hash: None,
+            content_hash: None,
+            content_hash_context: None,
             depth,
             redirect_target: None,
             redirect_type: None,
@@ -889,6 +906,55 @@ pub struct LinkEdgeResponse {
     pub total: usize,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PageReferenceKind {
+    Canonical,
+    Hreflang,
+    Pagination,
+    Amp,
+    MetaRefresh,
+    Iframe,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PageReference {
+    pub id: u64,
+    pub source_storage_key: String,
+    pub source_url: String,
+    pub target_url: String,
+    pub kind: PageReferenceKind,
+    pub rel_nofollow: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PageReferenceQuery {
+    pub source_storage_key: Option<String>,
+    pub kind: Option<PageReferenceKind>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
+impl Default for PageReferenceQuery {
+    fn default() -> Self {
+        Self {
+            source_storage_key: None,
+            kind: None,
+            offset: 0,
+            limit: 100,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageReferenceResponse {
+    pub references: Vec<PageReference>,
+    pub total: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageAsset {
@@ -964,6 +1030,33 @@ pub struct CrawlFrontierState {
     pub queued: Vec<CrawlFrontierItem>,
     pub seen: Vec<String>,
     pub crawled: usize,
+}
+
+impl CrawlFrontierState {
+    fn update(
+        &mut self,
+        completed_storage_key: &str,
+        queued: Vec<CrawlFrontierItem>,
+        sitemap_urls: &[String],
+        crawled: usize,
+    ) {
+        self.queued
+            .retain(|item| item.storage_key != completed_storage_key);
+        if !queued.is_empty() {
+            self.seen
+                .extend(queued.iter().map(|item| item.storage_key.clone()));
+            self.seen.sort_unstable();
+            self.seen.dedup();
+        }
+        self.queued.extend(queued);
+        if !sitemap_urls.is_empty() {
+            let sitemap_urls = sitemap_urls.iter().collect::<HashSet<_>>();
+            for item in &mut self.queued {
+                item.from_sitemap |= sitemap_urls.contains(&item.url);
+            }
+        }
+        self.crawled = crawled;
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1117,6 +1210,8 @@ fn default_true() -> bool {
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("invalid page capture: {0}")]
+    InvalidPageCapture(String),
     #[error("crawl record {0} was not found")]
     RecordNotFound(u64),
     #[error("invalid PageSpeed snapshot: {0}")]
@@ -1176,6 +1271,9 @@ pub trait CrawlStore: Clone + Send + Sync + 'static {
     fn mark_sitemap_urls(&self, urls: &[String]);
     fn add_link_edge(&self, edge: LinkEdge) -> LinkEdge;
     fn add_image_assets(&self, page_url: &str, images: Vec<ImageAsset>);
+    /// Replace retained references for this exact source occurrence, including an empty result.
+    fn add_page_references(&self, source_storage_key: &str, references: Vec<PageReference>);
+    fn replace_page_capture(&self, source_storage_key: &str, capture: Option<PageCapture>);
     fn merge_search_console_metrics(&self, metrics: Vec<SearchConsoleMetricRow>) -> usize;
     fn merge_analytics_metrics(&self, metrics: Vec<AnalyticsMetricRow>) -> usize;
     fn merge_backlink_metrics(&self, metrics: Vec<BacklinkMetricRow>) -> usize;
@@ -1183,8 +1281,22 @@ pub trait CrawlStore: Clone + Send + Sync + 'static {
     fn query(&self, query: GridQuery) -> GridResponse;
     fn link_edges(&self, query: LinkEdgeQuery) -> LinkEdgeResponse;
     fn image_assets(&self, query: ImageAssetQuery) -> ImageAssetResponse;
+    fn page_references(&self, query: PageReferenceQuery) -> PageReferenceResponse;
+    fn page_captures(&self, query: PageCaptureQuery) -> PageCaptureResponse;
     fn anchor_texts(&self, query: LinkEdgeQuery) -> AnchorTextResponse;
     fn save_frontier_state(&self, state: CrawlFrontierState);
+    /// Remove completed work and append newly discovered entries in one checkpoint.
+    fn update_frontier_state(
+        &self,
+        completed_storage_key: &str,
+        queued: Vec<CrawlFrontierItem>,
+        sitemap_urls: &[String],
+        crawled: usize,
+    ) {
+        let mut state = self.load_frontier_state().unwrap_or_default();
+        state.update(completed_storage_key, queued, sitemap_urls, crawled);
+        self.save_frontier_state(state);
+    }
     fn load_frontier_state(&self) -> Option<CrawlFrontierState>;
     fn clear_frontier_state(&self);
 
@@ -1243,10 +1355,13 @@ struct MemoryStoreInner {
     inlink_counts: HashMap<String, u32>,
     link_edges: Vec<LinkEdge>,
     image_assets: Vec<ImageAsset>,
+    page_references: Vec<PageReference>,
+    page_captures: std::collections::BTreeMap<String, PageCapture>,
     frontier_state: Option<CrawlFrontierState>,
     next_id: u64,
     next_edge_id: u64,
     next_image_asset_id: u64,
+    next_page_reference_id: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1424,6 +1539,38 @@ impl MemoryStore {
             image.oversized = false;
             inner.image_assets.push(image);
         }
+    }
+
+    pub fn add_page_references(&self, source_storage_key: &str, references: Vec<PageReference>) {
+        let mut inner = self.inner.write().expect("memory store lock poisoned");
+        // ponytail: scan the Memory references on replacement; index by source if headless scale needs it.
+        inner
+            .page_references
+            .retain(|reference| reference.source_storage_key != source_storage_key);
+        for mut reference in references {
+            inner.next_page_reference_id += 1;
+            reference.id = inner.next_page_reference_id;
+            reference.source_storage_key = source_storage_key.to_string();
+            inner.page_references.push(reference);
+        }
+    }
+
+    pub fn page_references(&self, query: PageReferenceQuery) -> PageReferenceResponse {
+        let inner = self.inner.read().expect("memory store lock poisoned");
+        let references = inner.page_references.iter().filter(|reference| {
+            query
+                .source_storage_key
+                .as_ref()
+                .is_none_or(|key| *key == reference.source_storage_key)
+                && query.kind.is_none_or(|kind| kind == reference.kind)
+        });
+        let total = references.clone().count();
+        let references = references
+            .skip(query.offset)
+            .take(query.limit.min(1_000_000))
+            .cloned()
+            .collect();
+        PageReferenceResponse { references, total }
     }
 
     pub fn merge_search_console_metrics(&self, metrics: Vec<SearchConsoleMetricRow>) -> usize {
@@ -1733,6 +1880,23 @@ impl MemoryStore {
         inner.frontier_state = Some(state);
     }
 
+    pub fn update_frontier_state(
+        &self,
+        completed_storage_key: &str,
+        queued: Vec<CrawlFrontierItem>,
+        sitemap_urls: &[String],
+        crawled: usize,
+    ) {
+        let mut inner = self.inner.write().expect("memory store lock poisoned");
+        // ponytail: the Memory frontier still scans/sorts in place; index it if headless scale requires it.
+        inner.frontier_state.get_or_insert_default().update(
+            completed_storage_key,
+            queued,
+            sitemap_urls,
+            crawled,
+        );
+    }
+
     pub fn load_frontier_state(&self) -> Option<CrawlFrontierState> {
         let inner = self.inner.read().expect("memory store lock poisoned");
         inner.frontier_state.clone()
@@ -1778,6 +1942,20 @@ impl CrawlStore for MemoryStore {
         Self::add_image_assets(self, page_url, images);
     }
 
+    fn add_page_references(&self, source_storage_key: &str, references: Vec<PageReference>) {
+        Self::add_page_references(self, source_storage_key, references);
+    }
+
+    fn replace_page_capture(&self, source_storage_key: &str, capture: Option<PageCapture>) {
+        self.try_replace_page_capture(source_storage_key, capture)
+            .expect("memory page capture update failed");
+    }
+
+    fn page_captures(&self, query: PageCaptureQuery) -> PageCaptureResponse {
+        self.try_page_captures(query)
+            .expect("memory page capture query failed")
+    }
+
     fn merge_search_console_metrics(&self, metrics: Vec<SearchConsoleMetricRow>) -> usize {
         Self::merge_search_console_metrics(self, metrics)
     }
@@ -1810,12 +1988,26 @@ impl CrawlStore for MemoryStore {
         Self::image_assets(self, query)
     }
 
+    fn page_references(&self, query: PageReferenceQuery) -> PageReferenceResponse {
+        Self::page_references(self, query)
+    }
+
     fn anchor_texts(&self, query: LinkEdgeQuery) -> AnchorTextResponse {
         Self::anchor_texts(self, query)
     }
 
     fn save_frontier_state(&self, state: CrawlFrontierState) {
         Self::save_frontier_state(self, state);
+    }
+
+    fn update_frontier_state(
+        &self,
+        completed_storage_key: &str,
+        queued: Vec<CrawlFrontierItem>,
+        sitemap_urls: &[String],
+        crawled: usize,
+    ) {
+        Self::update_frontier_state(self, completed_storage_key, queued, sitemap_urls, crawled);
     }
 
     fn load_frontier_state(&self) -> Option<CrawlFrontierState> {
@@ -1866,6 +2058,15 @@ struct CachedExactDuplicates {
 }
 
 impl SqliteStore {
+    /// Return the open database's file path, or None for an in-memory database.
+    pub fn try_database_path(&self) -> Result<Option<PathBuf>, StorageError> {
+        Ok(self
+            .connection()?
+            .path()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from))
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let conn = Connection::open(path)?;
         let store = Self {
@@ -1898,6 +2099,8 @@ impl SqliteStore {
         conn.execute("DELETE FROM inlink_counts", [])?;
         conn.execute("DELETE FROM link_edges", [])?;
         conn.execute("DELETE FROM image_assets", [])?;
+        conn.execute("DELETE FROM page_references", [])?;
+        conn.execute("DELETE FROM page_captures", [])?;
         conn.execute("DELETE FROM crawl_frontier_queue", [])?;
         conn.execute("DELETE FROM crawl_frontier_seen", [])?;
         conn.execute("DELETE FROM crawl_frontier_meta", [])?;
@@ -2099,7 +2302,9 @@ impl SqliteStore {
                     ai_insights = ?99,
                     backlink_count = ?100,
                     referring_domain_count = ?101,
-                    backlink_authority = ?102
+                    backlink_authority = ?102,
+                    content_hash = ?103,
+                    content_hash_context = ?104
                  WHERE id = ?92",
                 params![
                     record.url,
@@ -2207,7 +2412,9 @@ impl SqliteStore {
                     record
                         .referring_domain_count
                         .map(|value| value.min(i64::MAX as u64) as i64),
-                    record.backlink_authority
+                    record.backlink_authority,
+                    record.content_hash,
+                    record.content_hash_context
                 ],
             )?;
             update_sqlite_edge_statuses(&conn, &record)?;
@@ -2316,7 +2523,9 @@ impl SqliteStore {
                     ai_insights,
                     backlink_count,
                     referring_domain_count,
-                    backlink_authority
+                    backlink_authority,
+                    content_hash,
+                    content_hash_context
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
@@ -2326,7 +2535,7 @@ impl SqliteStore {
                     ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65, ?66, ?67, ?68, ?69,
                     ?70, ?71, ?72, ?73, ?74, ?75, ?76, ?77, ?78, ?79, ?80,
                     ?81, ?82, ?83, ?84, ?85, ?86, ?87, ?88, ?89, ?90, ?91, ?92, ?93,
-                    ?94, ?95, ?96, ?97, ?98, ?99, ?100, ?101
+                    ?94, ?95, ?96, ?97, ?98, ?99, ?100, ?101, ?102, ?103
                  )",
                 params![
                     record.url,
@@ -2433,7 +2642,9 @@ impl SqliteStore {
                     record
                         .referring_domain_count
                         .map(|value| value.min(i64::MAX as u64) as i64),
-                    record.backlink_authority
+                    record.backlink_authority,
+                    record.content_hash,
+                    record.content_hash_context
                 ],
             )?;
             record.id = conn.last_insert_rowid() as u64;
@@ -2611,6 +2822,77 @@ impl SqliteStore {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn try_add_page_references(
+        &self,
+        source_storage_key: &str,
+        references: Vec<PageReference>,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.connection()?;
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM page_references WHERE source_storage_key = ?1",
+            [source_storage_key],
+        )?;
+        {
+            let mut insert = transaction.prepare_cached(
+                "INSERT INTO page_references
+                 (source_storage_key, source_url, target_url, kind, rel_nofollow)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for reference in references {
+                insert.execute(params![
+                    source_storage_key,
+                    reference.source_url,
+                    reference.target_url,
+                    page_reference_kind_to_str(reference.kind),
+                    reference.rel_nofollow,
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn try_page_references(
+        &self,
+        query: PageReferenceQuery,
+    ) -> Result<PageReferenceResponse, StorageError> {
+        let conn = self.connection()?;
+        let transaction = conn.unchecked_transaction()?;
+        let mut clauses = Vec::new();
+        let mut args = Vec::new();
+        if let Some(key) = query.source_storage_key.as_deref() {
+            clauses.push("source_storage_key = ?");
+            args.push(key);
+        }
+        if let Some(kind) = query.kind {
+            clauses.push("kind = ?");
+            args.push(page_reference_kind_to_str(kind));
+        }
+        let filter = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+        let total = transaction.query_row(
+            &format!("SELECT COUNT(*) FROM page_references{filter}"),
+            rusqlite::params_from_iter(args.iter()),
+            |row| row.get::<_, i64>(0).map(|count| count as usize),
+        )?;
+        let mut statement = transaction.prepare(&format!(
+            "SELECT * FROM page_references{filter} ORDER BY id LIMIT {} OFFSET {}",
+            query.limit.min(1_000_000),
+            query.offset.min(i64::MAX as usize),
+        ))?;
+        let references = statement
+            .query_map(
+                rusqlite::params_from_iter(args.iter()),
+                page_reference_from_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(PageReferenceResponse { references, total })
     }
 
     pub fn try_merge_backlink_metrics(
@@ -3078,6 +3360,62 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn try_update_frontier_state(
+        &self,
+        completed_storage_key: &str,
+        queued: Vec<CrawlFrontierItem>,
+        sitemap_urls: &[String],
+        crawled: usize,
+    ) -> Result<(), StorageError> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM crawl_frontier_queue WHERE storage_key = ?1",
+            [completed_storage_key],
+        )?;
+        if !queued.is_empty() {
+            let position: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM crawl_frontier_queue",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut insert = tx.prepare(
+                "INSERT INTO crawl_frontier_queue
+                 (position, url, depth, from_sitemap, storage_key, list_position, list_duplicate_index)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            let mut seen =
+                tx.prepare("INSERT OR IGNORE INTO crawl_frontier_seen (url) VALUES (?1)")?;
+            for (offset, item) in queued.into_iter().enumerate() {
+                insert.execute(params![
+                    position + offset as i64,
+                    item.url,
+                    item.depth as i64,
+                    item.from_sitemap,
+                    item.storage_key,
+                    item.list_position.map(i64::from),
+                    i64::from(item.list_duplicate_index),
+                ])?;
+                seen.execute([&item.storage_key])?;
+            }
+        }
+        if !sitemap_urls.is_empty() {
+            let mut update = tx.prepare(
+                "UPDATE crawl_frontier_queue SET from_sitemap = 1 WHERE url = ?1 AND from_sitemap = 0",
+            )?;
+            for url in sitemap_urls {
+                update.execute([url])?;
+            }
+        }
+        tx.execute(
+            "INSERT INTO crawl_frontier_meta (key, value) VALUES ('crawled', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [crawled.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn try_load_frontier_state(&self) -> Result<Option<CrawlFrontierState>, StorageError> {
         let conn = self.connection()?;
         let mut queue_stmt = conn.prepare(
@@ -3450,6 +3788,8 @@ impl SqliteStore {
                 resolved_ip_count INTEGER NOT NULL DEFAULT 0,
                 size_bytes INTEGER NOT NULL,
                 response_hash TEXT,
+                content_hash TEXT,
+                content_hash_context TEXT,
                 depth INTEGER NOT NULL,
                 redirect_target TEXT,
                 redirect_type TEXT,
@@ -3572,6 +3912,19 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_image_assets_page_url ON image_assets(page_url);
             CREATE INDEX IF NOT EXISTS idx_image_assets_image_url ON image_assets(image_url);
 
+            CREATE TABLE IF NOT EXISTS page_references (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_storage_key TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                target_url TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                rel_nofollow INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_page_references_source ON page_references(source_storage_key, id);
+            CREATE INDEX IF NOT EXISTS idx_page_references_kind ON page_references(kind, id);
+            CREATE INDEX IF NOT EXISTS idx_page_references_source_kind ON page_references(source_storage_key, kind, id);
+
             CREATE TABLE IF NOT EXISTS crawl_frontier_queue (
                 position INTEGER PRIMARY KEY,
                 url TEXT NOT NULL,
@@ -3593,6 +3946,8 @@ impl SqliteStore {
 
             CREATE INDEX IF NOT EXISTS idx_crawl_frontier_queue_storage_key
                 ON crawl_frontier_queue(storage_key);
+            CREATE INDEX IF NOT EXISTS idx_crawl_frontier_queue_url
+                ON crawl_frontier_queue(url);
             ",
         )?;
         if !column_exists(&conn, "crawl_records", "response_hash")? {
@@ -3601,6 +3956,8 @@ impl SqliteStore {
                 [],
             )?;
         }
+        add_column_if_missing(&conn, "content_hash", "TEXT")?;
+        add_column_if_missing(&conn, "content_hash_context", "TEXT")?;
         if !column_exists(&conn, "crawl_records", "simhash")? {
             conn.execute("ALTER TABLE crawl_records ADD COLUMN simhash TEXT", [])?;
         }
@@ -3798,6 +4155,7 @@ impl SqliteStore {
             "list_duplicate_index",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        page_captures::initialize(&conn)?;
         Ok(())
     }
 
@@ -3850,6 +4208,21 @@ impl CrawlStore for SqliteStore {
             .expect("sqlite image asset update failed");
     }
 
+    fn add_page_references(&self, source_storage_key: &str, references: Vec<PageReference>) {
+        self.try_add_page_references(source_storage_key, references)
+            .expect("sqlite page reference update failed");
+    }
+
+    fn replace_page_capture(&self, source_storage_key: &str, capture: Option<PageCapture>) {
+        self.try_replace_page_capture(source_storage_key, capture)
+            .expect("sqlite page capture update failed");
+    }
+
+    fn page_captures(&self, query: PageCaptureQuery) -> PageCaptureResponse {
+        self.try_page_captures(query)
+            .expect("sqlite page capture query failed")
+    }
+
     fn merge_analytics_metrics(&self, metrics: Vec<AnalyticsMetricRow>) -> usize {
         self.try_merge_analytics_metrics(metrics)
             .expect("sqlite analytics merge failed")
@@ -3888,6 +4261,11 @@ impl CrawlStore for SqliteStore {
             .expect("sqlite image asset query failed")
     }
 
+    fn page_references(&self, query: PageReferenceQuery) -> PageReferenceResponse {
+        self.try_page_references(query)
+            .expect("sqlite page reference query failed")
+    }
+
     fn anchor_texts(&self, query: LinkEdgeQuery) -> AnchorTextResponse {
         self.try_anchor_texts(query)
             .expect("sqlite anchor text query failed")
@@ -3896,6 +4274,17 @@ impl CrawlStore for SqliteStore {
     fn save_frontier_state(&self, state: CrawlFrontierState) {
         self.try_save_frontier_state(state)
             .expect("sqlite frontier save failed");
+    }
+
+    fn update_frontier_state(
+        &self,
+        completed_storage_key: &str,
+        queued: Vec<CrawlFrontierItem>,
+        sitemap_urls: &[String],
+        crawled: usize,
+    ) {
+        self.try_update_frontier_state(completed_storage_key, queued, sitemap_urls, crawled)
+            .expect("sqlite frontier update failed");
     }
 
     fn load_frontier_state(&self) -> Option<CrawlFrontierState> {
@@ -3930,6 +4319,16 @@ pub enum ActiveStore {
 }
 
 impl ActiveStore {
+    pub fn try_page_references(
+        &self,
+        query: PageReferenceQuery,
+    ) -> Result<PageReferenceResponse, StorageError> {
+        match self {
+            Self::Memory(store) => Ok(store.page_references(query)),
+            Self::Sqlite(store) => store.try_page_references(query),
+        }
+    }
+
     pub fn try_save_page_speed(
         &self,
         id: u64,
@@ -4018,6 +4417,23 @@ impl CrawlStore for ActiveStore {
         }
     }
 
+    fn add_page_references(&self, source_storage_key: &str, references: Vec<PageReference>) {
+        match self {
+            ActiveStore::Memory(store) => store.add_page_references(source_storage_key, references),
+            ActiveStore::Sqlite(store) => store.add_page_references(source_storage_key, references),
+        }
+    }
+
+    fn replace_page_capture(&self, source_storage_key: &str, capture: Option<PageCapture>) {
+        self.try_replace_page_capture(source_storage_key, capture)
+            .expect("page capture update failed");
+    }
+
+    fn page_captures(&self, query: PageCaptureQuery) -> PageCaptureResponse {
+        self.try_page_captures(query)
+            .expect("page capture query failed")
+    }
+
     fn merge_analytics_metrics(&self, metrics: Vec<AnalyticsMetricRow>) -> usize {
         match self {
             ActiveStore::Memory(store) => store.merge_analytics_metrics(metrics),
@@ -4071,6 +4487,13 @@ impl CrawlStore for ActiveStore {
         }
     }
 
+    fn page_references(&self, query: PageReferenceQuery) -> PageReferenceResponse {
+        match self {
+            ActiveStore::Memory(store) => store.page_references(query),
+            ActiveStore::Sqlite(store) => store.page_references(query),
+        }
+    }
+
     fn anchor_texts(&self, query: LinkEdgeQuery) -> AnchorTextResponse {
         match self {
             ActiveStore::Memory(store) => store.anchor_texts(query),
@@ -4082,6 +4505,23 @@ impl CrawlStore for ActiveStore {
         match self {
             ActiveStore::Memory(store) => store.save_frontier_state(state),
             ActiveStore::Sqlite(store) => store.save_frontier_state(state),
+        }
+    }
+
+    fn update_frontier_state(
+        &self,
+        completed_storage_key: &str,
+        queued: Vec<CrawlFrontierItem>,
+        sitemap_urls: &[String],
+        crawled: usize,
+    ) {
+        match self {
+            ActiveStore::Memory(store) => {
+                store.update_frontier_state(completed_storage_key, queued, sitemap_urls, crawled)
+            }
+            ActiveStore::Sqlite(store) => {
+                store.update_frontier_state(completed_storage_key, queued, sitemap_urls, crawled)
+            }
         }
     }
 
@@ -4741,6 +5181,17 @@ fn link_type_from_str(value: &str) -> LinkType {
     }
 }
 
+fn page_reference_kind_to_str(kind: PageReferenceKind) -> &'static str {
+    match kind {
+        PageReferenceKind::Canonical => "canonical",
+        PageReferenceKind::Hreflang => "hreflang",
+        PageReferenceKind::Pagination => "pagination",
+        PageReferenceKind::Amp => "amp",
+        PageReferenceKind::MetaRefresh => "metaRefresh",
+        PageReferenceKind::Iframe => "iframe",
+    }
+}
+
 fn record_url_aliases(record: &CrawlRecord) -> HashSet<String> {
     url_aliases_many([
         record.storage_key.as_str(),
@@ -5375,6 +5826,8 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CrawlRecord> {
         resolved_ip_count: row.get("resolved_ip_count")?,
         size_bytes: size_bytes as usize,
         response_hash: row.get("response_hash")?,
+        content_hash: row.get("content_hash")?,
+        content_hash_context: row.get("content_hash_context")?,
         depth: depth as usize,
         redirect_target: row.get("redirect_target")?,
         redirect_type: row.get("redirect_type")?,
@@ -5518,6 +5971,26 @@ fn image_asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageAsset>
         oversized: size_bytes
             .map(|value| value > IMAGE_ASSET_OVERSIZE_BYTES)
             .unwrap_or(false),
+    })
+}
+
+fn page_reference_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PageReference> {
+    let kind_index = row.as_ref().column_index("kind")?;
+    let kind: String = row.get(kind_index)?;
+    let kind = serde_json::from_value(serde_json::Value::String(kind)).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            kind_index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    Ok(PageReference {
+        id: row.get::<_, i64>("id")?.max(0) as u64,
+        source_storage_key: row.get("source_storage_key")?,
+        source_url: row.get("source_url")?,
+        target_url: row.get("target_url")?,
+        kind,
+        rel_nofollow: row.get("rel_nofollow")?,
     })
 }
 
@@ -5818,6 +6291,8 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             resolved_ip_count INTEGER NOT NULL DEFAULT 0,
             size_bytes INTEGER NOT NULL,
             response_hash TEXT,
+            content_hash TEXT,
+            content_hash_context TEXT,
             depth INTEGER NOT NULL,
             redirect_target TEXT,
             redirect_type TEXT,
@@ -5923,6 +6398,8 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             resolved_ip_count,
             size_bytes,
             response_hash,
+            content_hash,
+            content_hash_context,
             depth,
             redirect_target,
             redirect_type,
@@ -6014,6 +6491,8 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             resolved_ip_count,
             size_bytes,
             response_hash,
+            content_hash,
+            content_hash_context,
             depth,
             redirect_target,
             redirect_type,

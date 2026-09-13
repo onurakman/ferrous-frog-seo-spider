@@ -85,6 +85,12 @@ test-ui: build-web ## Exercise the React workspace and production shell in headl
 	node scripts/check-schedule.mjs
 	node scripts/smoke-ui.mjs
 
+NATIVE_APP ?= target/release/ferrous-frog
+
+.PHONY: test-native
+test-native: ## Run the Linux native desktop smoke (built app and WebDriver tools required).
+	node scripts/smoke-native.mjs --app "$(NATIVE_APP)"
+
 BENCH_URLS ?= 1000000
 
 .PHONY: bench-synthetic

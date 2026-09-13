@@ -81,7 +81,7 @@ A persistent revision counter changes transactionally on record insertion, updat
 cargo test --release --locked -p ferrous-frog-storage sqlite_frontier_checkpoint_workload -- --ignored --nocapture
 ```
 
-The crawler saves its complete pending queue, seen set and completed count on dispatch and completion. Previously, SQLite prepared the same INSERT SQL separately for every queued and seen entry. It now prepares each INSERT once per checkpoint, retaining the complete replacement in one transaction.
+At the time of this measurement, the crawler saved its complete pending queue, seen set and completed count on dispatch and completion. Previously, SQLite prepared the same INSERT SQL separately for every queued and seen entry. It now prepares each INSERT once per checkpoint, retaining the complete replacement in one transaction.
 
 This ignored release-profile workload calls the public `SqliteStore::try_save_frontier_state` method against in-memory SQLite. Each case warms an initial checkpoint, then measures seven replacements with rotating queue order and an updated completed count. Fixture construction, snapshot cloning and verification reads are outside the timed region. The record and edge tables are empty, so these measurements isolate checkpoint persistence.
 
@@ -93,7 +93,7 @@ This ignored release-profile workload calls the public `SqliteStore::try_save_fr
 
 Checkpoint time decreased 66–71% in these matched local runs. Each timed save still changes exactly `2 × (pending + seen + 1)` rows: the previous checkpoint is deleted and the complete replacement inserted. The workload verifies the final checkpoint, and ordinary fixtures cover List occurrences sharing a URL, queue order, all saved metadata, seen deduplication, shrinking and empty checkpoints. Injected queue, seen and metadata insertion failures retain the previous checkpoint; subsequent saves succeed.
 
-Checkpoint frequency, transaction boundaries and SQLite durability settings are unchanged. Full frontier cloning, seen sorting and replacement still grow with crawl size. These measurements exclude network requests, progress-summary scans, session-index writes, concurrent UI queries and physical-disk latency; they do not establish crawler throughput.
+Checkpoint frequency, transaction boundaries and SQLite durability settings were unchanged in this storage-only comparison. Full frontier cloning, seen sorting and replacement still grow with crawl size. These measurements exclude network requests, progress-summary scans, session-index writes, concurrent UI queries and physical-disk latency; they do not establish crawler throughput. The later [scheduler comparison](#avoiding-dispatch-only-checkpoints) measures skipping redundant saves.
 
 ## Fresh SQLite Progress Summaries
 
@@ -175,6 +175,67 @@ The work regression `cargo test --locked -p ferrous-frog-storage memory_ingestio
 
 Memory elapsed time decreased 75–76%, approximately four times the throughput in this fixture. SQLite's implementation was unchanged. These are single optimized runs with tiny generated HTML and no desktop UI, Chromium, remote latency or physical disk. The original debug Memory run exceeded the 120-second phase deadline; use the release command above for this workload. The new index retains additional memory proportional to URL aliases; peak memory was not measured. Larger sites and active UI query traffic still need separate profiling.
 
+## Avoiding Dispatch-Only Checkpoints
+
+Measured on 2026-09-14 with the unchanged `synthetic_local_site_crawler_load` fixture above. Dispatch moves a URL from the waiting queue to the active set, both of which are already included in the saved frontier. The scheduler now omits that redundant checkpoint. Startup, completed results, worker errors and Stop retain their existing persistence paths. An uninterrupted 1,030-record fixture avoids 1,030 complete frontier snapshots, including queue/seen copying, seen sorting and SQLite table replacement.
+
+The same optimized before/after binaries were run serially on the Ryzen 9 9955HX with Rust 1.98.1 and locked dependencies. The first comparison uses `/tmp` on tmpfs; each entry is one run, excluding compilation and final verification queries.
+
+| Backend and run | Before | After |
+| --- | ---: | ---: |
+| Memory, uninterrupted | 6.317 s | 6.018 s |
+| Memory, stop/resume | 6.330 s | 6.043 s |
+| SQLite, uninterrupted | 3.888 s | 3.254 s |
+| SQLite, stop/reopen/resume | 3.959 s | 3.283 s |
+
+SQLite elapsed time fell 16–17% in this tmpfs comparison. Every run retained 1,030 records, 7,110 edges and the expected request counts: 1,031 uninterrupted or 1,039 with Stop/Resume. Robots exclusions, concurrency limits, completed record IDs and empty final frontiers remain verified by the fixture.
+
+For the physical-storage follow-up, `TMPDIR` pointed to a fresh temporary directory under `/home/onur-akman/.cache` on ext4, backed by `/dev/nvme0n1p2`. Three before/after pairs ran serially, alternating binaries and excluding a preliminary NVMe run. Each invocation still exercised both backends and both recovery cases; no build or other test suite ran concurrently. Values below are medians, with the observed SQLite ranges in parentheses.
+
+| Backend and run | Before | After |
+| --- | ---: | ---: |
+| Memory, uninterrupted | 6.114 s | 5.918 s |
+| Memory, stop/resume | 6.115 s | 5.968 s |
+| SQLite, uninterrupted | 4.419 s (4.402–5.786) | 3.788 s (3.782–3.826) |
+| SQLite, stop/reopen/resume | 4.454 s (4.435–4.513) | 3.791 s (3.776–3.819) |
+
+SQLite medians fell 14–15% in this NVMe fixture. To reproduce on another device, set `TMPDIR` to an existing directory on that device before running the local-site command above; repeat against both revisions. The database uses the existing WAL/`synchronous=NORMAL` settings and normal filesystem caches. These are physical-storage runs, not cold-cache or power-loss tests.
+
+The ordinary regression `cargo test --locked -p ferrous-frog-crawler-core aborted_dispatch_preserves_active_and_waiting_frontier_for_resume` blocks two HTTP responses while two URLs remain waiting, then aborts the crawl task without a final Stop checkpoint. It compares the saved pending identities and metadata, reopens SQLite and resumes all pending work. The Memory/SQLite matrix covers duplicate List occurrences and Spider discovery while another request is active; completed records retain their IDs. This tests task interruption and database reopening, not power loss.
+
+This comparison predates the incremental completion updates below; at this stage each remaining checkpoint still copied and replaced the complete frontier. The timing observations are not a general throughput or latency guarantee.
+
+## Incremental Frontier Checkpoints
+
+```bash
+cargo test --release --locked -p ferrous-frog-storage sqlite_incremental_frontier_workload -- --ignored --nocapture
+```
+
+Measured on 2026-09-14. Ordinary crawler completions now delete the completed storage key, append newly discovered queue entries and seen keys, update affected sitemap flags, and save the completed count in one SQLite transaction. Pending order and separate List identities remain intact. Startup, Stop and worker-error checkpoints retain full replacement. Memory mutates its saved state in place, but still scans the queue and sorts seen keys when discoveries are added.
+
+The ignored storage workload compares the full-save and update APIs in the same optimized build. Each in-memory SQLite case warms a frontier, then times seven one-completion/one-discovery checkpoints; preparation, full snapshot cloning and verification are excluded. Both paths finish with the same queue, seen set and counter. The full-save path includes the new URL index used for sitemap-flag updates.
+
+| Pending | Initial seen | Full-save median | Incremental median | Full-save row changes per call | Incremental row changes |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 2,000 | 1.435 ms | 0.015 ms | 6,003–6,015 | 4 |
+| 5,000 | 10,000 | 7.486 ms | 0.017 ms | 30,003–30,015 | 4 |
+| 500 | 100,000 | 39.244 ms | 0.020 ms | 201,003–201,015 | 4 |
+
+The ordinary regression additionally changes one existing sitemap flag and bounds writes to five rows at both 100 and 10,000 seen URLs; the preceding full-replacement implementation wrote 303 rows in the smaller case. Further tests cover List metadata, shared URLs with different keys, pending order, retained seen keys, rollback at queue/seen/sitemap/counter writes, reopening and unchanged audit revisions. Writes grow with new entries and affected sitemap rows; indexed lookups still have a size-dependent cost.
+
+The unchanged 1,000-page HTTP fixture was also measured in three serial before/after pairs on the same NVMe/ext4 filesystem as above. The before binary already omits dispatch-only checkpoints. Both binaries precede the separate reference-evidence retention feature, so these timings isolate checkpoint changes. Compilation and other test suites were excluded; the table shows medians and SQLite ranges.
+
+| Backend and run | Before incremental updates | After |
+| --- | ---: | ---: |
+| Memory, uninterrupted | 5.950 s | 5.900 s |
+| Memory, stop/resume | 5.966 s | 5.910 s |
+| SQLite, uninterrupted | 3.792 s (3.766–5.733) | 3.155 s (3.144–3.206) |
+| SQLite, stop/reopen/resume | 3.843 s (3.791–3.846) | 3.218 s (3.196–3.223) |
+
+SQLite medians fell another 16–17% in this fixture. Every run verified 1,030 records, 7,110 edges, 1,031 uninterrupted or 1,039 interrupted HTTP requests, robots/scope exclusions and preservation of completed IDs. The task-abort regression also checks late linked-sitemap flags on an active sibling and newly queued work, including SQLite reopening without a final Stop snapshot.
+
+These measurements do not bound whole-crawl cost: progress summaries and other record/edge operations still grow with the dataset. Larger mixed sites, concurrent UI queries, initial/Stop snapshot hydration and broader disk/memory measurements remain open.
+
 ## Paged Sitemap Validation
 
 ```bash
@@ -232,9 +293,9 @@ The graph still uses literal final URLs and existing backend record order. Node 
 ## What Remains
 
 - The first summary still scans the dataset. Record writes invalidate the cache, including commits from another SQLite connection; frontier-only writes now retain it. Frequent queries while ingesting a million URLs still need incremental counters or fewer repeated aggregate scans.
-- Frontier checkpoints still clone the complete pending queue and seen set, sort seen entries, and replace both tables on dispatch and completion. Reusing INSERT statements reduces SQL preparation without bounding that work as the crawl grows.
+- Ordinary SQLite completion checkpoints write only changed queue/seen/sitemap/counter rows. Startup, Stop and worker errors still clone/sort/replace the full frontier; Memory updates scan its pending vector and sort seen keys after discoveries. Those paths still need larger-scale measurements.
 - Duplicate queries still normalize and group matching text inside SQLite. They decode only the requested row window, but grouping remains proportional to dataset size.
 - Hreflang audits rebuild temporary alias joins for their count and page queries. Repeated audits during active large crawls may justify persistent indexed aliases or cached issue membership, with explicit invalidation.
 - Memory upsert still scans existing edges for status updates and first-inlink source annotations, and its progress summaries still scan retained records. Alias indexing removes repeated record lookup scans without making all ingestion work constant-time.
 - Graph hydration is capped, but its record/key scans and internal-edge counts still grow with the crawl. Measure concurrent ingestion and SQLite temporary working memory before claiming constant-cost refreshes at larger scales.
-- The 1,000-page local crawler now covers edges, a live frontier and interrupted/reopened crawls. Increase workload variety and scale, add concurrent UI query traffic, physical SSD storage and packaged desktop memory before making large-site capacity claims.
+- The 1,000-page local crawler now covers edges, a live frontier, interrupted/reopened crawls and an initial physical NVMe comparison. Increase workload variety and scale, add concurrent UI query traffic, broader disk measurements and packaged desktop memory before making large-site capacity claims.

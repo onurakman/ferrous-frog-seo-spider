@@ -1,11 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod comparison;
+mod comparison_sources;
 mod content;
 #[cfg(test)]
 mod export_tests;
 mod google_oauth;
 mod http_auth;
+mod page_captures;
 mod pagespeed;
 mod serp;
 #[cfg(test)]
@@ -14,6 +17,7 @@ mod sessions;
 mod updates;
 mod window_state;
 
+use comparison::{ComparisonDetail, ComparisonPage, ComparisonQuery, ComparisonWorkspace};
 use ferrous_frog_analysis::analyze_records;
 use ferrous_frog_crawler_core::{AutomationConfig, CrawlProgress};
 use ferrous_frog_crawler_core::{
@@ -27,8 +31,9 @@ use ferrous_frog_crawler_core::{
 use ferrous_frog_export::{
     audit_workbook_to_writer, export_preset, graph_nodes_to_csv, link_edges_to_csv,
     link_edges_to_csv_string, query_to_xlsx_writer, records_to_csv, records_to_csv_string,
-    records_to_html_report, records_to_sitemap_xml, records_to_xlsx_bytes,
-    redirect_chains_to_csv_string, sitemap_validation_to_csv_string, write_export_files,
+    records_to_html_report, records_to_html_report_writer, records_to_sitemap_xml,
+    records_to_xlsx_bytes, redirect_chains_to_csv_string, sitemap_validation_to_csv_string,
+    write_export_files,
 };
 use ferrous_frog_integrations::{
     AnalyticsConfig, BacklinkEndpointConfig, BacklinkEndpointProvider, DateRange,
@@ -39,9 +44,10 @@ use ferrous_frog_storage::{
     ActiveStore, AnalyticsMetricRow, AnchorTextResponse, AuditThresholds, BacklinkMetricRow,
     CrawlFrontierState, CrawlGraph, CrawlGraphQuery, CrawlPathQuery, CrawlPathResponse,
     CrawlRecord, CrawlStore, GridQuery, GridResponse, ImageAsset, ImageAssetQuery,
-    ImageAssetResponse, Issue, LinkEdge, LinkEdgeQuery, LinkEdgeResponse, SearchConsoleMetricRow,
-    SitemapValidationQuery, SitemapValidationResponse, is_broken_record, is_no_response_record,
-    summarize, validate_grid_query,
+    ImageAssetResponse, Issue, LinkEdge, LinkEdgeQuery, LinkEdgeResponse, MAX_CAPTURE_PAGE_SIZE,
+    PageCapture, PageCaptureQuery, PageReference, PageReferenceQuery, PageReferenceResponse,
+    SearchConsoleMetricRow, SitemapValidationQuery, SitemapValidationResponse, is_broken_record,
+    is_no_response_record, summarize, validate_grid_query,
 };
 use keyring::{Entry, Error as KeyringError};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -100,8 +106,80 @@ struct AppState {
     control: Mutex<Option<CrawlControl>>,
     crawl_task: tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     current_session_id: Mutex<Option<String>>,
+    comparison: Mutex<ComparisonState>,
     frontend_ready: AtomicBool,
     exit_confirmed: AtomicBool,
+}
+
+#[derive(Default)]
+struct ComparisonState {
+    id: Option<String>,
+    generation: u64,
+    workspace: Option<Arc<Mutex<ComparisonWorkspace>>>,
+}
+
+impl ComparisonState {
+    fn reserve(&mut self, id: &str) -> Result<u64, String> {
+        if id.trim().is_empty() || id.len() > 128 {
+            return Err("comparison ID must contain between 1 and 128 characters".into());
+        }
+        if self.id.as_deref() == Some(id) {
+            return Err("this comparison ID is already in use".into());
+        }
+        self.id = Some(id.to_owned());
+        self.generation = self.generation.wrapping_add(1);
+        if let Some(workspace) = self.workspace.take() {
+            drop_comparison(workspace);
+        }
+        Ok(self.generation)
+    }
+
+    fn close(&mut self, id: &str) {
+        if self.id.as_deref() == Some(id) {
+            self.id = None;
+            if let Some(workspace) = self.workspace.take() {
+                drop_comparison(workspace);
+            }
+        }
+    }
+
+    fn publish(
+        &mut self,
+        id: &str,
+        generation: u64,
+        workspace: ComparisonWorkspace,
+    ) -> Result<(), String> {
+        let workspace = Arc::new(Mutex::new(workspace));
+        if self.id.as_deref() != Some(id) || self.generation != generation {
+            drop_comparison(workspace);
+            return Err("comparison preparation was superseded or closed".into());
+        }
+        self.workspace = Some(workspace);
+        Ok(())
+    }
+
+    fn get(&self, id: &str) -> Result<Arc<Mutex<ComparisonWorkspace>>, String> {
+        if self.id.as_deref() != Some(id) {
+            return Err("comparison is closed or has been replaced".into());
+        }
+        self.workspace
+            .clone()
+            .ok_or_else(|| "comparison is still being prepared".into())
+    }
+}
+
+fn drop_comparison(workspace: Arc<Mutex<ComparisonWorkspace>>) {
+    // SQLite close/checkpoint and temporary file deletion can block on disk I/O.
+    tauri::async_runtime::spawn_blocking(move || drop(workspace));
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenCrawlComparisonRequest {
+    comparison_id: String,
+    baseline_session_id: Option<String>,
+    current_session_id: Option<String>,
+    archive_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -153,6 +231,10 @@ enum ExportFileKind {
     SelectedCsv,
     QueuedUrlsCsv,
     ImageAltCsv,
+    ResponseHeadersCsv,
+    RawHtmlCsv,
+    RenderedHtmlCsv,
+    VisibleTextCsv,
     Sitemap,
     LinkEdgesCsv,
     RedirectChainsCsv,
@@ -192,6 +274,8 @@ struct CrawlArchiveImportResult {
 #[serde(rename_all = "camelCase")]
 struct CompareCrawlArchiveRequest {
     path: String,
+    #[serde(default)]
+    include_response_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -207,6 +291,9 @@ struct CrawlComparisonResponse {
     meta_description_changed: usize,
     indexability_changed: usize,
     hash_changed: usize,
+    content_changed: usize,
+    response_only: usize,
+    content_unavailable: usize,
     rows: Vec<CrawlComparisonRow>,
     metric_deltas: Vec<ComparisonMetricDelta>,
 }
@@ -215,7 +302,15 @@ struct CrawlComparisonResponse {
 #[serde(rename_all = "camelCase")]
 struct CrawlComparisonRow {
     url: String,
+    identity_key: String,
+    occurrence: usize,
     change: String,
+    previous_url: Option<String>,
+    current_url: Option<String>,
+    previous_final_url: Option<String>,
+    current_final_url: Option<String>,
+    previous_list_position: Option<u32>,
+    current_list_position: Option<u32>,
     previous_status_code: Option<u16>,
     current_status_code: Option<u16>,
     previous_title: Option<String>,
@@ -224,6 +319,10 @@ struct CrawlComparisonRow {
     current_indexability: Option<String>,
     previous_response_hash: Option<String>,
     current_response_hash: Option<String>,
+    previous_meta_description: Option<String>,
+    current_meta_description: Option<String>,
+    changed_fields: Vec<String>,
+    content_comparison: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -358,6 +457,10 @@ struct CrawlArchive {
     records: Vec<CrawlRecord>,
     link_edges: Vec<LinkEdge>,
     image_assets: Vec<ImageAsset>,
+    #[serde(default)]
+    page_references: Vec<PageReference>,
+    #[serde(default)]
+    page_captures: Vec<PageCapture>,
     frontier_state: Option<CrawlFrontierState>,
 }
 
@@ -911,6 +1014,17 @@ async fn get_image_assets(
     query: ImageAssetQuery,
 ) -> Result<ImageAssetResponse, String> {
     with_store_worker(&state, false, move |store| query_store_images(store, query)).await
+}
+
+#[tauri::command]
+async fn page_references(
+    state: State<'_, AppState>,
+    query: PageReferenceQuery,
+) -> Result<PageReferenceResponse, String> {
+    with_store_worker(&state, false, move |store| {
+        query_store_page_references(store, query)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1775,6 +1889,45 @@ async fn export_audit_workbook(
     .await
 }
 
+async fn export_html_report_file(
+    state: &AppState,
+    path: PathBuf,
+) -> Result<ExportFileResult, String> {
+    with_store_worker(state, true, move |store| {
+        write_atomic_export(&path, |file| {
+            // ponytail: retain record/link snapshots for report-wide counts and duplicates;
+            // replace with aggregate storage queries if large reports need bounded hydration.
+            let records = match store {
+                ActiveStore::Memory(store) => store.records(),
+                ActiveStore::Sqlite(store) => {
+                    store.try_records().map_err(|error| error.to_string())?
+                }
+            };
+            let edges = query_store_link_edges(
+                store,
+                LinkEdgeQuery {
+                    limit: 1_000_000,
+                    ..LinkEdgeQuery::default()
+                },
+            )?;
+            if edges.edges.len() != edges.total {
+                return Err("HTML report requires all link edges; this crawl exceeds the 1,000,000-edge report limit".into());
+            }
+            let mut writer = BufWriter::new(file);
+            records_to_html_report_writer(
+                &records,
+                &edges.edges,
+                &audit_thresholds(),
+                &mut writer,
+            )
+            .map_err(|error| error.to_string())?;
+            writer.flush().map_err(|error| error.to_string())?;
+            Ok(records.len())
+        })
+    })
+    .await
+}
+
 async fn export_crawl_archive_file(
     state: &AppState,
     path: PathBuf,
@@ -1843,6 +1996,33 @@ fn write_crawl_archive_stream(
         )?;
         Ok((response.images, response.total))
     })?;
+    writer
+        .write_all(b",\n  \"pageReferences\": ")
+        .map_err(|error| error.to_string())?;
+    write_archive_array(writer, "page references", |offset| {
+        let response = query_store_page_references(
+            store,
+            PageReferenceQuery {
+                offset,
+                limit: EXPORT_STREAM_PAGE_SIZE,
+                ..PageReferenceQuery::default()
+            },
+        )?;
+        Ok((response.references, response.total))
+    })?;
+    writer
+        .write_all(b",\n  \"pageCaptures\": ")
+        .map_err(|error| error.to_string())?;
+    write_archive_array_with_page_size(writer, "page captures", MAX_CAPTURE_PAGE_SIZE, |offset| {
+        let response = store
+            .try_page_captures(PageCaptureQuery {
+                offset,
+                limit: MAX_CAPTURE_PAGE_SIZE,
+                ..Default::default()
+            })
+            .map_err(|error| error.to_string())?;
+        Ok((response.captures, response.total))
+    })?;
     // ponytail: hydrate the whole frontier; extend its visitor with seen/crawled metadata
     // if large resume snapshots need bounded memory.
     let frontier = match store {
@@ -1865,6 +2045,15 @@ fn write_crawl_archive_stream(
 fn write_archive_array<T: Serialize>(
     writer: &mut impl Write,
     name: &str,
+    read_page: impl FnMut(usize) -> Result<(Vec<T>, usize), String>,
+) -> Result<usize, String> {
+    write_archive_array_with_page_size(writer, name, EXPORT_STREAM_PAGE_SIZE, read_page)
+}
+
+fn write_archive_array_with_page_size<T: Serialize>(
+    writer: &mut impl Write,
+    name: &str,
+    page_size: usize,
     mut read_page: impl FnMut(usize) -> Result<(Vec<T>, usize), String>,
 ) -> Result<usize, String> {
     writer.write_all(b"[").map_err(|error| error.to_string())?;
@@ -1875,9 +2064,7 @@ fn write_archive_array<T: Serialize>(
         let total = *expected_total.get_or_insert(current_total);
         // The idle worker prevents app writes. Count checks also catch external cardinality
         // changes, but cannot guarantee a snapshot against same-count external edits.
-        if current_total != total
-            || rows.len() != total.saturating_sub(offset).min(EXPORT_STREAM_PAGE_SIZE)
-        {
+        if current_total != total || rows.len() != total.saturating_sub(offset).min(page_size) {
             return Err(format!(
                 "crawl archive {name} changed or ended early while exporting; retry the export"
             ));
@@ -1918,6 +2105,15 @@ fn query_store_images(
             .try_image_assets(query)
             .map_err(|error| error.to_string()),
     }
+}
+
+fn query_store_page_references(
+    store: &ActiveStore,
+    query: PageReferenceQuery,
+) -> Result<PageReferenceResponse, String> {
+    store
+        .try_page_references(query)
+        .map_err(|error| error.to_string())
 }
 
 fn query_store_link_edges(
@@ -2186,7 +2382,13 @@ async fn export_graph_file(
 fn validate_export_request(request: &ExportFileRequest) -> Result<(), String> {
     if matches!(
         request.kind,
-        ExportFileKind::Csv | ExportFileKind::Xlsx | ExportFileKind::Sitemap
+        ExportFileKind::Csv
+            | ExportFileKind::Xlsx
+            | ExportFileKind::Sitemap
+            | ExportFileKind::ResponseHeadersCsv
+            | ExportFileKind::RawHtmlCsv
+            | ExportFileKind::RenderedHtmlCsv
+            | ExportFileKind::VisibleTextCsv
     ) && let Some(query) = &request.query
     {
         validate_grid_query(query).map_err(|error| error.to_string())?;
@@ -2202,9 +2404,38 @@ async fn export_file(
 ) -> Result<ExportFileResult, String> {
     validate_export_request(&request)?;
     let timestamp = now_ms();
+    let capture_kind = match &request.kind {
+        ExportFileKind::ResponseHeadersCsv => Some((
+            "response-headers",
+            page_captures::PageCaptureKind::ResponseHeaders,
+        )),
+        ExportFileKind::RawHtmlCsv => Some(("raw-html", page_captures::PageCaptureKind::RawHtml)),
+        ExportFileKind::RenderedHtmlCsv => Some((
+            "rendered-html",
+            page_captures::PageCaptureKind::RenderedHtml,
+        )),
+        ExportFileKind::VisibleTextCsv => {
+            Some(("visible-text", page_captures::PageCaptureKind::VisibleText))
+        }
+        _ => None,
+    };
+    if let Some((name, kind)) = capture_kind {
+        let path = export_path(&app, &format!("ferrous-frog-{name}-{timestamp}.csv"))?;
+        return page_captures::export_capture_file(
+            &state,
+            path,
+            request.query.unwrap_or_else(export_grid_query),
+            kind,
+        )
+        .await;
+    }
     if matches!(&request.kind, ExportFileKind::AuditWorkbook) {
         let path = export_path(&app, &format!("ferrous-frog-audit-{timestamp}.xlsx"))?;
         return export_audit_workbook(&state, path).await;
+    }
+    if matches!(&request.kind, ExportFileKind::HtmlReport) {
+        let path = export_path(&app, &format!("ferrous-frog-seo-report-{timestamp}.html"))?;
+        return export_html_report_file(&state, path).await;
     }
     if matches!(&request.kind, ExportFileKind::CrawlArchive) {
         let path = export_path(
@@ -2261,11 +2492,16 @@ async fn export_file(
             .map_err(|_| "store lock poisoned".to_string())?;
         match request.kind {
             ExportFileKind::AuditWorkbook
+            | ExportFileKind::HtmlReport
             | ExportFileKind::CrawlArchive
             | ExportFileKind::Xlsx
             | ExportFileKind::SelectedCsv
             | ExportFileKind::QueuedUrlsCsv
             | ExportFileKind::ImageAltCsv
+            | ExportFileKind::ResponseHeadersCsv
+            | ExportFileKind::RawHtmlCsv
+            | ExportFileKind::RenderedHtmlCsv
+            | ExportFileKind::VisibleTextCsv
             | ExportFileKind::GraphJson
             | ExportFileKind::GraphNodesCsv
             | ExportFileKind::GraphEdgesCsv => unreachable!("scoped export returned earlier"),
@@ -2344,24 +2580,6 @@ async fn export_file(
                     row_count,
                 )
             }
-            ExportFileKind::HtmlReport => {
-                let records = store.records();
-                let edges = store
-                    .link_edges(LinkEdgeQuery {
-                        offset: 0,
-                        limit: 1_000_000,
-                        ..LinkEdgeQuery::default()
-                    })
-                    .edges;
-                let row_count = records.len();
-                let html = records_to_html_report(&records, &edges, &audit_thresholds())
-                    .map_err(|error| error.to_string())?;
-                (
-                    format!("ferrous-frog-seo-report-{timestamp}.html"),
-                    html.into_bytes(),
-                    row_count,
-                )
-            }
         }
     };
 
@@ -2399,6 +2617,27 @@ fn import_archive_into_session(
             "unsupported crawl archive schema version {}",
             archive.schema_version
         ));
+    }
+    let record_keys = archive
+        .records
+        .iter()
+        .map(|record| {
+            if record.storage_key.trim().is_empty() {
+                record.final_url.as_str()
+            } else {
+                record.storage_key.as_str()
+            }
+        })
+        .collect::<HashSet<_>>();
+    let mut capture_keys = HashSet::new();
+    for capture in &archive.page_captures {
+        capture.validate().map_err(|error| error.to_string())?;
+        if !record_keys.contains(capture.source_storage_key.as_str()) {
+            return Err("crawl archive capture has no matching record occurrence".into());
+        }
+        if !capture_keys.insert(capture.source_storage_key.as_str()) {
+            return Err("crawl archive contains duplicate page captures for one occurrence".into());
+        }
     }
     let mut active_store = state
         .store
@@ -2472,6 +2711,24 @@ fn import_archive_into_session(
                 .try_add_image_assets(&page_url, images)
                 .map_err(|error| error.to_string())?;
         }
+        let mut references_by_source = HashMap::<String, Vec<PageReference>>::new();
+        for reference in archive.page_references {
+            references_by_source
+                .entry(reference.source_storage_key.clone())
+                .or_default()
+                .push(reference);
+        }
+        for (source_storage_key, references) in references_by_source {
+            store
+                .try_add_page_references(&source_storage_key, references)
+                .map_err(|error| error.to_string())?;
+        }
+        for capture in archive.page_captures {
+            let key = capture.source_storage_key.clone();
+            store
+                .try_replace_page_capture(&key, Some(capture))
+                .map_err(|error| error.to_string())?;
+        }
         if let Some(frontier) = archive.frontier_state {
             store
                 .try_save_frontier_state(frontier)
@@ -2499,6 +2756,200 @@ fn import_archive_into_session(
     Ok(result)
 }
 
+async fn prepare_crawl_comparison(
+    state: &AppState,
+    directory: PathBuf,
+    request: OpenCrawlComparisonRequest,
+) -> Result<ComparisonPage, String> {
+    enum Source {
+        Saved(String, String),
+        Archive(String),
+    }
+    let source = match (
+        request.baseline_session_id,
+        request.current_session_id,
+        request.archive_path,
+    ) {
+        (Some(baseline), Some(current), None) if baseline != current => {
+            Source::Saved(baseline, current)
+        }
+        (None, None, Some(path)) if !path.trim().is_empty() => Source::Archive(path),
+        _ => return Err("choose two different saved crawls or one archive path".into()),
+    };
+    let id = request.comparison_id;
+    let generation = state
+        .comparison
+        .lock()
+        .map_err(|_| "comparison lock poisoned")?
+        .reserve(&id)?;
+    let result = async {
+        // Hold lifecycle changes until the source snapshots are complete.
+        let task = state.crawl_task.lock().await;
+        if state.exit_confirmed.load(Ordering::SeqCst) {
+            return Err("the application is closing".into());
+        }
+        let running = task
+            .as_ref()
+            .is_some_and(|task| !task.inner().is_finished());
+        let active_id = if running {
+            state
+                .current_session_id
+                .lock()
+                .map_err(|_| "session lock poisoned")?
+                .clone()
+        } else {
+            None
+        };
+        if running && matches!(source, Source::Archive(_)) {
+            return Err("stop or complete the active crawl before comparing its archive".into());
+        }
+        let current_store = if matches!(source, Source::Archive(_)) {
+            Some(
+                state
+                    .store
+                    .lock()
+                    .map_err(|_| "store lock poisoned")?
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let (workspace, page) = tauri::async_runtime::spawn_blocking(move || {
+            let sources = match source {
+                Source::Saved(baseline_id, current_id) => {
+                    if active_id
+                        .as_ref()
+                        .is_some_and(|id| id == &baseline_id || id == &current_id)
+                    {
+                        return Err("stop the selected active crawl before comparing it".into());
+                    }
+                    let index = Connection::open_with_flags(
+                        directory.join("ferrous-frog-sessions.sqlite3"),
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    .map_err(|error| format!("failed to read saved crawl library: {error}"))?;
+                    let baseline = get_session(&index, &baseline_id, None)?;
+                    let current = get_session(&index, &current_id, None)?;
+                    let baseline_path = fs::canonicalize(&baseline.database_path)
+                        .map_err(|error| error.to_string())?;
+                    let current_path = fs::canonicalize(&current.database_path)
+                        .map_err(|error| error.to_string())?;
+                    if baseline_path == current_path {
+                        return Err("these saved cards refer to the same crawl database".into());
+                    }
+                    comparison_sources::ComparisonSources::saved(&baseline_path, &current_path)?
+                }
+                Source::Archive(path) => comparison_sources::ComparisonSources::archive(
+                    Path::new(path.trim()),
+                    current_store
+                        .as_ref()
+                        .ok_or("current crawl is unavailable")?,
+                )?,
+            };
+            let workspace = ComparisonWorkspace::new(sources)?;
+            let page = workspace.query(&ComparisonQuery::default())?;
+            Ok::<_, String>((workspace, page))
+        })
+        .await
+        .map_err(|error| format!("comparison preparation failed: {error}"))??;
+        drop(task);
+        state
+            .comparison
+            .lock()
+            .map_err(|_| "comparison lock poisoned")?
+            .publish(&id, generation, workspace)?;
+        Ok(page)
+    }
+    .await;
+    if result.is_err() {
+        let mut comparison = state
+            .comparison
+            .lock()
+            .map_err(|_| "comparison lock poisoned")?;
+        if comparison.generation == generation {
+            comparison.close(&id);
+        }
+    }
+    result
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn open_crawl_comparison(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: OpenCrawlComparisonRequest,
+) -> Result<ComparisonPage, String> {
+    prepare_crawl_comparison(&state, app_data_dir(&app)?, request).await
+}
+
+async fn with_comparison_worker<T: Send + 'static>(
+    state: &AppState,
+    id: &str,
+    work: impl FnOnce(&ComparisonWorkspace) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let workspace = state
+        .comparison
+        .lock()
+        .map_err(|_| "comparison lock poisoned")?
+        .get(id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace = workspace
+            .lock()
+            .map_err(|_| "comparison workspace lock poisoned")?;
+        work(&workspace)
+    })
+    .await
+    .map_err(|error| format!("comparison worker failed: {error}"))?
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn query_crawl_comparison(
+    state: State<'_, AppState>,
+    comparison_id: String,
+    query: ComparisonQuery,
+) -> Result<ComparisonPage, String> {
+    with_comparison_worker(&state, &comparison_id, move |workspace| {
+        workspace.query(&query)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn get_crawl_comparison_detail(
+    state: State<'_, AppState>,
+    comparison_id: String,
+    key: i64,
+) -> Result<ComparisonDetail, String> {
+    with_comparison_worker(&state, &comparison_id, move |workspace| {
+        workspace.detail(key)
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn export_crawl_comparison(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    comparison_id: String,
+    query: ComparisonQuery,
+) -> Result<ExportFileResult, String> {
+    let path = export_path(&app, &format!("crawl-comparison-{}.csv", now_ms()))?;
+    with_comparison_worker(&state, &comparison_id, move |workspace| {
+        write_atomic_export(&path, |file| workspace.write_csv(&query, file))
+    })
+    .await
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn close_crawl_comparison(state: State<'_, AppState>, comparison_id: String) -> Result<(), String> {
+    state
+        .comparison
+        .lock()
+        .map_err(|_| "comparison lock poisoned")?
+        .close(&comparison_id);
+    Ok(())
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn compare_crawl_archive(
     state: State<'_, AppState>,
@@ -2520,7 +2971,11 @@ fn compare_crawl_archive(
         .lock()
         .map_err(|_| "store lock poisoned".to_string())?
         .records();
-    Ok(compare_records(&archive.records, &current_records))
+    Ok(compare_records(
+        &archive.records,
+        &current_records,
+        request.include_response_only,
+    ))
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -2529,6 +2984,7 @@ async fn compare_crawl_sessions(
     state: State<'_, AppState>,
     baseline_session_id: String,
     current_session_id: String,
+    include_response_only: Option<bool>,
 ) -> Result<CrawlComparisonResponse, String> {
     let task = state.crawl_task.lock().await;
     let active_id = if task
@@ -2551,6 +3007,7 @@ async fn compare_crawl_sessions(
             &baseline_session_id,
             &current_session_id,
             active_id.as_deref(),
+            include_response_only.unwrap_or(false),
         )
     })
     .await
@@ -2569,18 +3026,95 @@ fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
     }
 }
 
+fn comparison_list_key(storage_key: &str) -> Option<(u32, &str)> {
+    let (position, url) = storage_key.strip_prefix("list:")?.split_once(':')?;
+    Some((position.parse().ok()?, url))
+}
+
+fn comparison_request_url(
+    url: Option<&str>,
+    storage_key: Option<&str>,
+    final_url: Option<&str>,
+) -> String {
+    let storage_key = storage_key.unwrap_or_default();
+    let stored_url = comparison_list_key(storage_key)
+        .map(|(_, url)| url)
+        .unwrap_or(storage_key);
+    let value = url
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| {
+            if url::Url::parse(stored_url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+            {
+                stored_url
+            } else {
+                final_url.unwrap_or_default()
+            }
+        })
+        .trim();
+    match url::Url::parse(value) {
+        Ok(mut url) => {
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => value.to_string(),
+    }
+}
+
+fn comparison_position(list_position: Option<u32>, storage_key: &str, id: u64) -> u64 {
+    list_position
+        .or_else(|| comparison_list_key(storage_key).map(|(position, _)| position))
+        .map(u64::from)
+        .unwrap_or(id)
+}
+
+fn comparison_records_by_identity(
+    records: &[CrawlRecord],
+) -> std::collections::BTreeMap<(String, usize), &CrawlRecord> {
+    let mut groups = std::collections::BTreeMap::<String, Vec<&CrawlRecord>>::new();
+    for record in records {
+        let url = comparison_request_url(
+            Some(&record.url),
+            Some(&record.storage_key),
+            Some(&record.final_url),
+        );
+        groups.entry(url).or_default().push(record);
+    }
+    let mut result = std::collections::BTreeMap::new();
+    for (url, mut records) in groups {
+        let known = records
+            .iter()
+            .map(|record| record.list_duplicate_index)
+            .collect::<HashSet<_>>();
+        let use_known_occurrences = !known.contains(&0) && known.len() == records.len();
+        records.sort_by(|left, right| {
+            comparison_position(left.list_position, &left.storage_key, left.id)
+                .cmp(&comparison_position(
+                    right.list_position,
+                    &right.storage_key,
+                    right.id,
+                ))
+                .then_with(|| left.storage_key.cmp(&right.storage_key))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        for (index, record) in records.into_iter().enumerate() {
+            let occurrence = if use_known_occurrences {
+                record.list_duplicate_index as usize
+            } else {
+                index + 1
+            };
+            result.insert((url.clone(), occurrence), record);
+        }
+    }
+    result
+}
+
 fn compare_records(
     baseline_records: &[CrawlRecord],
     current_records: &[CrawlRecord],
+    include_response_only: bool,
 ) -> CrawlComparisonResponse {
-    let baseline_by_url = baseline_records
-        .iter()
-        .map(|record| (record.final_url.clone(), record))
-        .collect::<HashMap<_, _>>();
-    let current_by_url = current_records
-        .iter()
-        .map(|record| (record.final_url.clone(), record))
-        .collect::<HashMap<_, _>>();
+    let baseline_by_identity = comparison_records_by_identity(baseline_records);
+    let current_by_identity = comparison_records_by_identity(current_records);
 
     let mut added = 0;
     let mut removed = 0;
@@ -2590,52 +3124,63 @@ fn compare_records(
     let mut meta_description_changed = 0;
     let mut indexability_changed = 0;
     let mut hash_changed = 0;
+    let mut content_changed = 0;
+    let mut response_only = 0;
+    let mut content_unavailable = 0;
     let mut rows = Vec::new();
+    let mut response_rows = Vec::new();
 
-    for (url, current) in &current_by_url {
-        if !baseline_by_url.contains_key(url) {
+    for (identity, current) in &current_by_identity {
+        if !baseline_by_identity.contains_key(identity) {
             added += 1;
-            push_comparison_row(&mut rows, comparison_row("added", url, None, Some(current)));
+            push_comparison_row(
+                &mut rows,
+                comparison_row("added", identity, None, Some(current)),
+            );
         }
     }
 
-    for (url, previous) in &baseline_by_url {
-        match current_by_url.get(url) {
+    for (identity, previous) in &baseline_by_identity {
+        match current_by_identity.get(identity) {
             None => {
                 removed += 1;
                 push_comparison_row(
                     &mut rows,
-                    comparison_row("removed", url, Some(previous), None),
+                    comparison_row("removed", identity, Some(previous), None),
                 );
             }
             Some(current) => {
-                let status_diff = previous.status_code != current.status_code;
-                let title_diff = previous.title != current.title;
-                let meta_diff = previous.meta_description != current.meta_description;
-                let indexability_diff = previous.indexability != current.indexability
-                    || previous.indexability_status != current.indexability_status;
-                let hash_diff = previous.response_hash != current.response_hash;
-                if status_diff || title_diff || meta_diff || indexability_diff || hash_diff {
+                let mut row = comparison_row("changed", identity, Some(previous), Some(current));
+                let has_change =
+                    |field: &str| row.changed_fields.iter().any(|changed| changed == field);
+                let hash_diff = has_change("responseHash");
+                hash_changed += usize::from(hash_diff);
+                content_unavailable += usize::from(row.content_comparison == "unavailable");
+                if row
+                    .changed_fields
+                    .iter()
+                    .any(|field| field != "responseHash")
+                {
                     changed += 1;
-                    status_changed += usize::from(status_diff);
-                    title_changed += usize::from(title_diff);
-                    meta_description_changed += usize::from(meta_diff);
-                    indexability_changed += usize::from(indexability_diff);
-                    hash_changed += usize::from(hash_diff);
-                    push_comparison_row(
-                        &mut rows,
-                        comparison_row("changed", url, Some(previous), Some(current)),
-                    );
+                    status_changed += usize::from(has_change("statusCode"));
+                    title_changed += usize::from(has_change("title"));
+                    meta_description_changed += usize::from(has_change("metaDescription"));
+                    indexability_changed += usize::from(has_change("indexability"));
+                    content_changed += usize::from(has_change("content"));
+                    push_comparison_row(&mut rows, row);
+                } else if hash_diff {
+                    response_only += 1;
+                    if include_response_only {
+                        row.change = "responseOnly".into();
+                        push_comparison_row(&mut response_rows, row);
+                    }
                 }
             }
         }
     }
 
-    rows.sort_by(|left, right| {
-        comparison_change_order(&left.change)
-            .cmp(&comparison_change_order(&right.change))
-            .then_with(|| left.url.cmp(&right.url))
-    });
+    rows.extend(response_rows);
+    rows.sort_by(comparison_row_order);
     rows.truncate(1_000);
 
     let baseline_summary = summarize(baseline_records);
@@ -2651,26 +3196,131 @@ fn compare_records(
         meta_description_changed,
         indexability_changed,
         hash_changed,
+        content_changed,
+        response_only,
+        content_unavailable,
         rows,
         metric_deltas: comparison_metric_deltas(&baseline_summary, &current_summary),
     }
 }
 
 fn push_comparison_row(rows: &mut Vec<CrawlComparisonRow>, row: CrawlComparisonRow) {
-    if rows.len() < 2_000 {
-        rows.push(row);
+    rows.push(row);
+    if rows.len() == 2_000 {
+        rows.sort_by(comparison_row_order);
+        rows.truncate(1_000);
     }
+}
+
+fn comparison_row_order(
+    left: &CrawlComparisonRow,
+    right: &CrawlComparisonRow,
+) -> std::cmp::Ordering {
+    comparison_change_order(&left.change)
+        .cmp(&comparison_change_order(&right.change))
+        .then_with(|| left.url.cmp(&right.url))
+        .then_with(|| left.occurrence.cmp(&right.occurrence))
 }
 
 fn comparison_row(
     change: &str,
-    url: &str,
+    identity: &(String, usize),
     previous: Option<&CrawlRecord>,
     current: Option<&CrawlRecord>,
 ) -> CrawlComparisonRow {
+    let mut changed_fields = Vec::new();
+    let mut content_comparison = "notApplicable";
+    if let Some((previous, current)) = previous.zip(current) {
+        content_comparison = match (
+            previous.content_hash.as_deref(),
+            current.content_hash.as_deref(),
+            previous.content_hash_context.as_deref(),
+            current.content_hash_context.as_deref(),
+        ) {
+            (Some(before), Some(after), Some(old_context), Some(new_context))
+                if old_context == new_context =>
+            {
+                if before == after {
+                    "unchanged"
+                } else {
+                    "changed"
+                }
+            }
+            _ => "unavailable",
+        };
+        let known_count_diff = |before: Option<usize>, after: Option<usize>| {
+            before
+                .zip(after)
+                .is_some_and(|(before, after)| before != after)
+        };
+        for (field, differs) in [
+            (
+                "finalUrl",
+                comparison_request_url(Some(&previous.final_url), None, None)
+                    != comparison_request_url(Some(&current.final_url), None, None),
+            ),
+            ("statusCode", previous.status_code != current.status_code),
+            (
+                "title",
+                previous.title != current.title
+                    || known_count_diff(previous.title_count, current.title_count),
+            ),
+            (
+                "metaDescription",
+                previous.meta_description != current.meta_description
+                    || known_count_diff(
+                        previous.meta_description_count,
+                        current.meta_description_count,
+                    ),
+            ),
+            (
+                "indexability",
+                previous.indexability != current.indexability
+                    || previous.indexability_status != current.indexability_status,
+            ),
+            (
+                "headings",
+                previous.h1 != current.h1
+                    || previous.h1_count != current.h1_count
+                    || previous.h2 != current.h2
+                    || previous.h2_count != current.h2_count,
+            ),
+            (
+                "canonical",
+                previous.canonical != current.canonical
+                    || previous.canonical_count != current.canonical_count,
+            ),
+            (
+                "robotsDirectives",
+                previous.meta_robots != current.meta_robots
+                    || previous.x_robots_tag != current.x_robots_tag,
+            ),
+            ("content", content_comparison == "changed"),
+            (
+                "responseHash",
+                previous
+                    .response_hash
+                    .as_ref()
+                    .zip(current.response_hash.as_ref())
+                    .is_some_and(|(before, after)| before != after),
+            ),
+        ] {
+            if differs {
+                changed_fields.push(field.to_string());
+            }
+        }
+    }
     CrawlComparisonRow {
-        url: url.to_string(),
+        url: identity.0.clone(),
+        identity_key: format!("{}:{}", identity.1, identity.0),
+        occurrence: identity.1,
         change: change.to_string(),
+        previous_url: previous.map(|record| record.url.clone()),
+        current_url: current.map(|record| record.url.clone()),
+        previous_final_url: previous.map(|record| record.final_url.clone()),
+        current_final_url: current.map(|record| record.final_url.clone()),
+        previous_list_position: previous.and_then(|record| record.list_position),
+        current_list_position: current.and_then(|record| record.list_position),
         previous_status_code: previous.and_then(|record| record.status_code),
         current_status_code: current.and_then(|record| record.status_code),
         previous_title: previous.and_then(|record| record.title.clone()),
@@ -2679,6 +3329,10 @@ fn comparison_row(
         current_indexability: current.map(|record| record.indexability_status.clone()),
         previous_response_hash: previous.and_then(|record| record.response_hash.clone()),
         current_response_hash: current.and_then(|record| record.response_hash.clone()),
+        previous_meta_description: previous.and_then(|record| record.meta_description.clone()),
+        current_meta_description: current.and_then(|record| record.meta_description.clone()),
+        changed_fields,
+        content_comparison: content_comparison.into(),
     }
 }
 
@@ -2687,6 +3341,7 @@ fn comparison_change_order(change: &str) -> u8 {
         "added" => 0,
         "removed" => 1,
         "changed" => 2,
+        "responseOnly" => 3,
         _ => 3,
     }
 }
@@ -3320,6 +3975,7 @@ fn main() {
             control: Mutex::new(None),
             crawl_task: tokio::sync::Mutex::new(None),
             current_session_id: Mutex::new(None),
+            comparison: Mutex::new(crate::ComparisonState::default()),
             frontend_ready: AtomicBool::new(false),
             exit_confirmed: AtomicBool::new(false),
         })
@@ -3369,6 +4025,8 @@ fn main() {
             get_issues,
             get_link_edges,
             get_image_assets,
+            page_references,
+            page_captures::get_page_capture,
             get_anchor_texts,
             get_sitemap_validation,
             get_crawl_graph,
@@ -3427,6 +4085,11 @@ fn main() {
             import_crawl_archive,
             compare_crawl_archive,
             compare_crawl_sessions,
+            open_crawl_comparison,
+            query_crawl_comparison,
+            get_crawl_comparison_detail,
+            export_crawl_comparison,
+            close_crawl_comparison,
             open_external_url
         ])
         .build(tauri::generate_context!())
@@ -3509,6 +4172,7 @@ mod lifecycle_tests {
             control: Mutex::new(Some(control.clone())),
             crawl_task: tokio::sync::Mutex::new(Some(task)),
             current_session_id: Mutex::new(None),
+            comparison: Mutex::new(crate::ComparisonState::default()),
             frontend_ready: AtomicBool::new(true),
             exit_confirmed: AtomicBool::new(false),
         };

@@ -1,6 +1,7 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import CrawlHome, { type SavedCrawl } from "./CrawlHome";
+import ComparisonWorkspace from "./ComparisonWorkspace";
 import AdvancedFilters, { type GridFilterGroup } from "./AdvancedFilters";
 import { FieldVitalsPanel, PageSpeedPanel, PageSpeedSettings, usePageSpeedCredentials, type FieldFormFactor, type FieldVitalsSnapshot, type PageSpeedCategory, type PageSpeedSnapshot, type PageSpeedStrategy } from "./PageSpeed";
 import { HttpAuthSettings, formLoginCommands, useHttpAuthCredentials } from "./HttpAuth";
@@ -181,7 +182,7 @@ type RedirectHop = {
   elapsedMs?: number | null;
 };
 
-type CrawlRecord = {
+export type CrawlRecord = {
   id: number;
   storageKey: string;
   url: string;
@@ -206,6 +207,8 @@ type CrawlRecord = {
   resolvedIpCount: number;
   sizeBytes: number;
   responseHash?: string | null;
+  contentHash?: string | null;
+  contentHashContext?: string | null;
   depth: number;
   redirectTarget?: string | null;
   redirectType?: string | null;
@@ -548,6 +551,10 @@ type SitemapValidationResponse = {
 
 type ExportKind =
   | "csv"
+  | "responseHeadersCsv"
+  | "rawHtmlCsv"
+  | "renderedHtmlCsv"
+  | "visibleTextCsv"
   | "selectedCsv"
   | "queuedUrlsCsv"
   | "imageAltCsv"
@@ -574,41 +581,6 @@ type CrawlArchiveImportResult = {
   linkEdges: number;
   imageAssets: number;
   frontierItems: number;
-};
-
-type ComparisonMetricDelta = {
-  label: string;
-  previous: number;
-  current: number;
-  delta: number;
-};
-
-type CrawlComparisonRow = {
-  url: string;
-  change: "added" | "removed" | "changed" | string;
-  previousStatusCode?: number | null;
-  currentStatusCode?: number | null;
-  previousTitle?: string | null;
-  currentTitle?: string | null;
-  previousIndexability?: string | null;
-  currentIndexability?: string | null;
-  previousResponseHash?: string | null;
-  currentResponseHash?: string | null;
-};
-
-type CrawlComparisonResponse = {
-  baselineRecords: number;
-  currentRecords: number;
-  added: number;
-  removed: number;
-  changed: number;
-  statusChanged: number;
-  titleChanged: number;
-  metaDescriptionChanged: number;
-  indexabilityChanged: number;
-  hashChanged: number;
-  rows: CrawlComparisonRow[];
-  metricDeltas: ComparisonMetricDelta[];
 };
 
 type SearchConsoleCredentialStatus = {
@@ -696,7 +668,9 @@ type OverviewStatusSegment = {
 };
 
 type SettingsTab =
-  | "crawl"
+  | "limits"
+  | "speed"
+  | "robots"
   | "scope"
   | "sitemaps"
   | "requests"
@@ -719,6 +693,7 @@ type CrawlConfig = {
   listSitemapUrls: string[];
   sitemap: SitemapConfig;
   content: { includeSelectors: string[]; excludeSelectors: string[] };
+  capture: { responseHeaders: boolean; rawHtml: boolean; renderedHtml: boolean; visibleText: boolean; maxBytes: number };
   thresholds: AuditThresholds;
   automation: AutomationConfig;
   httpAuth: { enabled: boolean };
@@ -829,7 +804,25 @@ type StoreConfig = {
   other: boolean;
   internalLinks: boolean;
   externalLinks: boolean;
+  canonical: boolean;
+  hreflang: boolean;
+  pagination: boolean;
+  amp: boolean;
+  metaRefresh: boolean;
+  iframe: boolean;
 };
+
+const referenceTypes = [["canonical", "Canonical targets"], ["hreflang", "Hreflang targets"], ["pagination", "Pagination (next / previous)"],
+  ["amp", "AMP targets"], ["metaRefresh", "Meta refresh targets"], ["iframe", "Iframe sources"]] as const;
+type PageReference = { id: number; sourceStorageKey: string; sourceUrl: string; targetUrl: string;
+  kind: (typeof referenceTypes)[number][0]; relNofollow: boolean };
+type PageReferencesResponse = { references: PageReference[]; total: number };
+
+type CaptureKind = "responseHeaders" | "rawHtml" | "renderedHtml" | "visibleText";
+type PageCapturePreview = { sourceStorageKey: string; sourceUrl: string; finalUrl: string; kind: CaptureKind; text: string; storedTruncated: boolean; previewTruncated: boolean };
+const captureLabels: Record<CaptureKind, string> = { responseHeaders: "Client-observed response headers", rawHtml: "Raw HTML", renderedHtml: "Rendered HTML", visibleText: "Visible text" };
+const capturedExportLabels = { responseHeadersCsv: "Response Headers CSV", rawHtmlCsv: "Raw HTML CSV", renderedHtmlCsv: "Rendered HTML CSV", visibleTextCsv: "Visible Text CSV" };
+
 
 type QuerySettingsConfig = {
   sortParameters: boolean;
@@ -957,6 +950,8 @@ const detailTabs = [
   { id: "page", label: "URL details" },
   { id: "inlinks", label: "Inlinks" },
   { id: "outlinks", label: "Outlinks" },
+  { id: "references", label: "References" },
+  { id: "captured", label: "Captured data" },
   { id: "links", label: "Links & indexing" },
   { id: "technical", label: "Technical" },
   { id: "custom", label: "Custom data" },
@@ -1047,6 +1042,7 @@ const defaultConfig: CrawlConfig = {
   listSitemapUrls: [],
   sitemap: { enabled: true, discoverFromRobots: true, probeDefault: true, followLinked: true, urls: [] },
   content: { includeSelectors: [], excludeSelectors: [] },
+  capture: { responseHeaders: false, rawHtml: false, renderedHtml: false, visibleText: false, maxBytes: 1_048_576 },
   thresholds: {
     titleMinChars: 30,
     titleMaxChars: 60,
@@ -1110,6 +1106,12 @@ const defaultConfig: CrawlConfig = {
     other: true,
     internalLinks: true,
     externalLinks: true,
+    canonical: true,
+    hreflang: true,
+    pagination: true,
+    amp: true,
+    metaRefresh: true,
+    iframe: true,
   },
   querySettings: {
     sortParameters: false,
@@ -1134,6 +1136,7 @@ function normalizeCrawlConfig(config: Partial<CrawlConfig>): CrawlConfig {
     listSitemapUrls: cleanPatterns(config.listSitemapUrls),
     sitemap: { ...defaultConfig.sitemap, ...config.sitemap, urls: cleanPatterns(config.sitemap?.urls) },
     content: { includeSelectors: cleanPatterns(config.content?.includeSelectors), excludeSelectors: cleanPatterns(config.content?.excludeSelectors) },
+    capture: { ...defaultConfig.capture, ...config.capture },
     thresholds: { ...defaultConfig.thresholds, ...(config.thresholds ?? {}) },
     automation: { ...defaultConfig.automation, ...(config.automation ?? {}), webhookUrl: (config.automation?.webhookUrl ?? "").trim() },
     httpAuth: { enabled: config.httpAuth?.enabled ?? false },
@@ -1182,6 +1185,7 @@ function getInitialSettings(): Pick<AppState, "config" | "modeStartUrls" | "stor
     for (const [value, template] of [[saved.config, defaultConfig], [saved.config.resourceTypes ?? {}, defaultConfig.resourceTypes],
       [saved.config.querySettings ?? {}, defaultConfig.querySettings], [saved.config.rendering ?? {}, defaultConfig.rendering],
       [saved.config.sitemap ?? {}, defaultConfig.sitemap], [saved.config.content ?? {}, defaultConfig.content],
+      [saved.config.capture ?? {}, defaultConfig.capture],
       [saved.config.referenceLinks ?? {}, defaultConfig.referenceLinks], [saved.config.store ?? {}, defaultConfig.store],
       [saved.config.thresholds ?? {}, defaultConfig.thresholds], [saved.config.automation ?? {}, defaultConfig.automation],
       [saved.config.httpAuth ?? {}, defaultConfig.httpAuth], [saved.config.schedule ?? {}, defaultConfig.schedule],
@@ -1758,11 +1762,25 @@ const settingsTabs: Array<{
   keywords: string;
 }> = [
   {
-    id: "crawl",
-    label: "Crawl",
-    description: "Limits, robots.txt, and crawl throughput.",
+    id: "limits",
+    label: "Limits",
+    description: "Bound the crawl size, discovery depth and HTTP response size.",
     group: "Spider",
-    keywords: "max URLs crawl depth folder depth URL length links per page concurrency speed requests delay timeout retries backoff robots override tester download response body bytes MiB size near duplicate threshold",
+    keywords: "max URLs crawl depth folder depth URL length links per page redirects download response body bytes MiB size budget",
+  },
+  {
+    id: "speed",
+    label: "Speed",
+    description: "Concurrency, request pacing, timeouts and retries.",
+    group: "Spider",
+    keywords: "threads throughput requests per second RPS delay timeout retries backoff default benchmark preset",
+  },
+  {
+    id: "robots",
+    label: "robots.txt",
+    description: "Respect site rules or test an explicit robots.txt override.",
+    group: "Spider",
+    keywords: "robots policy override tester batch download allowed blocked crawl delay",
   },
   {
     id: "scope",
@@ -1832,14 +1850,14 @@ const settingsTabs: Array<{
     label: "Content",
     description: "Select page regions for text analysis.",
     group: "Analysis",
-    keywords: "content area include exclude CSS selectors visible text word count ratio near duplicates preview HTML",
+    keywords: "content area include exclude CSS selectors visible text word count ratio near duplicates threshold similarity bits preview HTML",
   },
   {
     id: "extraction",
     label: "Extraction",
-    description: "Create custom CSS, XPath, and regex extraction columns.",
+    description: "Retain page evidence and create custom extraction columns.",
     group: "Analysis",
-    keywords: "custom extraction search text CSS selector attribute XPath regex raw HTML rendered visible include exclude snippets",
+    keywords: "custom extraction search text CSS selector attribute XPath regex raw HTML rendered visible include exclude snippets retain captured response headers evidence",
   },
   {
     id: "thresholds",
@@ -1864,9 +1882,25 @@ const settingsTabs: Array<{
   },
 ];
 
-function matchingSettingsTabs(search: string) {
+type SettingsControlMatch = { tab: SettingsTab; label: string; control: HTMLElement; disabled: boolean };
+
+function matchingSettingsControls(root: HTMLElement | null, search: string): SettingsControlMatch[] {
+  if (!root || !search.trim()) return [];
   const terms = search.trim().toLowerCase().split(/\s+/);
-  return settingsTabs.filter((tab) => terms.every((term) =>
+  return [...root.querySelectorAll<HTMLElement>('input:not([type="hidden"]):not([aria-hidden="true"]), select, textarea, button[role="checkbox"]')].flatMap((control) => {
+    const tab = control.closest<HTMLElement>("[data-settings-section]")?.dataset.settingsSection as SettingsTab | undefined;
+    const labelNode = control.closest("label")?.cloneNode(true) as HTMLElement | undefined;
+    labelNode?.querySelectorAll("input, select, textarea, button, small").forEach((node) => node.remove());
+    const label = (control.getAttribute("aria-label") || labelNode?.textContent || "").replace(/\s+/g, " ").trim();
+    const text = `${label} ${control.dataset.settingsKeywords ?? ""}`.toLowerCase();
+    return tab && label && terms.every((term) => text.includes(term))
+      ? [{ tab, label, control, disabled: control.matches(":disabled") }] : [];
+  });
+}
+
+function matchingSettingsTabs(search: string, controls: SettingsControlMatch[] = []) {
+  const terms = search.trim().toLowerCase().split(/\s+/);
+  return settingsTabs.filter((tab) => controls.some((control) => control.tab === tab.id) || terms.every((term) =>
     `${tab.label} ${tab.description} ${tab.keywords}`.toLowerCase().includes(term)));
 }
 
@@ -2162,7 +2196,7 @@ export default function App() {
     if (!settingsDirty) { if (close) changeSettingsOpen(false); return; }
     const invalid = document.querySelector<HTMLInputElement>('.settings-content input:invalid');
     if (invalid) {
-      const tab = invalid.closest<HTMLElement>('[data-settings-section]')?.dataset.settingsSection as SettingsTab ?? "crawl";
+      const tab = invalid.closest<HTMLElement>('[data-settings-section]')?.dataset.settingsSection as SettingsTab ?? "limits";
       setSettingsSearch("");
       setCollapsedSettingsGroups(settingsGroups.filter((group) => group !== settingsTabs.find((item) => item.id === tab)?.group));
       setSettingsTab(tab);
@@ -2195,7 +2229,7 @@ export default function App() {
   const [renderingStatusError, setRenderingStatusError] = useState<string>();
   const renderingStatusRequest = useRef(0);
   const [detailTab, setDetailTab] = useState<(typeof detailTabs)[number]["id"]>("page");
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("crawl");
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("limits");
   const settingsContentRef = useRef<HTMLFieldSetElement>(null);
   useEffect(() => {
     if (!settingsOpen) return;
@@ -2203,16 +2237,26 @@ export default function App() {
     document.querySelector('.settings-tab-button[aria-current="page"]')?.scrollIntoView({ block: "nearest" });
   }, [settingsTab, settingsOpen]);
   const [settingsSearch, setSettingsSearch] = useState("");
+  const [settingsControlMatches, setSettingsControlMatches] = useState<SettingsControlMatch[]>([]);
   const [collapsedSettingsGroups, setCollapsedSettingsGroups] = useState<string[]>(settingsGroups);
+  useEffect(() => {
+    setSettingsControlMatches(matchingSettingsControls(settingsContentRef.current, settingsSearch));
+  }, [settingsSearch, settingsDraft, settingsOpen, settingsApplying, running, workspaceBusy]);
+  const focusSettingsControl = (match: SettingsControlMatch) => {
+    if (!match.control.isConnected || match.control.matches(":disabled")) return;
+    setSettingsTab(match.tab);
+    setCollapsedSettingsGroups(settingsGroups.filter((group) => group !== settingsTabs.find((tab) => tab.id === match.tab)?.group));
+    requestAnimationFrame(() => {
+      if (!match.control.isConnected) return;
+      match.control.focus();
+      match.control.scrollIntoView({ block: "center" });
+    });
+  };
   const [aboutOpen, setAboutOpen] = useState(false);
   const [comparisonOpen, setComparisonOpen] = useState(false);
   const [serpOpen, setSerpOpen] = useState(false);
   const [serpVisited, setSerpVisited] = useState(false);
-  const [comparisonArchivePath, setComparisonArchivePath] = useState("");
-  const [comparisonLoading, setComparisonLoading] = useState(false);
-  const [comparisonResult, setComparisonResult] = useState<CrawlComparisonResponse>();
   const [comparisonSessions, setComparisonSessions] = useState<[SavedCrawl, SavedCrawl]>();
-  const comparisonRequest = useRef(0);
   const [linkReportsOpen, setLinkReportsOpen] = useState(false);
   const [linkReportPage, setLinkReportPage] = useState(0);
   const linkReportRequest = useRef(0);
@@ -2387,7 +2431,7 @@ export default function App() {
   const settingsCrawlScope = crawlScopePreset(settingsConfig);
   const activeSettingsTab =
     settingsTabs.find((tab) => tab.id === settingsTab) ?? settingsTabs[0];
-  const visibleSettingsTabs = matchingSettingsTabs(settingsSearch);
+  const visibleSettingsTabs = matchingSettingsTabs(settingsSearch, settingsControlMatches);
   const crawlTargetLabel =
     config.mode === "list"
       ? `${listSourceCount || 1} list source${listSourceCount === 1 ? "" : "s"}`
@@ -4048,8 +4092,9 @@ export default function App() {
       setError("Open the desktop app with make dev to export files.");
       return;
     }
-    const scoped = ["auditWorkbook", "selectedCsv", "queuedUrlsCsv", "xlsx", "imageAltCsv", "crawlArchive"].includes(kind);
-    if (workspaceOperation.current || (["auditWorkbook", "xlsx", "imageAltCsv", "crawlArchive"].includes(kind) && running) || (kind === "selectedCsv" && selectedRecordIds.length === 0)) return;
+    const captured = ["responseHeadersCsv", "rawHtmlCsv", "renderedHtmlCsv", "visibleTextCsv"].includes(kind);
+    const scoped = captured || ["auditWorkbook", "selectedCsv", "queuedUrlsCsv", "xlsx", "imageAltCsv", "crawlArchive"].includes(kind);
+    if (workspaceOperation.current || ((captured || ["auditWorkbook", "xlsx", "imageAltCsv", "crawlArchive"].includes(kind)) && running) || (kind === "selectedCsv" && selectedRecordIds.length === 0)) return;
     if (scoped) {
       workspaceOperation.current = true;
       setWorkspaceBusy(true);
@@ -4062,7 +4107,7 @@ export default function App() {
           kind,
           ...(kind === "selectedCsv" ? { recordIds: selectedRecordIds } : {}),
           query:
-            kind === "csv" || kind === "xlsx" || kind === "sitemap"
+            captured || kind === "csv" || kind === "xlsx" || kind === "sitemap"
               ? currentGridExportQuery()
               : null,
           graphQuery:
@@ -4109,51 +4154,13 @@ export default function App() {
     });
   };
 
-  const compareCrawlArchive = async () => {
-    if (!desktopRuntime || !comparisonArchivePath.trim()) {
-      return;
-    }
-    setComparisonLoading(true);
-    setComparisonResult(undefined);
-    const request = ++comparisonRequest.current;
-    try {
-      const result = await invoke<CrawlComparisonResponse>("compare_crawl_archive", {
-        request: { path: comparisonArchivePath.trim() },
-      });
-      if (request === comparisonRequest.current) setComparisonResult(result);
-    } catch (caught) {
-      if (request === comparisonRequest.current) setError(errorMessage(caught));
-    } finally {
-      if (request === comparisonRequest.current) setComparisonLoading(false);
-    }
-  };
-
-  const changeComparisonOpen = (open: boolean) => {
-    if (!open) { comparisonRequest.current += 1; setComparisonLoading(false); }
-    setComparisonOpen(open);
-  };
-
-  const compareSavedCrawls = async () => {
-    if (running || workspaceOperation.current || comparisonLoading || comparisonSelection.length !== 2) return;
+  const compareSavedCrawls = () => {
+    if (running || workspaceOperation.current || comparisonSelection.length !== 2) return;
     const sessions = comparisonSelection.map((id) => crawlSessions.find((session) => session.id === id));
     if (!sessions[0] || !sessions[1]) return;
     const pair = (sessions as [CrawlSession, CrawlSession]).sort((a, b) => a.createdAtMs - b.createdAtMs || a.id.localeCompare(b.id));
-    const request = ++comparisonRequest.current;
     setComparisonSessions(pair);
-    setComparisonResult(undefined);
-    setComparisonLoading(true);
     setComparisonOpen(true);
-    setError(undefined);
-    try {
-      const result = await invoke<CrawlComparisonResponse>("compare_crawl_sessions", {
-        baselineSessionId: pair[0].id, currentSessionId: pair[1].id,
-      });
-      if (request === comparisonRequest.current) setComparisonResult(result);
-    } catch (caught) {
-      if (request === comparisonRequest.current) setError(errorMessage(caught));
-    } finally {
-      if (request === comparisonRequest.current) setComparisonLoading(false);
-    }
   };
 
   const openSelectedUrl = async () => {
@@ -4273,7 +4280,7 @@ export default function App() {
                 <DropdownMenu.Separator className="dropdown-separator" />
                 <DropdownMenu.Item className="dropdown-item toolbar-menu-item" data-action="compare-crawls"
                   disabled={!desktopRuntime || running || summary.total === 0} onSelect={() => {
-                    setComparisonSessions(undefined); setComparisonResult(undefined); setComparisonOpen(true);
+                    setComparisonSessions(undefined); setComparisonOpen(true);
                   }}>
                   <FileText size={15} /><span>Compare crawls</span>
                 </DropdownMenu.Item>
@@ -4370,6 +4377,9 @@ export default function App() {
                 <DropdownMenu.Item className="dropdown-item" disabled={exportDisabled || running}
                   title={running ? "Stop the crawl to export image occurrences" : "Export images and alt text from all pages"}
                   onSelect={() => void exportFile("imageAltCsv")}>Image Alt Text CSV</DropdownMenu.Item>
+                {Object.entries(capturedExportLabels).map(([kind, label]) => <DropdownMenu.Item key={kind} className="dropdown-item"
+                  disabled={filteredExportDisabled || running} title={running ? "Stop the crawl to export captured data" : "Export retained evidence from the current filtered view"}
+                  onSelect={() => void exportFile(kind as ExportKind)}>{label}</DropdownMenu.Item>)}
                 <DropdownMenu.Item
                   className="dropdown-item"
                   disabled={filteredExportDisabled || running}
@@ -4701,13 +4711,36 @@ export default function App() {
             <div className="settings-layout">
               <aside className="settings-sidebar">
                 <input type="search" aria-label="Search settings" placeholder="Search settings…"
+                  aria-describedby={settingsControlMatches.length ? "settings-search-help" : undefined}
                   value={settingsSearch} onChange={(event) => {
                     const search = event.target.value;
                     setSettingsSearch(search);
-                    const matches = matchingSettingsTabs(search);
+                    const controls = matchingSettingsControls(settingsContentRef.current, search);
+                    setSettingsControlMatches(controls);
+                    const matches = matchingSettingsTabs(search, controls);
                     setCollapsedSettingsGroups(search.trim() ? settingsGroups.filter((group) => !matches.some((tab) => tab.group === group)) : settingsGroups);
                     if (matches.length && !matches.some((tab) => tab.id === settingsTab)) setSettingsTab(matches[0].id);
+                  }} onKeyDown={(event) => {
+                    if (event.key !== "Enter") return;
+                    event.preventDefault();
+                    const match = settingsControlMatches.find((item) => !item.disabled);
+                    if (match) focusSettingsControl(match);
                   }} />
+                {settingsControlMatches.length ? <div className="settings-control-search">
+                  <select aria-label="Matching settings controls" value="" onChange={(event) => {
+                    const match = settingsControlMatches[Number(event.target.value)];
+                    if (match) focusSettingsControl(match);
+                  }}>
+                    <option value="" disabled>Jump to control ({settingsControlMatches.length})</option>
+                    {visibleSettingsTabs.map((tab) => {
+                      const matches = settingsControlMatches.map((match, index) => ({ ...match, index })).filter((match) => match.tab === tab.id);
+                      return matches.length ? <optgroup key={tab.id} label={tab.label}>
+                        {matches.map((match) => <option key={match.index} value={match.index} disabled={match.disabled}>{match.label}{match.disabled ? " (unavailable)" : ""}</option>)}
+                      </optgroup> : null;
+                    })}
+                  </select>
+                  <p id="settings-search-help">Enter focuses the first available match. Unavailable: enable its options or wait for the crawl.</p>
+                </div> : null}
                 <nav className="settings-tabs" aria-label="Settings sections">
                   {settingsGroups.map((group) => {
                     const tabs = visibleSettingsTabs.filter((tab) => tab.group === group);
@@ -4764,8 +4797,53 @@ export default function App() {
                     <span>{activeSettingsTab.description}</span>
                   </div>
                 </div>
-            <section className="settings-section" data-settings-section="crawl" hidden={settingsTab !== "crawl"}>
-              <h3>Limits and Throughput</h3>
+            <section className="settings-section" data-settings-section="limits" hidden={settingsTab !== "limits"}>
+              <h3>Crawl budgets</h3>
+              <p id="crawl-limits-help" className="settings-save-note">Depth counts links from the seed (depth 0). Folder depth, URL length and links per page use 0 for unlimited; these discovery limits keep the seed and recorded link evidence.</p>
+              <div className="settings-grid">
+                <label>
+                  Max URLs
+                  <input
+                    type="number"
+                    min={1}
+                    value={settingsConfig.maxUrls}
+                    onChange={(event) => setSettingsConfig({ maxUrls: Number(event.target.value) })}
+                  />
+                </label>
+                <label>
+                  Depth
+                  <input
+                    type="number"
+                    min={0}
+                    aria-describedby="crawl-limits-help"
+                    value={settingsConfig.maxDepth}
+                    onChange={(event) => setSettingsConfig({ maxDepth: Number(event.target.value) })}
+                  />
+                </label>
+                {([["maxFolderDepth", "Max folder depth"], ["maxUrlLength", "Max URL length"], ["maxLinksPerPage", "Max links per page"]] as const).map(([key, label]) =>
+                  <label key={key} title="0 = unlimited. Applies to discovered URLs; the seed and link evidence are kept.">
+                    {label}
+                    <input type="number" min={0} step={1} aria-describedby="crawl-limits-help" value={settingsConfig[key]}
+                      onChange={(event) => setSettingsConfig({ [key]: Math.max(0, Math.floor(Number(event.target.value) || 0)) })} />
+                  </label>)}
+                <label>
+                  Redirect limit
+                  <input type="number" min={1} value={settingsConfig.maxRedirects}
+                    onChange={(event) => setSettingsConfig({ maxRedirects: Number(event.target.value) })} />
+                </label>
+                <label>
+                  Max response MiB
+                  <input type="number" min={1 / (1024 * 1024)} max={1024} step="any" required aria-describedby="response-limit-help"
+                    value={settingsConfig.maxResponseBytes / (1024 * 1024)}
+                    onChange={(event) => setSettingsConfig({ maxResponseBytes: Math.round(Number(event.target.value) * 1024 * 1024) })} />
+                </label>
+                <p id="response-limit-help" className="settings-wide settings-save-note">Caps each HTTP response, including robots.txt and sitemaps. Oversized responses are recorded without parsing. Browser rendering downloads are outside this limit.</p>
+              </div>
+            </section>
+
+            <section className="settings-section" data-settings-section="speed" hidden={settingsTab !== "speed"}>
+              <h3>Request pacing</h3>
+              <p id="crawl-speed-help" className="settings-save-note">Threads limits simultaneous requests across the crawl. RPS caps requests per second per host; Delay ms adds minimum request spacing. The site's crawl delay and Retry-After can make requests slower. Set RPS or Delay ms to 0 only to remove that limit.</p>
               <div className="settings-grid">
                 <div className="settings-preset-row settings-wide">
                   <button
@@ -4783,35 +4861,14 @@ export default function App() {
                     Benchmark preset: ignore robots
                   </button>
                 </div>
-                <label>
-                  Max URLs
-                  <input
-                    type="number"
-                    min={1}
-                    value={settingsConfig.maxUrls}
-                    onChange={(event) => setSettingsConfig({ maxUrls: Number(event.target.value) })}
-                  />
-                </label>
-                <label>
-                  Depth
-                  <input
-                    type="number"
-                    min={0}
-                    value={settingsConfig.maxDepth}
-                    onChange={(event) => setSettingsConfig({ maxDepth: Number(event.target.value) })}
-                  />
-                </label>
-                {([["maxFolderDepth", "Max folder depth"], ["maxUrlLength", "Max URL length"], ["maxLinksPerPage", "Max links per page"]] as const).map(([key, label]) =>
-                  <label key={key} title="0 = unlimited. Applies to discovered URLs; the seed and link evidence are kept.">
-                    {label}
-                    <input type="number" min={0} step={1} value={settingsConfig[key]}
-                      onChange={(event) => setSettingsConfig({ [key]: Math.max(0, Math.floor(Number(event.target.value) || 0)) })} />
-                  </label>)}
+                <p className="settings-wide settings-save-note">Default preset restores 8 threads, 10 RPS, 100 ms spacing and site robots rules. Benchmark preset removes pacing and robots protection, raises URL/depth budgets and uses 64 threads. Both presets also enable nofollow discovery; changes stay pending until Apply.</p>
                 <label>
                   Threads
                   <input
                     type="number"
                     min={1}
+                    aria-describedby="crawl-speed-help"
+                    data-settings-keywords="concurrency concurrent requests"
                     value={settingsConfig.concurrency}
                     onChange={(event) => setSettingsConfig({ concurrency: Number(event.target.value) })}
                   />
@@ -4821,6 +4878,8 @@ export default function App() {
                   <input
                     type="number"
                     min={0}
+                    aria-describedby="crawl-speed-help"
+                    data-settings-keywords="requests per second rate per host"
                     value={settingsConfig.requestsPerSecond}
                     onChange={(event) =>
                       setSettingsConfig({ requestsPerSecond: Number(event.target.value) })
@@ -4832,6 +4891,8 @@ export default function App() {
                   <input
                     type="number"
                     min={0}
+                    aria-describedby="crawl-speed-help"
+                    data-settings-keywords="minimum request spacing milliseconds"
                     value={settingsConfig.requestDelayMs}
                     onChange={(event) =>
                       setSettingsConfig({ requestDelayMs: Number(event.target.value) })
@@ -4844,6 +4905,7 @@ export default function App() {
                     type="number"
                     min={0}
                     max={5}
+                    aria-describedby="retry-help"
                     value={settingsConfig.retryAttempts}
                     onChange={(event) => setSettingsConfig({ retryAttempts: Number(event.target.value) })}
                   />
@@ -4854,22 +4916,24 @@ export default function App() {
                     type="number"
                     min={0}
                     max={30000}
+                    aria-describedby="retry-help"
                     value={settingsConfig.retryBackoffMs}
                     onChange={(event) => setSettingsConfig({ retryBackoffMs: Number(event.target.value) })}
                   />
                 </label>
                 <label>
-                  Dup bits
-                  <input
-                    type="number"
-                    min={0}
-                    max={64}
-                    value={settingsConfig.nearDuplicateThreshold}
-                    onChange={(event) =>
-                      setSettingsConfig({ nearDuplicateThreshold: Number(event.target.value) })
-                    }
-                  />
+                  Timeout seconds
+                  <input type="number" min={1} value={settingsConfig.timeoutSecs}
+                    onChange={(event) => setSettingsConfig({ timeoutSecs: Number(event.target.value) })} />
                 </label>
+                <p id="retry-help" className="settings-wide settings-save-note">Retries adds up to 5 attempts after a transient failure. Backoff ms is the initial wait, doubling after each retry to a maximum of 30 seconds. A server's Retry-After may require a longer wait.</p>
+              </div>
+            </section>
+
+            <section className="settings-section" data-settings-section="robots" hidden={settingsTab !== "robots"}>
+              <h3>Site access rules</h3>
+              <p id="robots-policy-help" className="settings-save-note">Respect robots.txt is enabled by default and applies to Spider and List crawls. An override replaces the downloaded rules with your draft text. Enable both options to edit or test an override; tests use the User-Agent from HTTP headers.</p>
+              <div className="settings-grid">
                 <CheckboxField
                   checked={settingsConfig.respectRobots}
                   onCheckedChange={(checked) => setSettingsConfig({ respectRobots: checked })}
@@ -4885,27 +4949,11 @@ export default function App() {
                 >
                   Override robots.txt
                 </CheckboxField>
-                <label>
-                  Timeout seconds
-                  <input type="number" min={1} value={settingsConfig.timeoutSecs}
-                    onChange={(event) => setSettingsConfig({ timeoutSecs: Number(event.target.value) })} />
-                </label>
-                <label>
-                  Redirect limit
-                  <input type="number" min={1} value={settingsConfig.maxRedirects}
-                    onChange={(event) => setSettingsConfig({ maxRedirects: Number(event.target.value) })} />
-                </label>
-                <label>
-                  Max response MiB
-                  <input type="number" min={1 / (1024 * 1024)} max={1024} step="any" required
-                    value={settingsConfig.maxResponseBytes / (1024 * 1024)}
-                    onChange={(event) => setSettingsConfig({ maxResponseBytes: Math.round(Number(event.target.value) * 1024 * 1024) })} />
-                </label>
-                <p className="settings-wide settings-save-note">Caps each HTTP response, including robots.txt and sitemaps. Oversized responses are recorded without parsing. Browser rendering downloads are outside this limit.</p>
                 <label className="settings-wide">
                   robots.txt override
                   <textarea
                     rows={4}
+                    aria-describedby="robots-policy-help"
                     disabled={!settingsConfig.respectRobots || !settingsConfig.useRobotsTxtOverride}
                     value={settingsConfig.robotsTxtOverride}
                     onChange={(event) =>
@@ -5236,6 +5284,21 @@ export default function App() {
               <h3>Content</h3>
               <p className="muted">Choose the text used for word counts and near-duplicate checks. Metadata and discovered links use the whole page.</p>
               <div className="settings-grid">
+                <label>
+                  Dup bits
+                  <input
+                    type="number"
+                    aria-describedby="near-duplicate-help"
+                    data-settings-keywords="near duplicate threshold similarity bits"
+                    min={0}
+                    max={64}
+                    value={settingsConfig.nearDuplicateThreshold}
+                    onChange={(event) =>
+                      setSettingsConfig({ nearDuplicateThreshold: Number(event.target.value) })
+                    }
+                  />
+                </label>
+                <p id="near-duplicate-help" className="settings-save-note">Maximum differing bits in the 64-bit text fingerprint (0–64). Higher values group less similar text. This applies to new crawl results; it does not recompute saved clusters.</p>
                 <label className="settings-wide">Include CSS selectors
                   <textarea aria-label="Content include selectors" rows={3} placeholder="main&#10;article" value={patternsToText(settingsConfig.content.includeSelectors)}
                     onChange={(event) => setSettingsConfig({ content: { ...settingsConfig.content, includeSelectors: event.target.value.split(/\r?\n/) } })} />
@@ -5347,14 +5410,25 @@ export default function App() {
                   })}
                 </tbody>
               </table>
-              <h3>Reference discovery</h3>
-              <p className="settings-save-note">Add referenced URLs to Spider crawls. Existing scope, resource permissions and robots rules apply; page metadata stays captured.</p>
-              <div className="settings-grid reference-discovery">
-                {([['canonical', 'Canonical targets'], ['hreflang', 'Hreflang targets'], ['pagination', 'Pagination (next / previous)'], ['amp', 'AMP targets'], ['metaRefresh', 'Meta refresh targets'], ['iframe', 'Iframe sources']] as const).map(([key, label]) =>
-                  <CheckboxField key={key} checked={settingsConfig.referenceLinks[key]} disabled={settingsConfig.mode === "list" || settingsConfig.folderScope === "exactUrl"}
-                    onCheckedChange={(checked) => setSettingsConfig({ referenceLinks: { ...settingsConfig.referenceLinks, [key]: checked } })}>{label}</CheckboxField>)}
-              </div>
-              {settingsConfig.mode === "list" || settingsConfig.folderScope === "exactUrl" ? <p className="settings-save-note">Reference discovery requires Spider mode with a wider scope than Exact URL.</p> : null}
+              <h3>Page references</h3>
+              <p className="settings-save-note">Crawl adds referenced URLs to Spider discovery using the existing scope, resource permissions and robots rules. Store keeps separate reference evidence in the URL inspector, without adding hyperlink counts. Audit metadata stays captured. Changes apply to future crawls.</p>
+              <table className="crawl-store-table reference-discovery">
+                <thead><tr><th scope="col">Reference</th><th scope="col">Crawl</th><th scope="col">Store</th></tr></thead>
+                <tbody>{referenceTypes.map(([key, label]) => {
+                  const crawlAllowed = settingsConfig.mode === "spider" && settingsConfig.folderScope !== "exactUrl";
+                  const crawled = crawlAllowed && settingsConfig.referenceLinks[key];
+                  return <tr key={key}>
+                    <th scope="row">{label}</th>
+                    <td><CheckboxField checked={settingsConfig.referenceLinks[key]} disabled={!crawlAllowed}
+                      onCheckedChange={(checked) => setSettingsConfig({ referenceLinks: { ...settingsConfig.referenceLinks, [key]: checked } })}>
+                      <span className="sr-only">Crawl {label}</span></CheckboxField></td>
+                    <td><CheckboxField checked={crawled || settingsConfig.store[key]} disabled={crawled}
+                      onCheckedChange={(checked) => setSettingsConfig({ store: { ...settingsConfig.store, [key]: checked } })}>
+                      <span className="sr-only">Store {label}</span></CheckboxField></td>
+                  </tr>;
+                })}</tbody>
+              </table>
+              <p className="settings-save-note">Crawled reference types are always stored. List mode and Exact URL keep Store editable while preserving your disabled Spider discovery choices.</p>
             </section>
 
             <section className="settings-section" data-settings-section="query" hidden={settingsTab !== "query"}>
@@ -5873,6 +5947,15 @@ export default function App() {
             </section>
 
             <section className="settings-section" data-settings-section="extraction" hidden={settingsTab !== "extraction"}>
+              <h3>Retain page evidence</h3>
+              <p className="muted">Opt in before crawling to keep evidence for inspection and filtered CSV exports. These choices apply to new captures; older pages stay unretained.</p>
+              <div className="settings-grid capture-settings">
+                {Object.entries(captureLabels).map(([key, label]) => <CheckboxField key={key} checked={settingsConfig.capture[key as CaptureKind]}
+                  onCheckedChange={(checked) => setSettingsConfig({ capture: { ...settingsConfig.capture, [key]: checked } })}>{label}</CheckboxField>)}
+                <label>Maximum bytes per retained body<input aria-label="Maximum capture bytes" type="number" min={1024} max={1_048_576}
+                  value={settingsConfig.capture.maxBytes} onChange={(event) => setSettingsConfig({ capture: { ...settingsConfig.capture, maxBytes: Number(event.target.value) } })} /></label>
+                <p className="settings-wide settings-save-note">Body limit: 1 KiB–1 MiB each. Response headers have a separate 64 KiB limit. Headers reflect the normalized HTTP client response, with known sensitive header values redacted; request, browser and original wire headers are not retained. Raw HTML is decoded response HTML; rendered HTML requires DOM rendering. Visible text follows the configured content area.</p>
+              </div>
               <div className="section-heading">
                 <h3>Custom Extraction</h3>
                 <button className="settings-action-button primary" onClick={addExtractor}>
@@ -6238,16 +6321,7 @@ export default function App() {
 
       {serpVisited ? <Suspense fallback={null}><SerpPreviewDialog open={serpOpen} onOpenChange={setSerpOpen}
         selected={selected ? { url: selected.url, title: selected.title ?? "", description: selected.metaDescription ?? "" } : undefined} /></Suspense> : null}
-      <ComparisonDialog
-        open={comparisonOpen}
-        onOpenChange={changeComparisonOpen}
-        archivePath={comparisonArchivePath}
-        onArchivePathChange={setComparisonArchivePath}
-        loading={comparisonLoading}
-        result={comparisonResult}
-        sessions={comparisonSessions}
-        onCompare={() => void (comparisonSessions ? compareSavedCrawls() : compareCrawlArchive())}
-      />
+      <ComparisonWorkspace open={comparisonOpen} onOpenChange={setComparisonOpen} sessions={comparisonSessions} />
 
       {!settingsOpen && !linkReportsOpen && !graphOpen && !comparisonOpen && !sessionDeleteOpen ? <FeedbackMessages /> : null}
       {pageSpeedActive ? <div className="notice-bar page-speed-running" role="status">
@@ -6263,7 +6337,7 @@ export default function App() {
         scopes={!activeCrawlScope ? [{ id: "custom", label: "Custom scope" }, ...crawlScopePresets] : crawlScopePresets}
         listUrls={config.listUrls} listSitemapCount={config.listSitemapUrls.filter((url) => url.trim()).length}
         sessions={crawlSessions} loading={sessionsLoading} error={sessionsError}
-        busy={workspaceBusy || comparisonLoading} running={running} desktop={desktopRuntime}
+        busy={workspaceBusy} running={running} desktop={desktopRuntime}
         workspaceAvailable={workspaceAvailable} selectedIds={comparisonSelection}
         onStartUrlChange={(startUrl) => setConfig({ startUrl })}
         onModeChange={(mode) => setConfig({ mode })}
@@ -6612,6 +6686,16 @@ export default function App() {
                       setSelectedLinkReport(detailTab === "inlinks" ? "selectedInlinks" : "selectedOutlinks");
                       setLinkReportSearch(""); setLinkReportsOpen(true);
                     }} />
+                </div>
+              ) : detailTab === "references" ? (
+                <div className="detail-link-panel" id="detail-panel-references" role="tabpanel" aria-labelledby="detail-tab-references">
+                  <SelectedReferencesPanel key={`${workspaceRevision}-${selected.storageKey}`} storageKey={selected.storageKey}
+                    live={running} enabled={desktopRuntime && workspaceAvailable && !workspaceBusy} />
+                </div>
+              ) : detailTab === "captured" ? (
+                <div className="detail-link-panel" id="detail-panel-captured" role="tabpanel" aria-labelledby="detail-tab-captured">
+                  <SelectedCapturedData key={`${workspaceRevision}-${selected.storageKey}`} storageKey={selected.storageKey}
+                    live={running} enabled={desktopRuntime && workspaceAvailable && !workspaceBusy} />
                 </div>
               ) : detailTab === "pagespeed" ? (
                 <div className="detail-content">
@@ -7016,13 +7100,13 @@ function handleTabKeys(event: KeyboardEvent<HTMLElement>) {
   tabs[next]?.click();
 }
 
-function ResultPagination({ pageIndex, total, visible, loading, onPageChange }: {
-  pageIndex: number; total: number; visible: number; loading: boolean; onPageChange: (page: number) => void;
+function ResultPagination({ pageIndex, total, visible, loading, onPageChange, pageSize = resultsPageSize }: {
+  pageIndex: number; total: number; visible: number; loading: boolean; onPageChange: (page: number) => void; pageSize?: number;
 }) {
-  const lastPage = Math.max(0, Math.ceil(total / resultsPageSize) - 1);
+  const lastPage = Math.max(0, Math.ceil(total / pageSize) - 1);
   return <div className="grid-pagination" aria-label="Result pages">
     <span role="status">{loading ? "Loading…" : total > 0
-      ? `${(pageIndex * resultsPageSize + 1).toLocaleString()}–${Math.min(total, pageIndex * resultsPageSize + visible).toLocaleString()} of ${total.toLocaleString()}`
+      ? `${(pageIndex * pageSize + 1).toLocaleString()}–${Math.min(total, pageIndex * pageSize + visible).toLocaleString()} of ${total.toLocaleString()}`
       : "0 results"}</span>
     <div>
       <button aria-label="First page" disabled={pageIndex === 0 || loading} onClick={() => onPageChange(0)}><ChevronsLeft size={16} /></button>
@@ -7437,140 +7521,6 @@ function Metric({
   );
 }
 
-function ComparisonDialog({
-  open,
-  onOpenChange,
-  archivePath,
-  onArchivePathChange,
-  loading,
-  result,
-  onCompare,
-  sessions,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  archivePath: string;
-  onArchivePathChange: (path: string) => void;
-  loading: boolean;
-  result?: CrawlComparisonResponse;
-  onCompare: () => void;
-  sessions?: [SavedCrawl, SavedCrawl];
-}) {
-  return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="modal-backdrop" />
-        <Dialog.Content className="comparison-modal" inert={!open}>
-          <div className="modal-header">
-            <Dialog.Title asChild>
-              <h2>Crawl Comparison</h2>
-            </Dialog.Title>
-            <Dialog.Close asChild>
-              <button title="Close crawl comparison">
-                <X size={16} />
-              </button>
-            </Dialog.Close>
-            <FeedbackMessages />
-          </div>
-
-          <div className="comparison-controls">
-            {sessions ? <div className="comparison-sessions">
-              <span><small>Baseline</small><strong>{sessions[0].name}</strong><time>{new Date(sessions[0].createdAtMs).toLocaleString()}</time></span>
-              <span><small>Current</small><strong>{sessions[1].name}</strong><time>{new Date(sessions[1].createdAtMs).toLocaleString()}</time></span>
-            </div> : <label>
-              Baseline crawl archive
-              <input
-                value={archivePath}
-                placeholder="/path/to/ferrous-frog-crawl-archive.ffcrawl.json"
-                onChange={(event) => onArchivePathChange(event.target.value)}
-              />
-            </label>}
-            <button
-              className="settings-action-button primary"
-              onClick={onCompare}
-              disabled={loading || (!sessions && !archivePath.trim())}
-            >
-              <FileText size={15} />
-              <span>{loading ? "Comparing" : "Compare"}</span>
-            </button>
-          </div>
-
-          {result ? (
-            <>
-              <div className="comparison-summary">
-                <Metric label="Baseline" value={result.baselineRecords} />
-                <Metric label="Current" value={result.currentRecords} />
-                <Metric label="Added" value={result.added} />
-                <Metric label="Removed" value={result.removed} tone="danger" />
-                <Metric label="Changed" value={result.changed} />
-                <Metric label="Status" value={result.statusChanged} tone="danger" />
-              </div>
-              <div className="comparison-deltas">
-                {result.metricDeltas.map((metric) => (
-                  <div key={metric.label}>
-                    <span>{metric.label}</span>
-                    <strong>{formatSignedDelta(metric.delta)}</strong>
-                    <em>
-                      {metric.previous.toLocaleString()} to{" "}
-                      {metric.current.toLocaleString()}
-                    </em>
-                  </div>
-                ))}
-              </div>
-              <div className="link-report-table-wrap comparison-table-wrap">
-                {result.added + result.removed + result.changed > result.rows.length ? <p className="comparison-limit">Showing the first {result.rows.length.toLocaleString()} changes. Summary counts include all URLs.</p> : null}
-                <table className="link-report-table comparison-table">
-                  <thead>
-                    <tr>
-                      <th>Change</th>
-                      <th>URL</th>
-                      <th>Status</th>
-                      <th>Title</th>
-                      <th>Indexability</th>
-                      <th>Hash</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {result.rows.map((row) => (
-                      <tr key={`${row.change}-${row.url}`}>
-                        <td>
-                          <span className={`severity-pill ${comparisonTone(row.change)}`}>
-                            {row.change}
-                          </span>
-                        </td>
-                        <td>{row.url}</td>
-                        <td>
-                          {statusCell(row.previousStatusCode)} to{" "}
-                          {statusCell(row.currentStatusCode)}
-                        </td>
-                        <td>
-                          {row.previousTitle || "None"} to {row.currentTitle || "None"}
-                        </td>
-                        <td>
-                          {row.previousIndexability || "None"} to{" "}
-                          {row.currentIndexability || "None"}
-                        </td>
-                        <td>
-                          {compactHash(row.previousResponseHash)} to{" "}
-                          {compactHash(row.currentResponseHash)}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
-          ) : (
-            <p className="link-report-empty">
-              {loading ? "Comparing saved crawl results…" : sessions ? "Compare these two saved crawls without changing the current workspace." : "Compare the current crawl against a previously exported crawl archive."}
-            </p>
-          )}
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
-  );
-}
-
 function LinkReportsDialog({
   open,
   onOpenChange,
@@ -7877,6 +7827,98 @@ function SitemapValidationReportTable({
       </table>
     </div>
   );
+}
+
+function SelectedCapturedData({ storageKey, live, enabled }: { storageKey: string; live: boolean; enabled: boolean }) {
+  const [kind, setKind] = useState<CaptureKind>("responseHeaders");
+  const [preview, setPreview] = useState<PageCapturePreview | null>();
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string>();
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    setPreview(undefined); setError(undefined);
+    const load = async () => {
+      if (!enabled) { setLoading(false); return; }
+      setLoading(true);
+      try {
+        const result = await invoke<PageCapturePreview | null>("get_page_capture", { sourceStorageKey: storageKey, kind });
+        if (!cancelled) { setPreview(result); setError(undefined); }
+      } catch (caught) {
+        if (!cancelled) setError(errorMessage(caught));
+      } finally {
+        if (!cancelled) { setLoading(false); if (live) timer = window.setTimeout(load, 1000); }
+      }
+    };
+    void load();
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [storageKey, kind, live, enabled, revision]);
+  return <section className="captured-data" aria-label="Selected URL captured data" aria-busy={loading}>
+    <div className="captured-data-controls"><label>Evidence<select aria-label="Captured data kind" value={kind} onChange={(event) => setKind(event.target.value as CaptureKind)}>{Object.entries(captureLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+      <button onClick={() => setRevision((value) => value + 1)} disabled={loading || !enabled}>Refresh</button></div>
+    {kind === "responseHeaders" ? <p className="detail-muted">Normalized HTTP client response headers; known sensitive values are redacted. Original wire, request and browser headers are not included.</p> : null}
+    {!enabled ? <p className="link-report-empty">Captured data is available after opening a desktop crawl.</p> : error ? <p className="link-report-empty" role="alert">{error}</p> : preview === undefined ? <p className="link-report-empty" role="status">Loading captured data…</p> : preview === null ? <p className="link-report-empty" role="status">Not retained for this URL occurrence. Enable this evidence in Settings → Extraction before a new crawl. Rendered HTML also requires DOM rendering.</p> : <>
+      <p className="detail-muted captured-data-source">{captureLabels[preview.kind]} · {preview.sourceUrl}{preview.finalUrl !== preview.sourceUrl ? ` → ${preview.finalUrl}` : ""}</p>
+      {preview.storedTruncated ? <p className="captured-data-warning" role="status">Capture truncated at its configured storage limit.</p> : null}
+      {preview.previewTruncated ? <p className="captured-data-warning" role="status">Preview limited to 64 KiB. Export the retained data to inspect the remaining text.</p> : null}
+      <pre className="captured-data-preview">{preview.text || "Empty retained value"}</pre>
+    </>}
+  </section>;
+}
+
+function SelectedReferencesPanel({ storageKey, live, enabled }: { storageKey: string; live: boolean; enabled: boolean }) {
+  const pageSize = 100;
+  const [response, setResponse] = useState<PageReferencesResponse>({ references: [], total: 0 });
+  const [page, setPage] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    setResponse({ references: [], total: 0 });
+    setError(undefined);
+    const load = async () => {
+      if (!enabled) { setLoading(false); return; }
+      setLoading(true);
+      try {
+        const result = await invoke<PageReferencesResponse>("page_references", { query: {
+          sourceStorageKey: storageKey, offset: page * pageSize, limit: pageSize,
+        } });
+        if (cancelled) return;
+        const last = Math.max(0, Math.ceil(result.total / pageSize) - 1);
+        if (page > last) { setPage(last); return; }
+        setResponse(result);
+        setError(undefined);
+      } catch (caught) {
+        if (!cancelled) setError(errorMessage(caught));
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+          if (live) timer = window.setTimeout(load, 1000);
+        }
+      }
+    };
+    void load();
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [storageKey, page, live, enabled, revision]);
+
+  return <section className="selected-references" aria-label="Selected URL references" aria-busy={loading}>
+    {!enabled ? <p className="link-report-empty">Stored references are available in the desktop app after the crawl opens.</p> :
+      error ? <div className="link-report-empty" role="alert"><p>{error}</p><button onClick={() => setRevision((value) => value + 1)}>Retry</button></div> :
+      loading && response.references.length === 0 ? <p className="link-report-empty">Loading references…</p> :
+      response.references.length === 0 ? <p className="link-report-empty">No stored references for this URL. Reference Store choices apply to future crawls; older saved crawls may need recrawling.</p> :
+      <div className="link-report-table-wrap"><table className="link-report-table">
+        <thead><tr><th scope="col">Type</th><th scope="col">Source URL</th><th scope="col">Target URL</th><th scope="col">Nofollow</th></tr></thead>
+        <tbody>{response.references.map((reference) => <tr key={reference.id}>
+          <td>{referenceTypes.find(([kind]) => kind === reference.kind)?.[1] ?? reference.kind}</td>
+          <td title={reference.sourceUrl}>{reference.sourceUrl}</td><td title={reference.targetUrl}>{reference.targetUrl}</td>
+          <td>{reference.relNofollow ? "Yes" : "No"}</td>
+        </tr>)}</tbody>
+      </table></div>}
+    <ResultPagination pageIndex={page} pageSize={pageSize} total={response.total} visible={response.references.length} loading={loading} onPageChange={setPage} />
+  </section>;
 }
 
 function SelectedLinksPanel({ record, direction, live, enabled, onOpenReport }: {
@@ -8852,29 +8894,6 @@ function statusCell(status?: number | null) {
   return String(status);
 }
 
-function formatSignedDelta(value: number) {
-  if (value > 0) {
-    return `+${value.toLocaleString()}`;
-  }
-  return value.toLocaleString();
-}
-
-function comparisonTone(change: string) {
-  if (change === "removed") {
-    return "error";
-  }
-  if (change === "changed") {
-    return "warning";
-  }
-  return "info";
-}
-
-function compactHash(value?: string | null) {
-  if (!value) {
-    return "None";
-  }
-  return value.length > 10 ? `${value.slice(0, 10)}...` : value;
-}
 
 function formatTime(timestamp: number) {
   return new Date(timestamp).toLocaleTimeString([], {

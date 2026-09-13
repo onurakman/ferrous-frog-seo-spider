@@ -48,6 +48,12 @@ function setupFixture(mockIPC, emit) {
   window.testQueries = [];
   window.testLinkQueries = [];
   window.testLinkDelays = {};
+  window.testReferenceQueries = [];
+  window.testReferenceDelays = {};
+  window.testCaptureQueries = [];
+  window.testCaptureDelays = {};
+  window.testComparisonRequests = [];
+  window.testPendingComparisons = [];
   window.testDuplicates = false;
   window.testEmptyDataset = false;
   window.testSearchDelays = {};
@@ -208,6 +214,32 @@ function setupFixture(mockIPC, emit) {
       })), totalNodes, totalEdges: 3,
       };
     }
+    if (cmd === "get_page_capture") {
+      window.testCaptureQueries.push(args);
+      const retained = window.testCaptureRetained && args.kind !== "renderedHtml";
+      const result = retained ? { ...args, sourceUrl: args.sourceStorageKey, finalUrl: "https://example.test/final", storedTruncated: args.kind === "rawHtml", previewTruncated: args.kind === "visibleText",
+        text: args.kind === "responseHeaders" ? '[{"name":"set-cookie","value":"[redacted]"},{"name":"x-fixture","value":"one"},{"name":"x-fixture","value":"two"}]'
+          : args.kind === "rawHtml" ? '<main><img src=x onerror="window.testCaptureExecuted = true">Saved ' + args.sourceStorageKey + '</main>' : 'Visible text for ' + args.sourceStorageKey } : null;
+      const fail = window.testCaptureFailure;
+      await new Promise((resolve) => setTimeout(resolve, window.testCaptureDelays[args.sourceStorageKey + '|' + args.kind] ?? 15));
+      if (fail) throw new Error("Captured data could not be read");
+      return result;
+    }
+    if (cmd === "page_references") {
+      window.testReferenceQueries.push(args.query);
+      const sourceStorageKey = args.query.sourceStorageKey;
+      const session = window.testOpenedSession ?? "new-crawl";
+      await new Promise((resolve) => setTimeout(resolve, window.testReferenceDelays[sourceStorageKey] ?? 15));
+      if (window.testReferenceFailure) throw new Error("Reference query failed");
+      const total = window.testReferenceTotal ?? 205;
+      const kinds = ["canonical", "hreflang", "pagination", "amp", "metaRefresh", "iframe"];
+      return { references: Array.from({ length: Math.max(0, Math.min(args.query.limit, total - args.query.offset)) }, (_, index) => {
+        const id = args.query.offset + index + 1;
+        return { id, sourceStorageKey, sourceUrl: "https://example.test/reference-source",
+          targetUrl: `https://references.test/${session}/${encodeURIComponent(sourceStorageKey)}/${id}`,
+          kind: kinds[(id - 1) % kinds.length], relNofollow: id % 2 === 0 };
+      }), total };
+    }
     if (cmd === "get_link_edges") {
       window.testLinkQueries.push(args.query);
       await new Promise((resolve) => setTimeout(resolve, window.testLinkDelays[args.query.targetUrl] ?? 15));
@@ -254,12 +286,76 @@ function setupFixture(mockIPC, emit) {
       }
       return;
     }
-    if (cmd === "compare_crawl_sessions") {
-      window.testComparisonIds = [args.baselineSessionId, args.currentSessionId];
-      if (window.testCompareFailure) throw new Error("Saved crawl could not be compared");
-      return { baselineRecords: 1200, currentRecords: 1205, added: 8, removed: 3, changed: 12, statusChanged: 2,
-        titleChanged: 8, metaDescriptionChanged: 3, indexabilityChanged: 1, hashChanged: 12, metricDeltas: [],
-        rows: [{ url: "https://example.test/changed", change: "changed", previousStatusCode: 404, currentStatusCode: 200, previousTitle: "Old title", currentTitle: "New title" }] };
+    if (cmd === "open_crawl_comparison" || cmd === "query_crawl_comparison" || cmd === "export_crawl_comparison") {
+      const opening = cmd === "open_crawl_comparison";
+      const request = opening ? args.request : args;
+      const query = opening ? { search: "", change: "all", includeResponseOnly: false, sortBy: "url", sortDir: "asc", offset: 0, limit: 100 } : args.query;
+      window.testComparisonRequests.push({ command: cmd, ...request, ...query });
+      if (opening) {
+        if (request.baselineSessionId) window.testComparisonIds = [request.baselineSessionId, request.currentSessionId];
+        if (window.testCompareFailure) throw new Error("Saved crawl could not be compared");
+        const responseCount = window.testComparisonOnlyResponses ? 205 : 500;
+        const responseRows = Array.from({ length: responseCount }, (_, index) => ({ key: 10000 + index, url: `https://example.test/response-only-${String(index).padStart(4, '0')}`, change: "responseOnly", changedFields: ["responseHash"], contentComparison: "unavailable", previousResponseHash: "response-old", currentResponseHash: "response-new" }));
+        const extra = window.testComparisonManyRows ? 1250 : 0;
+        const snapshot = window.testComparisonOnlyResponses
+          ? { baselineRecords: 205, currentRecords: 205, added: 0, removed: 0, changed: 0, statusChanged: 0, titleChanged: 0, metaDescriptionChanged: 0,
+            indexabilityChanged: 0, hashChanged: 205, contentChanged: 0, responseOnly: 205, contentUnavailable: 205, metricDeltas: [], rows: responseRows }
+          : { baselineRecords: 1200 + extra, currentRecords: 1205 + extra, added: 8, removed: 3, changed: 12 + extra, statusChanged: 2,
+            titleChanged: 8 + extra, metaDescriptionChanged: 3, indexabilityChanged: 1, hashChanged: 512, contentChanged: 4, responseOnly: 500, contentUnavailable: 33,
+            metricDeltas: [{ label: "Structured data errors", previous: 2, current: 1, delta: -1 }],
+            rows: [{ key: 1, url: "https://example.test/changed", change: "changed", previousStatusCode: 404, currentStatusCode: 200, previousTitle: "Old title", currentTitle: "New title",
+              previousMetaDescription: "Old description", currentMetaDescription: "New description", changedFields: ["statusCode", "title", "metaDescription", "content"], contentComparison: "changed" },
+            { key: 2, url: "https://example.test/legacy", change: "changed", changedFields: ["headings", "canonical", "robotsDirectives"], contentComparison: "unavailable" },
+            ...Array.from({ length: 21 + extra }, (_, index) => ({ key: index + 3, url: `https://example.test/zz-page-${String(index).padStart(4, '0')}`, change: index < 8 ? "added" : index < 11 ? "removed" : "changed", previousTitle: `Before ${index}`, currentTitle: `After ${index}`, changedFields: index < 11 ? [] : ["title"], contentComparison: index < 11 ? "notApplicable" : "unchanged" })), ...responseRows] };
+        if (window.testComparisonIdentities) {
+          Object.assign(snapshot, { baselineRecords: 4, currentRecords: 4, added: 0, removed: 0, changed: 4, responseOnly: 0,
+            statusChanged: 0, titleChanged: 4, metaDescriptionChanged: 0, indexabilityChanged: 0, hashChanged: 0, contentChanged: 0, contentUnavailable: 4, metricDeltas: [],
+            rows: [
+              { key: 41, url: 'https://example.test/repeated', occurrence: 1, previousListPosition: 2, currentListPosition: 7, previousUrl: 'HTTPS://EXAMPLE.TEST:443/repeated#old', currentUrl: 'https://example.test/repeated#new', previousFinalUrl: 'https://example.test/old-target', currentFinalUrl: 'https://example.test/new-target', previousTitle: 'First occurrence', currentTitle: 'First updated', changedFields: ['finalUrl', 'title'] },
+              { key: 42, url: 'https://example.test/repeated', occurrence: 2, previousListPosition: 5, currentListPosition: 8, previousTitle: 'Second occurrence', currentTitle: 'Second updated', changedFields: ['title'] },
+              { key: 43, url: 'https://example.test/alias-a', previousFinalUrl: 'https://example.test/shared', currentFinalUrl: 'https://example.test/shared', changedFields: ['title'] },
+              { key: 44, url: 'https://example.test/alias-b', previousFinalUrl: 'https://example.test/shared', currentFinalUrl: 'https://example.test/shared', changedFields: ['title'] },
+            ].map((row) => ({ change: 'changed', contentComparison: 'unavailable', ...row })) });
+        }
+        snapshot.rows = snapshot.rows.map((row) => ({ occurrence: 1, previousUrl: row.change === 'added' ? null : row.url, currentUrl: row.change === 'removed' ? null : row.url,
+          previousFinalUrl: row.change === 'added' ? null : row.url, currentFinalUrl: row.change === 'removed' ? null : row.url, previousListPosition: null, currentListPosition: null,
+          ...row, identityKey: `${row.occurrence ?? 1}:${row.url}` }));
+        (window.testComparisonSnapshots ??= {})[request.comparisonId] = snapshot;
+      }
+      const snapshot = window.testComparisonSnapshots?.[request.comparisonId];
+      if (!snapshot) throw new Error("Comparison is closed");
+      const filtered = snapshot.rows.filter((row) => (query.includeResponseOnly || query.change === "responseOnly" || row.change !== "responseOnly")
+        && (query.change === "all" || row.change === query.change) && (!query.changedField || row.changedFields.includes(query.changedField))
+        && (!query.search || [row.url, row.previousTitle, row.currentTitle].join(' ').toLowerCase().includes(query.search.toLowerCase())));
+      filtered.sort((a, b) => {
+        const left = a[query.sortBy] ?? '', right = b[query.sortBy] ?? '';
+        const comparison = typeof left === "number" && typeof right === "number" ? left - right : String(left).localeCompare(String(right));
+        return (comparison || a.key - b.key) * (query.sortDir === "desc" ? -1 : 1);
+      });
+      if (cmd === "export_crawl_comparison") {
+        window.testComparisonExport = { comparisonId: args.comparisonId, query, rows: filtered.length };
+        if (window.testHoldComparisonExport) await new Promise((resolve) => { window.testFinishComparisonExport = resolve; });
+        return { path: "/tmp/comparison.csv", rowCount: filtered.length };
+      }
+      const response = { summary: { ...snapshot, rows: [] }, total: filtered.length, offset: query.offset, limit: query.limit, rows: filtered.slice(query.offset, query.offset + query.limit) };
+      if (window.testHoldComparison) await new Promise((resolve) => { window.testPendingComparisons.push(resolve); });
+      // A delayed async native handler can publish after the frontend has already closed its ID.
+      if (opening && window.testLateComparisonPublication) window.testComparisonSnapshots[request.comparisonId] = snapshot;
+      return response;
+    }
+    if (cmd === "get_crawl_comparison_detail") {
+      const row = window.testComparisonSnapshots?.[args.comparisonId]?.rows.find((item) => item.key === args.key);
+      if (!row) throw new Error("Comparison row is missing");
+      const result = { row, previous: row.change === "added" ? null : { ...records[0], url: row.previousUrl, finalUrl: row.previousFinalUrl, listPosition: row.previousListPosition, title: row.previousTitle, metaDescription: row.previousMetaDescription, statusCode: row.previousStatusCode,
+        structuredDataIssues: [{ severity: "error", path: "$.offers", message: "Missing offer price" }], contentHash: "previous-content-hash", responseHash: "previous-full-response-hash" },
+        current: row.change === "removed" ? null : { ...records[0], url: row.currentUrl, finalUrl: row.currentFinalUrl, listPosition: row.currentListPosition, title: row.currentTitle, metaDescription: row.currentMetaDescription, statusCode: row.currentStatusCode, structuredDataIssues: [], contentHash: "current-content-hash", responseHash: "current-full-response-hash" } };
+      if (window.testHoldComparisonDetail) await new Promise((resolve) => { (window.testPendingComparisonDetails ??= []).push(resolve); });
+      return result;
+    }
+    if (cmd === "close_crawl_comparison") {
+      (window.testClosedComparisons ??= []).push(args.comparisonId);
+      delete window.testComparisonSnapshots?.[args.comparisonId];
+      return;
     }
     if (cmd === "list_config_profiles") return window.testProfiles ?? (window.testProfile ? [window.testProfile] : []);
     if (cmd === "load_config_profile") {
@@ -586,7 +682,14 @@ try {
   };
   const selectProfile = (id) => evaluate(`(() => { const select = document.querySelector('.settings-section:not([hidden]) select'); select.value = ${JSON.stringify(id)}; select.dispatchEvent(new Event('change', { bubbles: true })); })()`);
   const setting = (label) => `.settings-section:not([hidden]) label[data-test-setting=${JSON.stringify(label)}] input`;
-  const markSetting = (label) => evaluate(`[...document.querySelectorAll('.settings-section:not([hidden]) label')].find((item) => item.firstChild.textContent.trim() === ${JSON.stringify(label)}).setAttribute('data-test-setting', ${JSON.stringify(label)})`);
+  const markSetting = async (label) => {
+    const section = await evaluate(`(() => {
+      const item = [...document.querySelectorAll('.settings-section label')].find((item) => item.firstChild.textContent.trim() === ${JSON.stringify(label)});
+      item.setAttribute('data-test-setting', ${JSON.stringify(label)});
+      return item.closest('[data-settings-section]').dataset.settingsSection;
+    })()`);
+    await select("Settings section", section);
+  };
   const toggleSetting = (label) => evaluate(`[...document.querySelectorAll('.settings-section:not([hidden]) .checkbox-field')].find((item) => item.textContent.trim() === ${JSON.stringify(label)}).querySelector('[role="checkbox"]').click()`);
   const savedSettings = () => evaluate("JSON.parse(localStorage.getItem('ferrous-frog-settings'))");
   const applySettings = async () => {
@@ -706,12 +809,143 @@ try {
   await click('[data-session-id="fixture-current"] input[type="checkbox"]');
   await click('[data-session-id="fixture-baseline"] input[type="checkbox"]');
   assert.ok(await evaluate("document.querySelector('[data-session-id=\"fixture-other\"] input[type=\"checkbox\"]').disabled"), "Comparison selection must stop at two crawls");
+  await evaluate("document.querySelector('[data-action=\"compare-saved-crawls\"]').focus()");
   await click('[data-action="compare-saved-crawls"]');
   await until("document.querySelector('.comparison-table')?.textContent.includes('New title')", "Selecting two saved crawls must open their comparison");
   assert.deepEqual(await evaluate("testComparisonIds"), ["fixture-baseline", "fixture-current"], "The older crawl must be the comparison baseline");
   assert.ok(await evaluate("document.querySelector('.comparison-sessions')?.textContent.includes('Example baseline')"), "Comparison must identify its saved crawls");
   assert.equal(await evaluate("window.testOpenedSession"), undefined, "Comparison must not replace the active crawl");
+  assert.equal(await evaluate("testComparisonRequests.at(-1).includeResponseOnly"), false, "Saved comparisons must exclude response-only rows in the backend by default");
+  assert.ok(await evaluate("!document.querySelector('.comparison-table').textContent.includes('response-only') && document.querySelector('.comparison-options [role=\"checkbox\"]').getAttribute('aria-checked') === 'false'"), "Raw response changes must not appear as ordinary content changes");
+  assert.deepEqual(await evaluate("Object.fromEntries([...document.querySelectorAll('.comparison-summary .metric')].map((metric) => [metric.querySelector('span').textContent, metric.querySelector('strong').textContent]))"),
+    { Baseline: '1,200', Current: '1,205', Added: '8', Removed: '3', Changed: '12', Status: '2', Titles: '8', Descriptions: '3', Indexability: '1', 'Content changes': '4', 'Response-only': '500', 'Content unavailable': '33' }, "Comparison counters must distinguish text changes, raw-only changes and unavailable legacy content");
+  assert.ok(await evaluate("['HTTP status, Title, Meta description, Content', 'Headings, Canonical, Robots directives', 'Old description to New description', 'Unavailable', 'Response hash'].every((text) => document.querySelector('.comparison-table').textContent.includes(text))"), "Comparison rows must show readable reasons, descriptions and content availability");
+  const comparisonTheme = await evaluate("document.documentElement.classList.contains('dark')");
+  for (const [width, height] of [[1280, 840], [390, 640]]) {
+    await cdp("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
+    assert.ok(await evaluate("document.querySelector('.comparison-body').scrollWidth <= document.querySelector('.comparison-body').clientWidth && document.querySelector('.comparison-controls button').getBoundingClientRect().right <= document.querySelector('.comparison-modal').getBoundingClientRect().right"), "Comparison filters and controls must fit small windows while the wide table scrolls");
+    for (const theme of ["dark", "light"]) {
+      await evaluate(`document.documentElement.classList.toggle('dark', ${theme === "dark"})`);
+      assert.ok(await contrast('.comparison-options', '.comparison-modal') >= 4.5, `Comparison content guidance must stay readable in ${theme} mode`);
+    }
+  }
+  await cdp("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+  await evaluate(`document.documentElement.classList.toggle('dark', ${comparisonTheme})`);
+  await click('.comparison-options [role="checkbox"]');
+  await until("testComparisonRequests.at(-1).includeResponseOnly && document.querySelector('.comparison-table')?.textContent.includes('Response only')", "Response-only opt-in must query the saved-session backend again");
+  await evaluate("testHoldComparison = true; testPendingComparisons = []");
+  await click('.comparison-options [role="checkbox"]');
+  await until("testPendingComparisons.length === 1", "The older comparison filter request must be in flight");
+  await click('.comparison-options [role="checkbox"]');
+  await until("testPendingComparisons.length === 2", "The comparison filter must remain usable while a query is pending");
+  await evaluate("testPendingComparisons[1]()");
+  await until("document.querySelector('.comparison-table')?.textContent.includes('Response only')", "The latest filter response must appear first");
+  await evaluate("testPendingComparisons[0](); testHoldComparison = false; testPendingComparisons = []");
+  await delay(150);
+  assert.ok(await evaluate("document.querySelector('.comparison-table').textContent.includes('Response only') && document.querySelector('.comparison-options [role=\"checkbox\"]').getAttribute('aria-checked') === 'true'"), "An older filtered result must not overwrite the latest comparison");
+  await click('.comparison-table [data-comparison-key="1"]');
+  await until("document.querySelector('.comparison-detail-table')?.textContent.includes('previous-full-response-hash')", "Selected changes must load full record values without truncated hashes");
+  await click('.comparison-detail-title button');
+  assert.ok(await evaluate("document.querySelector('.comparison-detail').getBoundingClientRect().height > 700 && getComputedStyle(document.querySelector('.comparison-results')).display === 'none'"), "Expand details must dedicate the work area to inspecting a URL");
+  await fill('[aria-label="Find comparison detail field"]', 'Structured data issues');
+  assert.ok(await evaluate("document.querySelector('.comparison-detail-table').textContent.includes('Missing offer price') && document.querySelector('.comparison-detail-table').textContent.includes('[]')"), "Previous and current captured audit evidence must be inspectable side by side");
+  await fill('[aria-label="Find comparison detail field"]', '');
+  if (process.env.UI_SCREENSHOT) {
+    for (const [width, height] of [[1440, 900], [390, 640]]) {
+      await cdp("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
+      if (width < 700) {
+        assert.ok(await evaluate("document.querySelector('.comparison-detail-table th:last-child').getBoundingClientRect().right <= document.querySelector('.comparison-modal').getBoundingClientRect().right && document.querySelector('.comparison-body').scrollWidth <= document.querySelector('.comparison-body').clientWidth"), "Narrow detail views must show both previous and current columns without horizontal overflow");
+      }
+      const shot = await captureScreenshot();
+      await writeFile(`${process.env.UI_SCREENSHOT}.comparison-${width}.png`, Buffer.from(shot.data, "base64"));
+    }
+    await cdp("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+  }
+  await click('.comparison-detail-title button');
+  await until("getComputedStyle(document.querySelector('.comparison-results')).display !== 'none' && document.querySelector('.comparison-table tr[aria-selected=\"true\"]')?.dataset.comparisonKey === '1'", "Returning to changes must preserve the selected comparison row");
+  await evaluate("testHoldComparisonDetail = true; testPendingComparisonDetails = []");
+  await click('.comparison-table [data-comparison-key="1"]');
+  await until("testPendingComparisonDetails.length === 1", "The first detail request must remain pending");
+  await click('.comparison-table [data-comparison-key="2"]');
+  await until("testPendingComparisonDetails.length === 2", "Selection must remain usable while details load");
+  await evaluate("testPendingComparisonDetails[1]()");
+  await until("document.querySelector('.comparison-detail-header h3')?.textContent.endsWith('/legacy')", "The latest selected URL must appear first");
+  await evaluate("testPendingComparisonDetails[0](); testHoldComparisonDetail = false");
+  await delay(150);
+  assert.ok(await evaluate("document.querySelector('.comparison-detail-header h3').textContent.endsWith('/legacy')"), "A late detail must not replace the current selected URL");
+  await evaluate("document.querySelector('.comparison-table [data-comparison-key=\"1\"]').focus()");
+  await pressKey("ArrowDown");
+  await until("document.activeElement.dataset.comparisonKey === '2'", "Arrow keys must move focus and selection through comparison rows");
+  await evaluate("testComparisonManyRows = true");
+  await click('.comparison-controls button');
+  await until("document.querySelector('.comparison-limit')?.textContent.includes('of 1,273 matching changes')", "Prepared comparison must retain changes beyond the old 1,000-row limit");
+  assert.ok(await evaluate("document.querySelectorAll('.comparison-table [data-comparison-key]').length < 100"), "Comparison DOM rows must remain virtualized within each server page");
+  await fill('[aria-label="Comparison page"]', '13');
+  await evaluate("document.querySelector('[aria-label=\"Comparison page\"]').focus()");
+  await pressKey("Enter");
+  await until("testComparisonRequests.at(-1).offset === 1200 && document.querySelector('.comparison-limit')?.textContent.includes('1,201–1,273')", "Page navigation must fetch rows beyond 1,000 from the backend");
+  await fill('[aria-label="Search comparison"]', 'zz-page');
+  await select("Comparison change", "changed");
+  await select("Comparison changed field", "title");
+  await select("Comparison sort", "currentTitle");
+  await select("Comparison sort direction", "desc");
+  await until("testComparisonRequests.at(-1).sortDir === 'desc' && document.querySelector('.comparison-limit')?.textContent.includes('of 1,260 matching changes')", "Search, reason, change and sort controls must query the complete comparison");
+  assert.deepEqual(await evaluate("(({ search, change, changedField, sortBy, sortDir, offset, limit }) => ({ search, change, changedField, sortBy, sortDir, offset, limit }))(testComparisonRequests.at(-1))"),
+    { search: 'zz-page', change: 'changed', changedField: 'title', sortBy: 'currentTitle', sortDir: 'desc', offset: 0, limit: 100 }, "Comparison filters must reset pagination and remain server-side");
+  await click('.comparison-filters button');
+  await until("document.querySelector('.comparison-feedback')?.textContent.includes('Exported 1,260 matching changes')", "Filtered CSV must include every match rather than the visible page");
+  assert.equal(await evaluate("testComparisonExport.rows"), 1260);
+  await evaluate("testHoldComparisonExport = true");
+  await click('.comparison-filters button');
+  await until("typeof testFinishComparisonExport === 'function'", "Export must be pending for the stale-result check");
+  await fill('[aria-label="Search comparison"]', 'no-matches');
+  await until("document.querySelector('.comparison-limit')?.textContent.includes('No matching changes')", "An empty server filter must have a clear state");
+  await evaluate("testFinishComparisonExport(); testHoldComparisonExport = false");
+  await delay(150);
+  assert.ok(await evaluate("!document.querySelector('.comparison-feedback')?.textContent.includes('Exported')"), "A completed export from an older filter must not show a stale notice");
+  await evaluate("testComparisonIdentities = true");
+  await click('.comparison-controls button');
+  await until("document.querySelector('.comparison-limit')?.textContent.includes('of 4 matching changes')", "Repeated List occurrences and redirect aliases must remain separate comparison rows");
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('.comparison-table [data-comparison-key]')].map((row) => row.dataset.comparisonIdentity).sort()"), ['1:https://example.test/alias-a', '1:https://example.test/alias-b', '1:https://example.test/repeated', '2:https://example.test/repeated']);
+  assert.ok(await evaluate("document.querySelector('.comparison-table [data-comparison-key=\"41\"]').textContent.includes('2 to 7') && document.querySelector('.comparison-table').textContent.includes('https://example.test/new-target')"), "Rows must expose occurrence positions and changed final destinations");
+  await click('.comparison-table [data-comparison-key="41"]');
+  await until("document.querySelector('.comparison-detail-header')?.textContent.includes('Occurrence 1') && document.querySelector('.comparison-detail-table')?.textContent.includes('HTTPS://EXAMPLE.TEST:443/repeated#old')", "Identity details must retain captured literal URLs and occurrence evidence");
+  await click('.comparison-table [data-comparison-key="42"]');
+  await until("document.querySelector('.comparison-detail-header')?.textContent.includes('Occurrence 2') && document.querySelector('.comparison-detail-table')?.textContent.includes('Second updated')", "Selecting a repeated URL must inspect its own occurrence");
+  if (process.env.UI_SCREENSHOT) {
+    const shot = await captureScreenshot();
+    await writeFile(`${process.env.UI_SCREENSHOT}.comparison-identity.png`, Buffer.from(shot.data, "base64"));
+  }
+  await select('Comparison changed field', 'finalUrl');
+  await until("testComparisonRequests.at(-1).changedField === 'finalUrl' && document.querySelector('.comparison-limit')?.textContent.includes('of 1 matching changes')", "Final-destination changes must be a backend filter");
+  await click('.comparison-filters button');
+  await until("testComparisonExport.query.changedField === 'finalUrl' && testComparisonExport.rows === 1", "Identity comparisons must preserve destination filters for CSV");
+  await evaluate("testComparisonIdentities = false");
+  await evaluate("testHoldComparison = true; testPendingComparisons = []; testLateComparisonPublication = true");
+  await click('.comparison-controls button');
+  await until("testPendingComparisons.length === 1", "Preparation must be pending before closing its workspace");
+  const closingComparison = await evaluate("testComparisonRequests.at(-1).comparisonId");
   await click('[title="Close crawl comparison"]');
+  await until("!document.querySelector('.comparison-modal')", "Closing must remove the full workspace");
+  assert.ok(await evaluate(`testClosedComparisons.includes(${JSON.stringify(closingComparison)})`), "Closing must retire even a pending native comparison");
+  const nativePreparationsBeforeReopen = await evaluate("testComparisonRequests.filter((request) => request.command === 'open_crawl_comparison').length");
+  await click('[data-action="compare-saved-crawls"]');
+  await until("document.querySelector('.comparison-modal')?.textContent.includes('Preparing comparison')", "A rapid reopen must wait while its older preparation finishes");
+  await delay(100);
+  assert.equal(await evaluate("testComparisonRequests.filter((request) => request.command === 'open_crawl_comparison').length"), nativePreparationsBeforeReopen, "A new native preparation must wait until the older one has closed");
+  await click('[title="Close crawl comparison"]');
+  await until("!document.querySelector('.comparison-modal')", "A queued preparation must remain closable");
+  await click('[data-action="compare-saved-crawls"]');
+  await until("document.querySelector('.comparison-modal')?.textContent.includes('Preparing comparison')", "A later reopen must replace the superseded queued request");
+  await evaluate("testHoldComparison = false; testComparisonManyRows = false; testPendingComparisons[0]()");
+  await until(`!testComparisonSnapshots[${JSON.stringify(closingComparison)}] && testClosedComparisons.filter((id) => id === ${JSON.stringify(closingComparison)}).length === 2`, "A late native preparation must be closed again after publication to remove its temporary workspace");
+  await until("document.querySelector('.comparison-table')?.textContent.includes('New title')", "The newest reopened comparison must become ready after stale cleanup");
+  assert.equal(await evaluate("testComparisonRequests.filter((request) => request.command === 'open_crawl_comparison').length"), nativePreparationsBeforeReopen + 1, "Superseded queued preparations must never invoke the backend");
+  await evaluate("testLateComparisonPublication = false");
+  await click('[title="Close crawl comparison"]');
+  await until("!document.querySelector('.comparison-modal') && document.activeElement.dataset.action === 'compare-saved-crawls'", "Closing a reopened workspace must return focus to the library opener");
+  assert.equal(await evaluate("Object.keys(testComparisonSnapshots).length"), 0, "Closed and superseded comparisons must release every prepared snapshot");
+  assert.equal(await evaluate("window.testOpenedSession"), undefined, "Paging, detail and export must preserve the active crawl");
   await evaluate("window.testHistoryFixtures = testSessions; window.testSessions = []");
   await click('[aria-label="Refresh saved crawls"]');
   await until("document.querySelector('.crawl-history-empty')?.textContent.includes('No saved crawls')", "An empty library must offer a clear first-crawl state");
@@ -780,10 +1014,14 @@ try {
     get_url_tree: { nodes: [], totalUrls: 9999, renderedUrls: 0, capped: true },
     get_crawl_graph: { nodes: [], edges: [], totalNodes: 9999, totalEdges: 0 },
     get_recovery_state: { recoverable: true, queued: 9999, seen: 9999, crawled: 9999 },
-    get_database_location: { path: '/tmp/stale-crawl.sqlite3' }
+    get_database_location: { path: '/tmp/stale-crawl.sqlite3' },
+    page_references: { references: [{ id: 999, sourceStorageKey: 'https://example.test/page-1', sourceUrl: 'https://stale.test/',
+      targetUrl: 'https://stale.test/old-reference', kind: 'canonical', relNofollow: false }], total: 1 }
   }; window.testRecovery = undefined`);
   await click('.data-table tbody tr:not(.virtual-spacer)');
   await until("window.testPendingQueries?.get_crawl_path", "The old crawl path must be in flight");
+  await click('#detail-tab-references');
+  await until("window.testPendingQueries?.page_references", "The old crawl references must be in flight");
   await click('[aria-label="Tree view"]');
   await until("window.testPendingQueries?.get_url_tree", "The old tree must be in flight");
   await openGraph();
@@ -796,6 +1034,11 @@ try {
   await click('[data-session-id="fixture-other"] [data-action="open-saved-crawl"]');
   await until("document.querySelector('.data-table tbody tr:not(.virtual-spacer)') && !document.querySelector('.crawl-home')", "Another crawl must open while older queries are pending");
   await click('.data-table tbody tr:not(.virtual-spacer)');
+  await until("document.querySelector('.selected-references tbody')?.textContent.includes('fixture-other')", "The opened crawl must load its own stored references");
+  await evaluate("window.testPendingQueries.page_references()");
+  await delay(150);
+  assert.ok(await evaluate("document.querySelector('.selected-references tbody')?.textContent.includes('fixture-other') && !document.querySelector('.selected-references').textContent.includes('stale.test')"), "Older reference responses must not replace the same URL in another session");
+  await click('#detail-tab-page');
   await until("document.querySelector('.crawl-path-detail')?.textContent.includes('No internal path found')", "The opened crawl must load its own path");
   await click('[aria-label="Tree view"]');
   await until("document.querySelector('.url-tree-toolbar')?.textContent.includes('1,205')", "The opened crawl must load its own tree");
@@ -1053,6 +1296,12 @@ try {
   await exportMenu('CSV');
   await until("testExportRequest?.kind === 'csv'", "Filtered CSV must remain available");
   assert.deepEqual(await evaluate("testExportRequest.query.filters"), combinedFilter, "Grid exports must preserve the full advanced filter group");
+  for (const [label, kind] of [['Response Headers CSV', 'responseHeadersCsv'], ['Raw HTML CSV', 'rawHtmlCsv'], ['Rendered HTML CSV', 'renderedHtmlCsv'], ['Visible Text CSV', 'visibleTextCsv']]) {
+    await exportMenu(label);
+    await until(`testExportRequest?.kind === ${JSON.stringify(kind)} && !document.querySelector('[title="Start crawl"]').disabled`, "Captured-data exports must finish through the native export command");
+    assert.deepEqual(await evaluate("testExportRequest.query.filters"), combinedFilter, "Captured-data exports must preserve advanced filters");
+  }
+
   await click('[aria-label="Tree view"]');
   await until("testTreeQuery?.filters?.rules.length === 2", "The directory tree must use the same filters as the grid");
   assert.deepEqual(await evaluate("testTreeQuery.filters"), combinedFilter);
@@ -1180,6 +1429,8 @@ try {
   assert.equal(await evaluate("[...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === 'Audit Workbook (XLSX)').getAttribute('aria-disabled')"), "true", "Workbook reports require a stopped or completed crawl");
   assert.equal(await evaluate("[...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === 'XLSX').getAttribute('aria-disabled')"), "true", "Paged XLSX reports require a stable stopped crawl");
   assert.equal(await evaluate("[...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === 'Image Alt Text CSV').getAttribute('aria-disabled')"), "true", "Paged image reports require a stable stopped crawl");
+  assert.ok(await evaluate("['Response Headers CSV', 'Raw HTML CSV', 'Rendered HTML CSV', 'Visible Text CSV'].every((label) => [...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === label).getAttribute('aria-disabled') === 'true')"), "Captured evidence exports require a stopped crawl");
+
   assert.equal(await evaluate("[...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === 'Crawl Archive').getAttribute('aria-disabled')"), "true", "Archives require a stopped or completed crawl");
   await pressKey("Escape");
   await click('[title="Pause crawl"]');
@@ -1251,6 +1502,114 @@ try {
   await until("document.querySelector('.selected-links.outlinks tbody tr') && !document.querySelector('.selected-links [role=\"alert\"]')", "Retry must recover an inline link query");
   await click('#detail-tab-inlinks');
   await until("document.querySelector('.selected-links.inlinks tbody tr')", "The inlinks tab should remain usable after changing direction");
+  const beforeReferenceScenario = await evaluate("({ url: document.querySelector('.detail-url').textContent, session: testOpenedSession, linkDelays: testLinkDelays, desktop: window.isTauri })");
+  await click('#detail-tab-references');
+  await until("document.querySelectorAll('.selected-references tbody tr').length === 100", "References must load a bounded engine page in the URL inspector");
+  assert.deepEqual(await evaluate("testReferenceQueries.at(-1)"), { sourceStorageKey: "https://example.test/page-2", offset: 0, limit: 100 }, "Reference evidence must query the selected storage occurrence");
+  assert.deepEqual(await evaluate("[...document.querySelectorAll('.selected-references tbody tr')].slice(0, 6).map((row) => row.cells[0].textContent)"),
+    ["Canonical targets", "Hreflang targets", "Pagination (next / previous)", "AMP targets", "Meta refresh targets", "Iframe sources"], "All reference types must retain their labels");
+  assert.equal(await evaluate("document.querySelectorAll('.selected-references tbody tr')[1].cells[3].textContent"), "Yes", "Reference nofollow evidence must remain visible");
+  const referenceViewport = await evaluate("({ width: innerWidth, height: innerHeight })");
+  const referenceTheme = await evaluate("document.documentElement.classList.contains('dark')");
+  for (const [width, height] of [[1280, 840], [390, 640]]) {
+    await cdp("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
+    assert.ok(await evaluate("document.querySelector('.selected-references').scrollWidth <= document.querySelector('.selected-references').clientWidth && document.querySelector('.selected-references .link-report-table-wrap').scrollHeight > document.querySelector('.selected-references .link-report-table-wrap').clientHeight"), "Reference evidence must scroll inside its bounded inspector at every window width");
+    for (const theme of ["dark", "light"]) {
+      await evaluate(`document.documentElement.classList.toggle('dark', ${theme === "dark"})`);
+      assert.ok(await contrast('.selected-references .link-report-table', '.detail-panel') >= 4.5, `Reference evidence must remain readable in ${theme} mode`);
+    }
+  }
+  await cdp("Emulation.setDeviceMetricsOverride", { ...referenceViewport, deviceScaleFactor: 1, mobile: false });
+  await evaluate(`document.documentElement.classList.toggle('dark', ${referenceTheme})`);
+  await click('.selected-references [aria-label="Last page"]');
+  await until("testReferenceQueries.at(-1).offset === 200 && document.querySelectorAll('.selected-references tbody tr').length === 5 && document.querySelector('.selected-references .grid-pagination').textContent.includes('201–205 of 205')", "References must page beyond the first 100 entries");
+  await click('.data-table tbody tr:not(.virtual-spacer)');
+  await until("testReferenceQueries.at(-1).sourceStorageKey === 'https://example.test/page-1' && testReferenceQueries.at(-1).offset === 0 && document.querySelector('.selected-references tbody')?.textContent.includes('page-1')", "Changing URL must reset reference paging");
+  await evaluate("testReferenceDelays['https://example.test/page-2'] = 600; document.querySelectorAll('.data-table tbody tr:not(.virtual-spacer)')[1].click()");
+  await until("testReferenceQueries.at(-1).sourceStorageKey === 'https://example.test/page-2'", "An old reference request must be in flight");
+  await click('.data-table tbody tr:not(.virtual-spacer)');
+  await until("document.querySelector('.selected-references tbody')?.textContent.includes('page-1')", "The current reference selection must load independently");
+  await delay(700);
+  assert.ok(await evaluate("!document.querySelector('.selected-references tbody').textContent.includes('page-2')"), "Stale references must not replace a newer selected URL");
+  await evaluate("window.__TAURI_INTERNALS__.invoke('get_rows', { query: { offset: 0, limit: 1 } }).then(({ rows }) => testEmit({ kind: 'record', record: { ...rows[0], storageKey: 'list:1:https://example.test/page-1' } }))");
+  await until("testReferenceQueries.at(-1).sourceStorageKey === 'list:1:https://example.test/page-1' && document.querySelector('.selected-references tbody')?.textContent.includes('list%3A1')", "List reference queries must keep the first occurrence's identity");
+  await click('.selected-references [aria-label="Last page"]');
+  await until("testReferenceQueries.at(-1).offset === 200 && document.querySelectorAll('.selected-references tbody tr').length === 5", "Repeated List rows must retain paged evidence");
+  await evaluate("window.__TAURI_INTERNALS__.invoke('get_rows', { query: { offset: 0, limit: 1 } }).then(({ rows }) => testEmit({ kind: 'record', record: { ...rows[0], storageKey: 'list:2:https://example.test/page-1' } }))");
+  await until("testReferenceQueries.at(-1).sourceStorageKey === 'list:2:https://example.test/page-1' && testReferenceQueries.at(-1).offset === 0 && document.querySelector('.selected-references tbody')?.textContent.includes('list%3A2')", "A second occurrence of the same URL must load its own first reference page");
+  await click('.data-table tbody tr:not(.virtual-spacer)');
+  await until("testReferenceQueries.at(-1).sourceStorageKey === 'https://example.test/page-1' && document.querySelector('.selected-references tbody')?.textContent.includes('page-1')", "The original fixture row must be restored before live grid updates");
+  await evaluate("testReferenceDelays['https://example.test/page-1'] = 1250; window.testSlowReferenceStart = testReferenceQueries.length; testEmit({ kind: 'started' })");
+  await until("testReferenceQueries.length > testSlowReferenceStart && document.querySelector('.selected-references').getAttribute('aria-busy') === 'true'", "Live reference refresh must enter its loading state");
+  await until("document.querySelector('.selected-references tbody')?.textContent.includes('page-1') && document.querySelector('.selected-references').getAttribute('aria-busy') === 'false'", "Slow live references must settle without overlapping requests");
+  assert.equal(await evaluate("testReferenceQueries.length - testSlowReferenceStart"), 1, "Reference polling must wait until the prior request settles");
+  await evaluate("testReferenceDelays = {}; testReferenceFailure = true; testEmit({ kind: 'finished' })");
+  await until("document.querySelector('.selected-references [role=\"alert\"]')?.textContent.includes('Reference query failed')", "Reference failures must stay inside their inspector panel");
+  await evaluate("testReferenceFailure = false; testReferenceTotal = 0; document.querySelector('.selected-references [role=\"alert\"] button').click()");
+  await until("document.querySelector('.selected-references .link-report-empty')?.textContent.includes('No stored references')", "Retry must recover into a clear empty state for older crawls");
+  const referencesBeforePreview = await evaluate("testReferenceQueries.length");
+  await evaluate("window.isTauri = false; document.querySelector('#detail-tab-page').click()");
+  await click('#detail-tab-references');
+  await until("document.querySelector('.selected-references .link-report-empty')?.textContent.includes('desktop app')", "The browser preview must explain unavailable reference storage");
+  assert.equal(await evaluate("testReferenceQueries.length"), referencesBeforePreview, "Browser mode must not request desktop reference data");
+  await evaluate("window.isTauri = true; testReferenceDelays = {}; testReferenceFailure = false; testReferenceTotal = undefined; document.querySelector('#detail-tab-page').click()");
+  await click('#detail-tab-captured');
+  await until("document.querySelector('.captured-data')?.textContent.includes('Not retained for this URL occurrence')", "Older or uncaptured pages must have an explicit retention state");
+  assert.deepEqual(await evaluate("testCaptureQueries.at(-1)"), { sourceStorageKey: 'https://example.test/page-1', kind: 'responseHeaders' }, "Captured data must query only the selected occurrence and representation");
+  await evaluate("testCaptureRetained = true");
+  await click('.captured-data-controls button');
+  await until("document.querySelector('.captured-data-preview')?.textContent.includes('[redacted]')", "Captured headers must remain plain normalized evidence with redaction");
+  await select('Captured data kind', 'rawHtml');
+  await until("document.querySelector('.captured-data-preview')?.textContent.includes('<main>') && document.querySelector('.captured-data')?.textContent.includes('Capture truncated')", "Raw HTML must identify storage truncation");
+  assert.ok(await evaluate("!document.querySelector('.captured-data-preview img') && !window.testCaptureExecuted"), "Captured HTML must never execute or create HTML nodes");
+  const capturePanels = await evaluate("({ issues: document.querySelector('.issue-sidebar').dataset.state === 'open', overview: document.querySelector('.overview-panel').dataset.state === 'open' })");
+  for (const [width, height] of [[1280, 840], [390, 740]]) {
+    await cdp("Emulation.setDeviceMetricsOverride", { width, height, deviceScaleFactor: 1, mobile: false });
+    if (width === 390) {
+      if (capturePanels.issues) await click('[aria-label="Close audit views"]');
+      if (capturePanels.overview) await click('[aria-label="Close overview"]');
+    }
+    await until("document.getAnimations().every((animation) => animation.playState !== 'running' || animation.effect?.getTiming().iterations === Infinity)", "The responsive side panels must settle before measuring captured data");
+    assert.ok(await evaluate("document.querySelector('.captured-data').scrollWidth <= document.querySelector('.captured-data').clientWidth && document.querySelector('[aria-label=\"Captured data kind\"]').getBoundingClientRect().right <= innerWidth"), "Captured data controls and text must stay inside narrow detail panels");
+    assert.ok(await evaluate("(() => { const select = document.querySelector('[aria-label=\"Captured data kind\"]'), rect = select.getBoundingClientRect(); return rect.width > 100 && document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2) === select; })()"), "Captured data choices must remain visible and reachable at every window width");
+    if (process.env.UI_SCREENSHOT) {
+      const shot = await captureScreenshot();
+      await writeFile(`${process.env.UI_SCREENSHOT}.captured-data-${width}.png`, Buffer.from(shot.data, "base64"));
+    }
+  }
+  await cdp("Emulation.setDeviceMetricsOverride", { width: 1280, height: 840, deviceScaleFactor: 1, mobile: false });
+  if (capturePanels.issues) await click('[aria-label="Toggle audit views"]');
+  if (capturePanels.overview) await click('[aria-label="Toggle overview"]');
+  await evaluate("testCaptureDelays['https://example.test/page-1|visibleText'] = 600");
+  await select('Captured data kind', 'visibleText');
+  await until("testCaptureQueries.at(-1).kind === 'visibleText'", "The first evidence request must be pending before switching kind");
+  await select('Captured data kind', 'renderedHtml');
+  await until("document.querySelector('.captured-data')?.textContent.includes('Not retained')", "Unretained rendered HTML must not show another representation");
+  await delay(700);
+  assert.ok(await evaluate("!document.querySelector('.captured-data-preview')"), "A late representation response must not replace the selected kind");
+  await evaluate("testCaptureDelays = {}");
+  await select('Captured data kind', 'visibleText');
+  await until("document.querySelector('.captured-data')?.textContent.includes('Preview limited to 64 KiB')", "Preview truncation must be distinguished from storage truncation");
+  await evaluate("window.__TAURI_INTERNALS__.invoke('get_rows', { query: { offset: 0, limit: 1 } }).then(({ rows }) => testEmit({ kind: 'record', record: { ...rows[0], storageKey: 'list:2:https://example.test/page-1' } }))");
+  await until("testCaptureQueries.at(-1).sourceStorageKey === 'list:2:https://example.test/page-1' && document.querySelector('.captured-data-preview')?.textContent.includes('[redacted]')", "Another List occurrence must receive its own evidence and reset to the initial representation");
+  await evaluate("testCaptureDelays['https://example.test/page-2|responseHeaders'] = 600; document.querySelectorAll('.data-table tbody tr:not(.virtual-spacer)')[1].click()");
+  await until("testCaptureQueries.at(-1).sourceStorageKey === 'https://example.test/page-2'", "Old selected-URL evidence must be pending");
+  await click('.data-table tbody tr:not(.virtual-spacer)');
+  await until("document.querySelector('.captured-data-source')?.textContent.includes('page-1')", "The new occurrence evidence must load independently");
+  await delay(700);
+  assert.ok(await evaluate("!document.querySelector('.captured-data-source').textContent.includes('page-2')"), "Late captured data must not replace a new selected URL");
+  await evaluate("testCaptureFailure = true; testCaptureDelays = {}");
+  await click('.captured-data-controls button');
+  await until("document.querySelector('.captured-data [role=\"alert\"]')?.textContent.includes('could not be read')", "Captured data errors must stay in the selected URL panel");
+  await evaluate("testCaptureFailure = false");
+  await click('.captured-data-controls button');
+  await until("!document.querySelector('.captured-data [role=\"alert\"]') && document.querySelector('.captured-data-preview')", "Refresh must recover a failed evidence query");
+  await click('#detail-tab-page');
+
+  await evaluate("document.querySelectorAll('.data-table tbody tr:not(.virtual-spacer)')[1].click()");
+  await click('#detail-tab-inlinks');
+  await until("document.querySelector('.selected-links.inlinks tbody tr td:nth-child(3)')?.textContent === 'https://example.test/page-2' && document.querySelector('[title=\"Start crawl\"]')", "Reference inspection must restore the original selected row, stopped state and inlinks tab");
+  assert.deepEqual(await evaluate("({ url: document.querySelector('.detail-url').textContent, session: testOpenedSession, linkDelays: testLinkDelays, desktop: window.isTauri })"), beforeReferenceScenario, "Reference checks must leave the original selection, session, link delays and desktop mode unchanged");
   await click('#inspection-tab-issues');
   await until("document.querySelector('#inspection-panel-issues:not([hidden]) .issue-summary-table')", "The right inspector must show issue counts");
   await evaluate("[...document.querySelectorAll('.issue-summary-table button')].find((button) => button.textContent.includes('Duplicate Titles')).click()");
@@ -1262,7 +1621,7 @@ try {
     await click('[aria-label="Toggle audit views"]');
   }
   await click('.selected-links [title="Open full link report"]');
-  await until("document.querySelector('.link-report-modal [aria-label=\"Last page\"]')", "URL details must give direct access to paged inlinks");
+  await until("document.querySelector('.link-report-modal [aria-label=\"Last page\"]')?.disabled === false", "URL details must load paged inlinks before navigation");
   await click('.link-report-modal [aria-label="Last page"]');
   await until("document.querySelector('.link-report-modal')?.textContent.includes('Link 1205')", "Link reports must reach beyond the first 500 edges");
   await evaluate("[...document.querySelectorAll('.link-report-tabs button')].find((button) => button.textContent === 'Sitemap Validation').click()");
@@ -1703,7 +2062,7 @@ try {
   await chooseMode("spider");
   const beforeCrawlControls = await savedSettings();
   await click('[aria-label="Crawl settings"]');
-  await settingsTab("Crawl");
+  await settingsTab("Limits");
   await markSetting("Max response MiB");
   assert.equal(await evaluate(`document.querySelector(${JSON.stringify(setting("Max response MiB"))}).value`), "20", "HTTP responses must have a visible default download limit");
   await fill(setting("Max response MiB"), "0");
@@ -1737,7 +2096,7 @@ try {
   assert.deepEqual(await savedSettings(), beforeCrawlControls, "Cancel must discard response and nested sitemap edits");
   await until("document.querySelector('.settings-modal[data-state=\"open\"]')?.contains(document.activeElement)", "Reopening Settings during its exit must restore focus inside the retained dialog");
   assert.ok(await evaluate("document.querySelector('.settings-modal') === window.testClosingSettingsNode"), "Rapid reopening must retain the existing dialog content");
-  await settingsTab("Crawl");
+  await settingsTab("Limits");
   await markSetting("Max response MiB");
   await fill(setting("Max response MiB"), "32");
   await settingsTab("Sitemaps");
@@ -1760,11 +2119,23 @@ try {
   await settingsTab("Sitemaps");
   assert.equal(await evaluate("document.querySelector('[aria-label=\"Spider sitemap URLs\"]').value"), "https://example.test/map.xml\nhttps://example.test/catalog.xml", "Sitemap sources must survive reopening");
   await settingsTab('Resources');
-  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery [role=\"checkbox\"]')].every((item) => item.getAttribute('aria-checked') === 'false')"), 'Reference discovery must preserve legacy off defaults');
-  await toggleSetting('Canonical targets');
-  await toggleSetting('Hreflang targets');
+  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery td:nth-child(2) [role=\"checkbox\"]')].every((item) => item.getAttribute('aria-checked') === 'false')"), 'Reference discovery must preserve legacy off defaults');
+  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery td:nth-child(3) [role=\"checkbox\"]')].every((item) => item.getAttribute('aria-checked') === 'true' && !item.disabled)"), 'Reference Store choices must default to enabled without requesting targets');
+  const referenceStoreBefore = await savedSettings();
+  const referenceStoreLabels = ['Canonical targets', 'Hreflang targets', 'Pagination (next / previous)', 'AMP targets', 'Meta refresh targets', 'Iframe sources'];
+  for (const label of referenceStoreLabels) await toggleSetting(`Store ${label}`);
+  assert.deepEqual(await savedSettings(), referenceStoreBefore, 'Reference retention changes must remain pending until Apply');
+  await toggleSetting('Crawl Canonical targets');
+  await toggleSetting('Crawl Hreflang targets');
+  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery tbody tr')].slice(0, 2).every((row) => { const store = row.querySelector('td:nth-child(3) [role=\"checkbox\"]'); return store.disabled && store.getAttribute('aria-checked') === 'true'; })"), 'Crawled reference types must visibly force Store on');
   await applySettings();
   assert.deepEqual((await savedSettings()).config.referenceLinks, { canonical: true, hreflang: true, pagination: false, amp: false, metaRefresh: false, iframe: false }, 'Reference types must save independently');
+  for (const kind of ['canonical', 'hreflang', 'pagination', 'amp', 'metaRefresh', 'iframe']) {
+    assert.equal((await savedSettings()).config.store[kind], false, `The explicit ${kind} Store preference must save independently of effective Crawl forcing`);
+  }
+  await toggleSetting('Crawl Canonical targets');
+  assert.ok(await evaluate("document.querySelector('.reference-discovery tbody tr td:nth-child(3) [role=\"checkbox\"]').getAttribute('aria-checked') === 'false' && !document.querySelector('.reference-discovery tbody tr td:nth-child(3) [role=\"checkbox\"]').disabled"), 'Turning Crawl off must restore the explicit Store choice');
+  await toggleSetting('Crawl Canonical targets');
   await settingsTab('Thresholds');
   await markSetting("Title maximum");
   await fill(setting("Title maximum"), "50");
@@ -1828,7 +2199,8 @@ try {
   await reloadApp();
   await click('[aria-label="Crawl settings"]');
   await settingsTab('Resources');
-  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery .checkbox-field')].find((field) => field.textContent.trim() === 'Canonical targets').querySelector('[role=\"checkbox\"]').getAttribute('aria-checked') === 'true'"), 'Reference discovery must survive reopening');
+  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery .checkbox-field')].find((field) => field.textContent.trim() === 'Crawl Canonical targets').querySelector('[role=\"checkbox\"]').getAttribute('aria-checked') === 'true'"), 'Reference discovery must survive reopening');
+  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery .checkbox-field')].find((field) => field.textContent.trim() === 'Store Meta refresh targets').querySelector('[role=\"checkbox\"]').getAttribute('aria-checked') === 'false'"), 'Explicit reference Store choices must survive reopening');
   await settingsTab('Sitemaps');
   if (process.env.UI_SCREENSHOT) {
     for (const [width, height] of [[1280, 840], [390, 640]]) {
@@ -1847,19 +2219,24 @@ try {
   await settingsTab("Sitemaps");
   assert.ok(await evaluate("[...document.querySelectorAll('[data-settings-section=\"sitemaps\"] [role=\"checkbox\"], [aria-label=\"Spider sitemap URLs\"]')].every((item) => item.disabled)"), "Exact URL scope must disable all sitemap discovery");
   await settingsTab('Resources');
-  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery [role=\"checkbox\"]')].every((item) => item.disabled)"), 'Exact URL scope must disable reference discovery without clearing its preferences');
+  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery td:nth-child(2) [role=\"checkbox\"]')].every((item) => item.disabled)"), 'Exact URL scope must disable reference discovery without clearing its preferences');
+  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery td:nth-child(3) [role=\"checkbox\"]')].every((item) => !item.disabled && item.getAttribute('aria-checked') === 'false')"), 'Exact URL must allow independent retention even with saved Spider Crawl choices');
+  await toggleSetting('Store Canonical targets');
   await click('[data-action="cancel-settings"]');
   await chooseMode("list");
   await click('[aria-label="Crawl settings"]');
   await settingsTab("Sitemaps");
   assert.ok(await evaluate("[...document.querySelectorAll('[data-settings-section=\"sitemaps\"] [role=\"checkbox\"], [aria-label=\"Spider sitemap URLs\"]')].every((item) => item.disabled)"), "List mode must use its own sitemap sources");
   await settingsTab('Resources');
-  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery [role=\"checkbox\"]')].every((item) => item.disabled)"), 'List mode must keep reference discovery disabled');
+  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery td:nth-child(2) [role=\"checkbox\"]')].every((item) => item.disabled)"), 'List mode must keep reference discovery disabled');
+  assert.ok(await evaluate("[...document.querySelectorAll('.reference-discovery td:nth-child(3) [role=\"checkbox\"]')].every((item) => !item.disabled && item.getAttribute('aria-checked') === 'false')"), 'List mode must preserve all Store choices independently of disabled Crawl preferences');
+  await toggleSetting('Store Iframe sources');
   await click('[data-action="cancel-settings"]');
+  assert.equal((await savedSettings()).config.store.iframe, false, 'Cancel must discard pending reference Store choices');
   await chooseMode("spider");
   await click('[aria-label="Crawl settings"]');
   await until("document.querySelector('.settings-modal')", "Settings must open");
-  await settingsTab("Crawl");
+  await settingsTab("Limits");
   const beforeDraft = await savedSettings();
   for (const [label, value] of [["Threads", "8"], ["RPS", "10"], ["Delay ms", "100"]]) {
     await markSetting(label);
@@ -1875,7 +2252,7 @@ try {
   await fill(setting("Threads"), "0");
   await settingsTab("Query");
   await click('[data-action="apply-settings"]');
-  await until("document.querySelector('.settings-tab-button[aria-current=\"page\"]')?.textContent.trim() === 'Crawl' && document.activeElement.type === 'number'", "Invalid values in hidden sections must reveal and focus their control");
+  await until("document.querySelector('.settings-tab-button[aria-current=\"page\"]')?.textContent.trim() === 'Speed' && document.activeElement.type === 'number'", "Invalid values in hidden sections must reveal and focus their control");
   assert.deepEqual(await savedSettings(), beforeDraft, "Invalid numeric settings must not be saved");
   await fill(setting("Threads"), "18");
   await evaluate("window.testConfigurationValidationFailure = true");
@@ -1915,7 +2292,7 @@ try {
   await evaluate("[...document.querySelectorAll('.settings-modal button')].find((button) => button.textContent.trim() === 'Open Database').click()");
   await until("window.testFinishWorkspace", "The database operation must reach the native command");
   assert.ok(await evaluate("document.querySelector('.settings-content').disabled && document.querySelector('[data-action=\"ok-settings\"]').disabled"), "A pending workspace change must lock draft editing and Apply/OK");
-  await settingsTab("Crawl");
+  await settingsTab("Limits");
   await markSetting("Threads");
   await fill(setting("Threads"), "99");
   assert.ok(await evaluate("document.querySelector('[data-action=\"apply-settings\"]').disabled"), "Late input events must not dirty a locked draft");
@@ -1930,7 +2307,7 @@ try {
   await until("testEmptyDataset && document.querySelector('.detail-empty') && !document.querySelector('.detail-header')", "Opening a different crawl must clear the previous URL selection while retaining the inspector layout");
   await until("!document.querySelector('.settings-content').disabled", "Finishing the workspace action must unlock Settings");
   assert.equal(await evaluate("document.querySelector('.settings-section:not([hidden]) input[readonly]').value"), "SQLite", "The clean draft must follow the newly opened database");
-  await settingsTab("Crawl");
+  await settingsTab("Limits");
   await markSetting("Threads");
   assert.equal(await evaluate(`document.querySelector(${JSON.stringify(setting("Threads"))}).value`), String(beforeDraft?.config.concurrency ?? 8), "A pending database operation must preserve the last applied threads value");
   await fill(setting("Threads"), "5");
@@ -1981,6 +2358,22 @@ try {
   await openMode();
   await click('[data-action="compare-crawls"]');
   await until("document.querySelector('.comparison-modal')", "Mode must directly open the existing comparison workflow");
+  assert.equal(await evaluate("document.querySelector('.comparison-options [role=\"checkbox\"]').getAttribute('aria-checked')"), 'false', "Opening an archive comparison must reset the response-only option");
+  await fill('[aria-label="Baseline crawl archive"]', '/tmp/baseline.ffcrawl.json');
+  await click('.comparison-controls button');
+  await until("testComparisonRequests.at(-1).command === 'open_crawl_comparison' && document.querySelector('.comparison-table')?.textContent.includes('New description')", "Archive comparisons must use the same prepared result view");
+  assert.equal(await evaluate("testComparisonRequests.at(-1).archivePath"), '/tmp/baseline.ffcrawl.json', "Archive preparation must receive its path inside the native request");
+  await evaluate("testComparisonOnlyResponses = true");
+  await click('.comparison-controls button');
+  await until("document.querySelector('.comparison-limit')?.textContent.includes('No matching changes')", "A fresh archive snapshot must hide raw-only changes by default");
+  const archivePreparations = await evaluate("testComparisonRequests.filter((request) => request.command === 'open_crawl_comparison').length");
+  await click('.comparison-options [role="checkbox"]');
+  await until("testComparisonRequests.at(-1).includeResponseOnly && document.querySelector('.comparison-table')?.textContent.includes('Response only') && document.querySelector('.comparison-limit')?.textContent.includes('of 205 matching changes')", "Response-only archives must page through every matching row");
+  assert.ok(await evaluate("document.querySelector('.comparison-options').textContent.includes('Older or incompatible captures') && [...document.querySelectorAll('.comparison-summary .metric')].find((metric) => metric.querySelector('span').textContent === 'Content unavailable').querySelector('strong').textContent === '205'"), "Legacy comparisons must disclose unavailable text and the need for matching new captures");
+  await click('.comparison-options [role="checkbox"]');
+  await until("testComparisonRequests.at(-1).includeResponseOnly === false && document.querySelectorAll('.comparison-table [data-comparison-key]').length === 0 && document.querySelector('.comparison-limit')?.textContent.includes('No matching changes')", "Disabling raw-only rows must request an empty filtered result");
+  assert.equal(await evaluate("testComparisonRequests.filter((request) => request.command === 'open_crawl_comparison').length"), archivePreparations, "Archive filters must reuse the prepared snapshot");
+  await evaluate("testComparisonOnlyResponses = false");
   await click('[title="Close crawl comparison"]');
   await fill('[aria-label="Seed URL"]', "");
   assert.ok(await evaluate("document.querySelector('[title=\"Start crawl\"]').disabled"), "An empty seed must not offer a runnable crawl");
@@ -2046,6 +2439,23 @@ try {
   assert.equal(await evaluate("document.querySelector('[aria-label=\"Request User-Agent\"]').value"), chromeAgent, "Chrome defaults must restore the agent");
   assert.deepEqual(await evaluate("[...document.querySelectorAll('.request-header')].map((row) => ({ name: row.querySelectorAll('input')[0].value, value: row.querySelectorAll('input')[1].value }))"), chromeHeaders, "Chrome defaults must restore editable headers");
   await settingsTab("Storage");
+  for (const [query, section, field] of [["max URLs", "limits", "Max URLs"], ["concurrency", "speed", "Threads"], ["respect robots", "robots", "Respect robots.txt"], ["near duplicate", "content", "Dup bits"], ["user-agent", "requests", "Request User-Agent"]]) {
+    await fill('[aria-label="Search settings"]', query);
+    await until("document.querySelector('[aria-label=\"Matching settings controls\"] option:not([value=\"\"])')", `Search must offer direct controls for ${query}`);
+    await evaluate("document.querySelector('[aria-label=\"Search settings\"]').focus()");
+    await pressKey("Enter");
+    await until(`document.activeElement.closest('[data-settings-section]')?.dataset.settingsSection === ${JSON.stringify(section)}`, `Enter must reveal and focus the ${section} control`);
+    assert.equal(await evaluate("document.activeElement.getAttribute('aria-label') || document.activeElement.closest('label').textContent.trim()"), field, "Search must focus the matching control without editing it");
+    assert.equal(await evaluate("document.querySelectorAll('[aria-label=\"Matching settings controls\"] option:not([value=\"\"])').length"), 1, "Each control must appear once, without hidden checkbox inputs");
+  }
+  await fill('[aria-label="Search settings"]', "override");
+  await until("[...document.querySelector('[aria-label=\"Matching settings controls\"]').options].some((option) => option.textContent.includes('robots.txt override') && option.disabled)", "Disabled override text must stay discoverable without being offered as editable");
+  await fill('[aria-label="Search settings"]', "Max response");
+  const responseControl = await evaluate("[...document.querySelector('[aria-label=\"Matching settings controls\"]').options].find((option) => option.textContent === 'Max response MiB').value");
+  await select("Matching settings controls", responseControl);
+  await until("document.activeElement.getAttribute('aria-describedby') === 'response-limit-help'", "Choosing a control must focus its input and expose its contextual help");
+  assert.ok(await evaluate("document.getElementById(document.activeElement.getAttribute('aria-describedby')).textContent.includes('Browser rendering')"), "Download help must explain the actual HTTP limit");
+  assert.deepEqual(await savedSettings(), beforeSettingsSearch, "Direct field search must preserve saved preferences");
   for (const [query, section] of [[" USER-AGENT ", "HTTP headers"], ["XPath", "Extraction"], ["CDP", "Rendering"]]) {
     await fill('[aria-label="Search settings"]', query);
     await until(`document.querySelector('.settings-tab-button[aria-current="page"]')?.textContent.trim() === ${JSON.stringify(section)}`,
@@ -2055,7 +2465,7 @@ try {
   await fill('[aria-label="Search settings"]', "missing-setting-name");
   await until("document.querySelector('.settings-search-empty')", "Unmatched settings must offer a clear search action");
   await click('.settings-search-empty button');
-  await until("document.querySelectorAll('.settings-tab-button').length === 15", "Clearing the search must restore all working sections");
+  await until("document.querySelectorAll('.settings-tab-button').length === 17", "Clearing the search must restore all working sections");
   await until("[...document.querySelectorAll('.settings-tabs details')].every((group) => !group.open)", "Clearing search must restore collapsed navigation");
   await evaluate("document.querySelector('.settings-tabs summary').focus()");
   assert.equal(await evaluate("document.activeElement.tagName"), "SUMMARY", "Settings group headers must accept keyboard focus");
@@ -2066,11 +2476,11 @@ try {
   await fill('[aria-label="Search settings"]', "Chrome");
   await until("document.querySelector('.settings-tabs details').open", "A search match must reveal a collapsed group");
   await fill('[aria-label="Search settings"]', "");
-  await until("document.querySelectorAll('.settings-tab-button').length === 15", "Clearing search must restore all sections");
+  await until("document.querySelectorAll('.settings-tab-button').length === 17", "Clearing search must restore all sections");
   assert.ok(await evaluate("[...document.querySelectorAll('.settings-tabs details')].every((group) => !group.open)"), "Search must not leave every group expanded");
   await click('.settings-tabs summary');
   await until("document.querySelector('.settings-tabs details').open", "Settings groups must expand again");
-  await settingsTab('Crawl');
+  await settingsTab('Limits');
   await evaluate("document.querySelector('.settings-content').scrollTop = 300");
   await settingsTab('Scope');
   await until("document.querySelector('.settings-content').scrollTop === 0", "Changing settings sections must restore the beginning of the form");
@@ -2086,6 +2496,20 @@ try {
     } else {
       assert.ok(await evaluate("document.querySelector('.settings-group-items .settings-tab-button span').getBoundingClientRect().left > document.querySelector('.settings-tabs summary span').getBoundingClientRect().left"), "Child settings need a clear tree indentation");
     }
+    await fill('[aria-label="Search settings"]', "Backoff");
+    await evaluate("document.querySelector('[aria-label=\"Search settings\"]').focus()");
+    await pressKey("Enter");
+    await until("document.activeElement.getAttribute('aria-describedby') === 'retry-help'", "Control search must focus a matching field at every window width");
+    assert.ok(await evaluate(`(() => {
+      const content = document.querySelector('.settings-content').getBoundingClientRect();
+      const input = document.activeElement.getBoundingClientRect();
+      const sidebar = document.querySelector('.settings-sidebar');
+      return input.top >= content.top && input.bottom <= content.bottom && sidebar.scrollHeight <= sidebar.clientHeight;
+    })()`), "Focused fields and the search picker must remain visible in small windows");
+    for (const theme of ["dark", "light"]) {
+      await evaluate(`document.documentElement.classList.toggle('dark', ${theme === "dark"}); document.documentElement.style.colorScheme = ${JSON.stringify(theme)}`);
+      assert.ok(await contrast('.settings-control-search p', '.settings-sidebar') >= 4.5, `Settings search help must remain readable in ${theme} mode`);
+    }
     if (process.env.UI_SCREENSHOT) {
       for (const theme of ["dark", "light"]) {
         await evaluate(`document.documentElement.classList.toggle('dark', ${theme === "dark"}); document.documentElement.style.colorScheme = ${JSON.stringify(theme)}`);
@@ -2093,18 +2517,20 @@ try {
         await writeFile(`${process.env.UI_SCREENSHOT}.settings-tree-${width}-${theme}.png`, Buffer.from(shot.data, "base64"));
       }
     }
+    await fill('[aria-label="Search settings"]', "");
   }
   await cdp("Emulation.setDeviceMetricsOverride", { width: 1280, height: 840, deviceScaleFactor: 1, mobile: false });
   await fill('[aria-label="Search settings"]', "Chrome");
   await click('[title="Close settings"]');
   await click('[aria-label="Crawl settings"]');
-  await until("document.querySelector('[aria-label=\"Search settings\"]')?.value === '' && document.querySelectorAll('.settings-tab-button').length === 15", "Reopening Settings must clear its search");
+  await until("document.querySelector('[aria-label=\"Search settings\"]')?.value === '' && document.querySelectorAll('.settings-tab-button').length === 17", "Reopening Settings must clear its search");
   assert.ok(await evaluate("[...document.querySelectorAll('.settings-tabs details')].every((group) => !group.open)"), "Reopening Settings must start with collapsed groups");
-  await settingsTab("Crawl");
+  await settingsTab("Limits");
   await markSetting("Threads");
   await fill(setting("Threads"), "7");
   await markSetting("Max URLs");
   await fill(setting("Max URLs"), "2345");
+  await settingsTab("robots.txt");
   await toggleSetting("Respect robots.txt");
   await settingsTab("Resources");
   await toggleSetting("Crawl Images");
@@ -2158,6 +2584,12 @@ try {
   await markSetting("Wait after load");
   await fill(setting("Wait after load"), "800");
   await settingsTab("Extraction");
+  assert.ok(await evaluate("[...document.querySelectorAll('.capture-settings [role=\"checkbox\"]')].every((control) => control.getAttribute('aria-checked') === 'false')"), "Retaining page bodies and headers must be opt-in for existing settings");
+  assert.equal(await evaluate("document.querySelector('[aria-label=\"Maximum capture bytes\"]').max"), '1048576', "The UI must enforce the 1 MiB capture ceiling");
+  await toggleSetting('Client-observed response headers');
+  await toggleSetting('Raw HTML');
+  await toggleSetting('Visible text');
+  await fill('[aria-label="Maximum capture bytes"]', '65536');
   await evaluate("document.querySelector('.settings-section:not([hidden]) .section-heading button').click()");
   await fill('[aria-label="Extractor pattern"]', 'main h1');
   const beforeExtractionPreview = await savedSettings();
@@ -2204,8 +2636,8 @@ try {
   await click('[aria-label="Crawl settings"]');
   await until("document.querySelector('.settings-modal')", "Saved settings should be readable after reopening the app");
   await markSetting("Threads");
-  await markSetting("Max URLs");
   assert.equal(await evaluate(`document.querySelector(${JSON.stringify(setting("Threads"))}).value`), "7", "Concurrency must survive reopening without saving a named profile");
+  await markSetting("Max URLs");
   assert.equal(await evaluate(`document.querySelector(${JSON.stringify(setting("Max URLs"))}).value`), "2345", "Crawl limits must survive reopening");
   assert.ok(await evaluate("[...document.querySelectorAll('.checkbox-field')].find((item) => item.textContent.trim() === 'Respect robots.txt').querySelector('[role=\"checkbox\"]').getAttribute('aria-checked') === 'false'"), "An explicit robots choice must not be replaced by the default during restore");
   assert.equal(await evaluate("document.querySelector('[aria-label=\"Crawl mode\"]').dataset.mode"), "list", "Crawl mode must be restored");
@@ -2231,6 +2663,9 @@ try {
   assert.equal(await evaluate(`document.querySelector(${JSON.stringify(setting("Wait after load"))}).value`), "800", "Rendering options must be restored");
   await settingsTab("Extraction");
   assert.equal(await evaluate("document.querySelector('[aria-label=\"Extractor pattern\"]').value"), "main h1", "Custom extractor definitions must be restored");
+  assert.deepEqual((await savedSettings()).config.capture, { responseHeaders: true, rawHtml: true, renderedHtml: false, visibleText: true, maxBytes: 65536 }, "Capture preferences must persist with the applied crawl configuration");
+  assert.equal(await evaluate("document.querySelector('[aria-label=\"Maximum capture bytes\"]').value"), '65536', "Capture limits must restore in Settings");
+
   assert.equal(await evaluate("document.querySelector('[aria-label=\"Extraction preview HTML\"]').value"), "", "Sample extraction HTML must not be persisted with crawl settings");
   await settingsTab("Scope");
   assert.equal(await evaluate("document.querySelector('[aria-label=\"List URLs\"]').value"), "https://list.test/first", "List sources must be restored");
@@ -2261,7 +2696,7 @@ try {
   await until("testProfileLoads.b", "The second profile load must start");
   await evaluate("testProfileLoads.a()");
   await evaluate("testProfileLoads.b()");
-  await settingsTab("Crawl");
+  await settingsTab("Limits");
   await markSetting("Max URLs");
   await until(`document.querySelector(${JSON.stringify(setting("Max URLs"))}).value === '2222'`, "The most recently requested profile must win even when the older response arrives first");
   assert.equal((await savedSettings()).config.maxUrls, 8765, "Asynchronous profile drafts must still require Apply");
@@ -2269,7 +2704,7 @@ try {
   await selectProfile("a");
   await selectProfile("");
   await evaluate("testProfileLoads.a()");
-  await settingsTab("Crawl");
+  await settingsTab("Limits");
   assert.equal(await evaluate(`document.querySelector(${JSON.stringify(setting("Max URLs"))}).value`), "2222", "Clearing profile selection must cancel its pending response");
   await settingsTab("Profiles");
   await evaluate("window.testProfileFailure = true");
@@ -2285,8 +2720,8 @@ try {
   await reloadApp();
   await click('[aria-label="Crawl settings"]');
   await markSetting("Max URLs");
-  await markSetting("Threads");
   assert.equal(await evaluate(`document.querySelector(${JSON.stringify(setting("Max URLs"))}).value`), "3210", "Older snapshots must retain their known values");
+  await markSetting("Threads");
   assert.equal(await evaluate(`document.querySelector(${JSON.stringify(setting("Threads"))}).value`), "8", "New or missing fields must use their defaults");
   await markSetting("Max response MiB");
   assert.equal(await evaluate(`document.querySelector(${JSON.stringify(setting("Max response MiB"))}).value`), "20", "Legacy snapshots must receive the bounded HTTP default");
@@ -2349,7 +2784,7 @@ try {
   await until("!document.querySelector('[aria-label=\"Dismiss settings error\"]')", "Successful persistence must recover after a storage failure");
   assert.equal((await savedSettings()).config.concurrency, 9);
   assert.deepEqual(Object.keys(await savedSettings()).sort(), ['config', 'modeStartUrls', 'resumeCrawl', 'storageMode', 'version'], "Only preferences belong in the saved snapshot");
-  for (const [tab, checkbox, field] of [["Crawl", "Respect robots.txt", "Dup bits"], ["Storage", "Resume database", "Storage engine"], ["Rendering", "Render DOM", "Backend"]]) {
+  for (const [tab, checkbox, field] of [["Storage", "Resume database", "Storage engine"], ["Rendering", "Render DOM", "Backend"]]) {
     await settingsTab(tab);
     assert.ok(await evaluate(`(() => {
       const section = document.querySelector('.settings-section:not([hidden])');
@@ -2362,7 +2797,7 @@ try {
       await writeFile(`${process.env.UI_SCREENSHOT}.settings-${tab.toLowerCase()}.png`, Buffer.from(shot.data, "base64"));
     }
   }
-  await settingsTab("Crawl");
+  await settingsTab("Limits");
   await markSetting("Threads");
   await evaluate(`document.querySelector(${JSON.stringify(setting("Threads"))}).focus(); testRequestQuit()`);
   await until("document.activeElement.textContent === 'No'", "Native quit must take keyboard focus above Settings");

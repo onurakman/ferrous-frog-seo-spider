@@ -6,8 +6,81 @@ fn state_with_store(store: ActiveStore) -> AppState {
         control: Mutex::new(None),
         crawl_task: tokio::sync::Mutex::new(None),
         current_session_id: Mutex::new(None),
+        comparison: Mutex::new(crate::ComparisonState::default()),
         frontend_ready: AtomicBool::new(true),
         exit_confirmed: AtomicBool::new(false),
+    }
+}
+
+#[tokio::test]
+async fn html_report_exports_each_backend_and_preserves_existing_files() {
+    for store in [
+        ActiveStore::memory(),
+        ActiveStore::Sqlite(ferrous_frog_storage::SqliteStore::in_memory().unwrap()),
+    ] {
+        let mut record = CrawlRecord::pending("https://example.test/missing".into(), 0);
+        record.status_code = Some(404);
+        store.upsert(record);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("report.html");
+        let state = state_with_store(store);
+        let result = export_html_report_file(&state, path.clone()).await.unwrap();
+        assert_eq!(result.row_count, 1);
+        let html = fs::read_to_string(&path).unwrap();
+        assert!(html.contains("example.test&#x2f;missing"));
+        assert!(html.contains("1 issue"));
+        assert!(html.trim_end().ends_with("</html>"));
+        assert!(export_html_report_file(&state, path.clone()).await.is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), html);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn html_report_rejects_active_and_closing_crawls_before_creating_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("report.html");
+    for paused in [false, true] {
+        let state = state_with_store(ActiveStore::memory());
+        let control = CrawlControl::default();
+        if paused {
+            control.pause();
+        }
+        *state.control.lock().unwrap() = Some(control);
+        *state.crawl_task.lock().await = Some(tauri::async_runtime::spawn(std::future::pending()));
+        let error = export_html_report_file(&state, path.clone())
+            .await
+            .unwrap_err();
+        assert!(error.contains("stop") && error.contains("crawl"), "{error}");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+        state.crawl_task.lock().await.take().unwrap().abort();
+    }
+    let state = state_with_store(ActiveStore::memory());
+    state.exit_confirmed.store(true, Ordering::SeqCst);
+    let error = export_html_report_file(&state, path).await.unwrap_err();
+    assert!(error.contains("closing"), "{error}");
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn html_report_storage_failures_preserve_existing_files_and_remove_temporary_files() {
+    for table in ["crawl_records", "link_edges"] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("report.html");
+        fs::write(&path, "previous report").unwrap();
+        let database_dir = tempfile::tempdir().unwrap();
+        let database_path = database_dir.path().join("crawl.sqlite3");
+        let store = ActiveStore::sqlite(&database_path).unwrap();
+        Connection::open(database_path)
+            .unwrap()
+            .execute_batch(&format!("DROP TABLE {table}"))
+            .unwrap();
+        let error = export_html_report_file(&state_with_store(store), path.clone())
+            .await
+            .unwrap_err();
+        assert!(error.contains("no such table"), "{error}");
+        assert_eq!(fs::read_to_string(path).unwrap(), "previous report");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }
 
@@ -29,6 +102,17 @@ fn archive_edge(position: u32) -> LinkEdge {
     }
 }
 
+fn archive_reference(source_key: &str, position: usize) -> PageReference {
+    PageReference {
+        id: 0,
+        source_storage_key: source_key.into(),
+        source_url: "https://example.test/final".into(),
+        target_url: format!("https://example.test/target-{position}?original=1"),
+        kind: ferrous_frog_storage::PageReferenceKind::Canonical,
+        rel_nofollow: true,
+    }
+}
+
 #[tokio::test]
 async fn crawl_archive_round_trips_order_unicode_frontier_and_import_seed() {
     for store in [
@@ -43,7 +127,11 @@ async fn crawl_archive_round_trips_order_unicode_frontier_and_import_seed() {
             row.title = Some(format!("{name}: Résumé, \"title\"\n🐸"));
             row.title_count = Some(2);
             row.meta_description_count = Some(3);
+            row.content_hash = Some(format!("captured-text-{position}"));
+            row.content_hash_context = Some("text-v1:http:fixture".into());
             store.upsert(row);
+            let key = format!("list:{position}");
+            store.add_page_references(&key, vec![archive_reference(&key, position as usize)]);
         }
         store.add_link_edge(archive_edge(3));
         store.add_image_assets(
@@ -70,11 +158,15 @@ async fn crawl_archive_round_trips_order_unicode_frontier_and_import_seed() {
             crawled: 2,
         });
         let expected = CrawlArchive {
+            page_captures: Vec::new(),
             schema_version: 1,
             exported_at_ms: 42,
             records: store.records(),
             link_edges: store.link_edges(LinkEdgeQuery::default()).edges,
             image_assets: store.image_assets(ImageAssetQuery::default()).images,
+            page_references: store
+                .page_references(PageReferenceQuery::default())
+                .references,
             frontier_state: store.load_frontier_state(),
         };
         assert!(expected.records.iter().all(
@@ -95,7 +187,7 @@ async fn crawl_archive_round_trips_order_unicode_frontier_and_import_seed() {
             serde_json::to_value(&expected).unwrap()
         );
         assert_eq!(
-            compare_records(&archive.records, &store.records()).changed,
+            compare_records(&archive.records, &store.records(), false).changed,
             0
         );
         let import_directory = tempfile::tempdir().unwrap();
@@ -117,6 +209,20 @@ async fn crawl_archive_round_trips_order_unicode_frontier_and_import_seed() {
         );
         let active = state.store.lock().unwrap().clone();
         assert_eq!(active.records().len(), 2);
+        for reference in &expected.page_references {
+            let result = query_store_page_references(
+                &active,
+                PageReferenceQuery {
+                    source_storage_key: Some(reference.source_storage_key.clone()),
+                    ..PageReferenceQuery::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.total, 1);
+            let mut imported = result.references[0].clone();
+            imported.id = reference.id;
+            assert_eq!(imported, *reference);
+        }
         assert_eq!(
             active.load_frontier_state().unwrap().queued,
             expected.frontier_state.as_ref().unwrap().queued
@@ -176,7 +282,10 @@ async fn crawl_archive_pages_every_collection_and_preserves_empty_schema_fields(
     );
     let empty: CrawlArchive = serde_json::from_slice(&fs::read(empty_path).unwrap()).unwrap();
     assert!(
-        empty.records.is_empty() && empty.link_edges.is_empty() && empty.image_assets.is_empty()
+        empty.records.is_empty()
+            && empty.link_edges.is_empty()
+            && empty.image_assets.is_empty()
+            && empty.page_references.is_empty()
     );
     assert_eq!(empty.frontier_state, None);
     let count = EXPORT_STREAM_PAGE_SIZE + 1;
@@ -203,6 +312,12 @@ async fn crawl_archive_pages_every_collection_and_preserves_empty_schema_fields(
             .collect(),
     );
     let path = directory.path().join("pages.json");
+    store.add_page_references(
+        "list:1",
+        (0..count)
+            .map(|index| archive_reference("list:1", index))
+            .collect(),
+    );
     assert_eq!(
         export_crawl_archive_file(&state, path.clone(), 2)
             .await
@@ -215,9 +330,10 @@ async fn crawl_archive_pages_every_collection_and_preserves_empty_schema_fields(
         (
             archive.records.len(),
             archive.link_edges.len(),
-            archive.image_assets.len()
+            archive.image_assets.len(),
+            archive.page_references.len()
         ),
-        (count, count, count)
+        (count, count, count, count)
     );
     assert_eq!(
         archive.records.first().unwrap().url,
@@ -233,6 +349,31 @@ async fn crawl_archive_pages_every_collection_and_preserves_empty_schema_fields(
     for (index, image) in archive.image_assets.iter().enumerate() {
         assert_eq!(image.source_position as usize, index);
     }
+    for (index, reference) in archive.page_references.iter().enumerate() {
+        assert_eq!(
+            reference.target_url,
+            archive_reference("list:1", index).target_url
+        );
+    }
+}
+
+#[test]
+fn legacy_crawl_archives_import_without_reference_evidence() {
+    let archive: CrawlArchive = serde_json::from_value(serde_json::json!({
+        "schemaVersion": 1, "exportedAtMs": 1, "records": [],
+        "linkEdges": [], "imageAssets": [], "frontierState": null
+    }))
+    .unwrap();
+    assert!(archive.page_references.is_empty());
+    let state = state_with_store(ActiveStore::memory());
+    let directory = tempfile::tempdir().unwrap();
+    import_archive_into_session(&state, directory.path(), archive).unwrap();
+    assert_eq!(
+        query_store_page_references(&state.store.lock().unwrap(), PageReferenceQuery::default())
+            .unwrap()
+            .total,
+        0
+    );
 }
 
 #[test]
@@ -279,8 +420,12 @@ fn crawl_archive_array_passes_the_old_cap_and_rejects_changed_or_short_pages() {
 }
 
 #[tokio::test]
-async fn crawl_archive_late_image_and_frontier_errors_are_fallible_and_atomic() {
-    for corrupt_image in [true, false] {
+async fn crawl_archive_late_evidence_and_frontier_errors_are_fallible_and_atomic() {
+    for corruption in [
+        "UPDATE image_assets SET width = 'invalid width'",
+        "UPDATE page_references SET kind = 'invalid reference kind'",
+        "DROP TABLE crawl_frontier_seen",
+    ] {
         let database = tempfile::tempdir().unwrap();
         let database_path = database.path().join("crawl.sqlite3");
         let store = ActiveStore::sqlite(&database_path).unwrap();
@@ -299,13 +444,8 @@ async fn crawl_archive_late_image_and_frontier_errors_are_fallible_and_atomic() 
             )],
         );
         let connection = Connection::open(&database_path).unwrap();
-        connection
-            .execute_batch(if corrupt_image {
-                "UPDATE image_assets SET width = 'invalid width'"
-            } else {
-                "DROP TABLE crawl_frontier_seen"
-            })
-            .unwrap();
+        store.add_page_references("source", vec![archive_reference("source", 0)]);
+        connection.execute_batch(corruption).unwrap();
         let mut partial = Vec::new();
         let error = write_crawl_archive_stream(&store, 1, &mut partial).unwrap_err();
         assert!(!error.is_empty());

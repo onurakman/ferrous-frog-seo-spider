@@ -104,6 +104,9 @@ pub struct PageSignals {
     pub indexability: String,
     pub indexability_status: String,
     pub visible_text: String,
+    /// Text for exact crawl comparison, always excluding non-content HTML subtrees.
+    #[serde(default)]
+    pub comparison_text: String,
     pub word_count: usize,
     pub text_to_code_ratio: f64,
     pub image_count: u32,
@@ -266,6 +269,11 @@ pub fn parse_html_with_content(
         word_count,
         text_to_code_ratio,
     } = content_preview(&document, html.len(), content);
+    let comparison_text = if content.include.is_empty() && content.exclude.is_empty() {
+        selected_visible_text(&document, content)
+    } else {
+        visible_text.clone()
+    };
     let links = extract_links(&document, base_url);
     let images = extract_images(&document, base_url);
     let resources = extract_resources(&document, base_url);
@@ -330,6 +338,7 @@ pub fn parse_html_with_content(
             "Indexable".to_string()
         },
         visible_text,
+        comparison_text,
         word_count,
         text_to_code_ratio,
         image_count: image_stats.image_count,
@@ -1346,6 +1355,10 @@ fn visible_text(document: &Html, content: &ContentSelectors) -> String {
             .unwrap_or_default();
     }
 
+    selected_visible_text(document, content)
+}
+
+fn selected_visible_text(document: &Html, content: &ContentSelectors) -> String {
     let mut text = String::new();
     let mut pending = vec![(document.tree.root(), content.include.is_empty())];
     while let Some((node, mut included)) = pending.pop() {
@@ -1586,7 +1599,12 @@ mod tests {
         let whole = parse_html(&Url::parse("https://example.test/").unwrap(), html);
         let mut whole_evidence = serde_json::to_value(whole).unwrap();
         let mut scoped_evidence = serde_json::to_value(scoped).unwrap();
-        for field in ["visibleText", "wordCount", "textToCodeRatio"] {
+        for field in [
+            "visibleText",
+            "comparisonText",
+            "wordCount",
+            "textToCodeRatio",
+        ] {
             whole_evidence.as_object_mut().unwrap().remove(field);
             scoped_evidence.as_object_mut().unwrap().remove(field);
         }
@@ -1600,6 +1618,7 @@ mod tests {
             scoped_signals(html, &[], &[]).visible_text,
             "Visible legacy script text legacy style text"
         );
+        assert_eq!(scoped_signals(html, &[], &[]).comparison_text, "Visible");
     }
 
     #[test]
