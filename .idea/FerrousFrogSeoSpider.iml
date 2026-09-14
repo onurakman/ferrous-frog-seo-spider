@@ -10,6 +10,8 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/parser/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/storage/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/src-tauri/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/cli/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/export/examples" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
