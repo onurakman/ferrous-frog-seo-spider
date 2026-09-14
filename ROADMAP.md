@@ -98,7 +98,7 @@ Goal: keep a buildable project skeleton with clear crate boundaries.
 - [x] Workspace tests and frontend build pass.
 - [x] GitHub CI and Release Please workflows, synchronized workspace/npm/Tauri versions, and desktop installer configuration.
 - [x] Verify the first hosted six-target installer matrix: v0.2.0 published 12 Windows, macOS and Linux packages with verified SHA256SUMS.
-- [ ] Verify native installation/startup/quit on Windows, macOS and Linux. The Linux embedded-assets debug app passes a real WebDriver crawl, robots/crawl-delay checks, planted 404, saved SQLite reopen without requests and cancel/confirm quit with process exit. Installer validation and Windows/macOS checks remain pending. See [native testing](docs/NATIVE_TESTING.md).
+- [ ] (Partial) Verify native installation/startup/quit on Windows, macOS and Linux. The Linux embedded-assets debug app and privately extracted Make-produced deb/AppImage payloads pass crawl, robots/crawl-delay, planted 404, saved reopen, frozen report/export and clean quit checks. The package run used documented private build-tool prerequisites; stock-tool packaging, host installation and Windows/macOS remain pending. See [native testing](docs/NATIVE_TESTING.md).
 - [ ] Developer ID signing/notarization and Windows code signing before trusted signed distribution.
 
 ## Phase 1 - Make The Frog Crawl
@@ -448,7 +448,7 @@ Delivered from the supplied initial/follow-up HTML references. The [design and d
 - [ ] (Partial) Load test against a large synthetic site. The one-million-record storage benchmark and configurable local HTTP crawler fixture are documented. Runs through 2,000 pages verify cycles, deduplication, errors, robots, concurrency and stop/reopen/resume in Memory/SQLite, including concurrent bounded grid/link/recovery polls and physical NVMe. Larger live datasets, denser resource/reference graphs, repeated disk runs and actual desktop responsiveness remain pending.
 - [x] Headless Chrome UI smoke checks for full result/report paging, stale responses, live duplicates, errors, details, graph exclusions, themes and small-screen layouts (`make test-ui`). Optional screenshots use `UI_SCREENSHOT`.
 - [x] Linux native desktop end-to-end crawl check beyond IPC fixtures: embedded-assets debug app, isolated Xvfb/D-Bus/WebKit WebDriver, robots/crawl delay, 404, SQLite persistence/reopen without requests and cancel/confirm quit with native process exit (`make test-native`).
-- [ ] Extend native desktop end-to-end checks to Windows/macOS and installer builds. The Linux embedded-assets debug workflow verifies saved audit-report creation, restart/reopen, complete export and clean quit.
+- [ ] (Partial) Extend native desktop end-to-end checks to Windows/macOS and installer builds. Linux debug and privately extracted Make-produced deb/AppImage payloads verify saved audit-report creation, restart/reopen, complete export and clean quit. The documented package source revision and private tool environment limit this result; stock-tool packaging, host installation, signing and other operating systems remain open.
 
 ## Definition Of Done
 

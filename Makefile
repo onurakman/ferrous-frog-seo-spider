@@ -39,6 +39,11 @@ build: ## Build the release desktop executable without installers.
 release: ## Build release installers for the current platform.
 	npm run tauri:build -- -- --locked
 
+.PHONY: release-linux
+release-linux: ## Build Linux deb and AppImage installers without requiring host FUSE.
+	@pkg-config --exists librsvg-2.0 || (echo "Linux AppImage packaging needs librsvg-2.0 pkg-config metadata; install/extract the development package and set PKG_CONFIG_PATH." >&2; exit 1)
+	APPIMAGE_EXTRACT_AND_RUN=1 npm run tauri:build -- --bundles deb,appimage -- --locked
+
 .PHONY: build-web
 build-web: ## Build the React/Vite frontend.
 	npm run build
@@ -86,10 +91,21 @@ test-ui: build-web ## Exercise the React workspace and production shell in headl
 	node scripts/smoke-ui.mjs
 
 NATIVE_APP ?= target/release/ferrous-frog
+NATIVE_DEB ?=
+NATIVE_APPIMAGE ?=
+export NATIVE_DEB NATIVE_APPIMAGE
 
 .PHONY: test-native
 test-native: ## Run the Linux native desktop smoke (built app and WebDriver tools required).
 	node scripts/smoke-native.mjs --app "$(NATIVE_APP)"
+
+.PHONY: test-native-installers
+test-native-installers: ## Privately extract Linux deb/AppImage installers and run the native smoke from each payload.
+	@set -eu; deb="$${NATIVE_DEB}"; appimage="$${NATIVE_APPIMAGE}"; \
+	if test -z "$$deb"; then deb=$$(find target/release/bundle/deb -name '*.deb' -type f -print -quit 2>/dev/null || true); fi; \
+	if test -z "$$appimage"; then appimage=$$(find target/release/bundle/appimage -name '*.AppImage' -type f -print -quit 2>/dev/null || true); fi; \
+	test -n "$$deb" && test -n "$$appimage" || (echo "Build deb and AppImage installers first, or set NATIVE_DEB and NATIVE_APPIMAGE." >&2; exit 1); \
+	node scripts/verify-linux-installers.mjs --deb "$$deb" --appimage "$$appimage"
 
 .PHONY: test-audit-reports
 test-audit-reports: ## Verify complete report and comparison packages directly from disk in Chrome.

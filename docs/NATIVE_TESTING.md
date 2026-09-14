@@ -60,6 +60,23 @@ make test-native NATIVE_APP=target/debug/ferrous-frog
 
 Use the Tauri build command so the executable includes the frontend. A plain Cargo development build may expect the Vite development server instead.
 
+## Linux installer payloads without a host installation
+
+Build only the Linux installer formats, including in environments without FUSE 2:
+
+```sh
+make release-linux
+make test-native-installers
+```
+
+`release-linux` requires `pkg-config --exists librsvg-2.0`, including its development `.pc` metadata. A FUSE-less machine can use a privately extracted development package by setting `PKG_CONFIG_PATH`; no package installation is required. `test-native-installers` uses `dpkg-deb` to inspect and privately extract the Debian payload, then uses `unsquashfs` with the AppImage-reported SquashFS offset to extract the AppImage. It runs this same native smoke from `usr/bin/ferrous-frog` and extracted `AppRun`, respectively. `release-linux` writes normal build output under `target/`; the verifier does not install an operating-system package and keeps its extracted payloads and smoke XDG state private. Set `NATIVE_DEB` and `NATIVE_APPIMAGE` when the artifacts are outside `target/release/bundle/`.
+
+The normal Debian and AppImage desktop entries use `ferrous-frog`. During AppImage assembly, `linuxdeploy` creates the AppDir root icon as a link to the installed hicolor icon. `APPIMAGE_EXTRACT_AND_RUN=1` applies to Tauri's local AppImage packaging tools on hosts without FUSE; the packaged AppImage itself is verified through `unsquashfs`, so its smoke does not mount it with FUSE.
+
+On 2026-09-14, `make release-linux` produced a 15,628,622-byte Debian package and a 92,551,672-byte AppImage from clean archive `beb187631124684f7766443dac4b8565bd4d3944`, using the original desktop configuration. Both Make-produced payloads were privately extracted and completed the full native smoke; the retained verifier log is `/tmp/ferrous-linux-installers-make-route-smoke.log`, with extraction and smoke artifacts in `/tmp/ferrous-linux-installers-lxkBE2`, `/tmp/ferrous-native-smoke-ATHjgY`, and `/tmp/ferrous-native-smoke-I1wEjR`.
+
+That host-specific packaging run used a privately extracted `librsvg2-dev` pkg-config directory and a private one-line compatibility patch to Tauri's cached GTK plugin: `ln -s` became `ln -sf` in `linuxdeploy-plugin-gtk.sh`. The unmodified plugin recreates GTK-module links already made by current `linuxdeploy` and exits on `EEXIST`; no host package or shared tool cache was changed. The original cached plugin was upstream-master hash `cb379f9b0733e9ad9f8bd78f8c2fa038aef2478523bb7d4c8e64ff6a1ea3501a`; the private patched copy was `9921b701e60ac80879fd889df37abbd97c739d437810e0bae6b93574c7888fb7`. This validates Linux x64 payload behavior for that revision and private tool environment. It does not establish a stock-tool packaging result, Windows or macOS coverage, installer signing, notarization, host installation, or release publication.
+
 Overrides:
 
 - `FF_NATIVE_TOOLS`: alternate temporary tools directory.

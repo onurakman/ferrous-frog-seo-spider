@@ -21,6 +21,8 @@ To select formats, use `--bundles deb,rpm,appimage` on Linux, `--bundles app,dmg
 
 The standard release excludes the optional Chrome CDP backend. Developers can add `--features js-rendering` to build it and must provide Chrome/Chromium at runtime. CI compiles this path separately and runs real-browser tests for crawling, subresource politeness, pause, resume and stop.
 
+For a local Linux installer check without installing either package, run `make release-linux` followed by `make test-native-installers`. `release-linux` preflights the `librsvg-2.0` pkg-config development metadata; a private extraction can supply it through `PKG_CONFIG_PATH`. The verifier privately extracts the `.deb` and AppImage and runs the complete native desktop smoke from each payload. On FUSE-less Linux hosts, `release-linux` sets `APPIMAGE_EXTRACT_AND_RUN=1` for Tauri's local AppImage packaging tools; it does not change the distributed artifact. The current `linuxdeploy-plugin-gtk.sh` can also need a private compatibility patch on hosts where it attempts to recreate a GTK-module link and exits on `EEXIST`; do not modify a shared Tauri tool cache. This validates the current Linux architecture only. Windows, macOS, signing, notarization, and hosted release-matrix validation remain separate checks.
+
 ## GitHub setup
 
 1. Push the repository, including both lockfiles, to GitHub with `master` or `main` as the default branch.
