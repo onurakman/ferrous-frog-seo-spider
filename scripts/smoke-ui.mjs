@@ -21,7 +21,7 @@ function setupFixture(mockIPC, emit) {
     metaDuplicate metaMultiple h1Missing h1Duplicate h2Missing h2Duplicate canonicalMissing canonicalMultiple noindex
     canonicalUncrawled canonicalToRedirect canonicalToError canonicalNonIndexable canonicalChain canonicalLoop
     paginationNextToError paginationPrevToError paginationNextLoop paginationPrevLoop
-    paginationNextNonReciprocal paginationPrevNonReciprocal ampToError
+    paginationNextNonReciprocal paginationPrevNonReciprocal ampToError ampNonReciprocal
     imagesMissingAlt imagesAltTooLong mixedContent insecureForms hreflangInvalid structuredDataInvalid
     structuredDataWarnings deprecatedHtmlTags duplicateIds renderedDomChanged missingViewport missingHsts
     sitemapOrphans`.split(/\s+/).map((key) => [key, 0]));
@@ -163,6 +163,8 @@ function setupFixture(mockIPC, emit) {
         ? records.slice(0, query.view === "paginationNextNonReciprocal" ? 2 : 1).map((row) => ({ ...row,
           relNext: 'https://example.test/next-without-return', relPrev: 'https://example.test/prev-without-return' })) : [];
       if (query.view === "ampToError") matching = window.testAmpError ? records.slice(0, 1) : [];
+      if (query.view === "ampNonReciprocal") matching = window.testAmpReturns
+        ? records.slice(0, 1).map((row) => ({ ...row, amphtml: 'https://example.test/amp-without-return' })) : [];
       if (query.view === "titleMultiple" || query.view === "metaMultiple") matching = window.testMultipleMetadata
         ? [{ ...records[0], titleCount: 3, metaDescriptionCount: 2 }] : [];
       if (window.testEmptyDataset) matching = [];
@@ -181,7 +183,7 @@ function setupFixture(mockIPC, emit) {
           paginationNextToError: window.testPaginationErrors ? 2 : 0, paginationPrevToError: window.testPaginationErrors ? 1 : 0,
           paginationNextLoop: window.testPaginationLoops ? 2 : 0, paginationPrevLoop: window.testPaginationLoops ? 1 : 0,
           paginationNextNonReciprocal: window.testPaginationReturns ? 2 : 0, paginationPrevNonReciprocal: window.testPaginationReturns ? 1 : 0,
-          ampToError: window.testAmpError ? 1 : 0,
+          ampToError: window.testAmpError ? 1 : 0, ampNonReciprocal: window.testAmpReturns ? 1 : 0,
           titleMultiple: window.testMultipleMetadata ? 1 : 0, metaMultiple: window.testMultipleMetadata ? 1 : 0 } };
       await new Promise((resolve) => setTimeout(resolve, window.testSearchDelays[query.globalSearch] ?? 15));
       return response;
@@ -1308,6 +1310,13 @@ try {
   await evaluate("testEmitProgress(0)");
   assert.equal(await evaluate("document.querySelector('[data-view=\"ampToError\"] .issue-count').textContent"), '1', "Progress must retain query-owned AMP diagnostics");
   await evaluate("window.testAmpError = false");
+  await evaluate("window.testAmpReturns = true");
+  await click('[data-view="ampNonReciprocal"]');
+  await until("testQueries.at(-1).view === 'ampNonReciprocal' && document.querySelector('[data-view=\"ampNonReciprocal\"] .issue-count')?.textContent === '1'", "AMP canonical-return warnings must query storage and count measured sources");
+  assert.ok(await evaluate("document.querySelector('.data-table thead').textContent.includes('AMP URL') && document.querySelector('.data-table tbody').textContent.includes('https://example.test/amp-without-return')"), "AMP return-link warnings must expose the declared target");
+  await evaluate('testEmitProgress(0)');
+  assert.equal(await evaluate("document.querySelector('[data-view=\"ampNonReciprocal\"] .issue-count').textContent"), '1', "Progress must retain query-owned AMP reciprocity counts");
+  await evaluate("window.testAmpReturns = false");
   await evaluate("testExactDuplicates = 3");
   await click('[data-view="exactDuplicate"]');
   await until("testQueries.at(-1).view === 'exactDuplicate' && document.querySelector('.data-table thead').textContent.includes('Response hash')", "Exact duplicate audits must query storage and show full-response hash evidence");

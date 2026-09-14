@@ -447,6 +447,14 @@ fn reference_target_issues(
             Severity::Error,
         ),
         (
+            diagnostic.amp_non_reciprocal,
+            "amp.non_reciprocal",
+            "Observed AMP target does not canonically return to the declaring page",
+            IssueView::AmpNonReciprocal,
+            &record.amphtml,
+            Severity::Warning,
+        ),
+        (
             diagnostic.pagination_next_loop,
             "pagination.next_loop",
             "Next pagination path enters a loop",
@@ -869,6 +877,40 @@ mod tests {
         assert_eq!(amp[0].severity, Severity::Error);
         assert_eq!(amp[0].url, source.url);
         assert!(amp[0].message.contains(source.amphtml.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn amp_reciprocity_emits_a_warning_only_for_measured_missing_return() {
+        let mut source = CrawlRecord::pending("https://example.test/source".into(), 0);
+        source.status_code = Some(200);
+        source.content_type = Some("text/html".into());
+        source.amphtml = Some("https://example.test/amp".into());
+        let mut target = CrawlRecord::pending("https://example.test/amp".into(), 0);
+        target.status_code = Some(200);
+        target.content_type = Some("text/html".into());
+
+        let warnings = |target: CrawlRecord| {
+            analyze_records(&[source.clone(), target], &AuditThresholds::default())
+                .into_iter()
+                .filter(|issue| issue.rule_id == "amp.non_reciprocal")
+                .collect::<Vec<_>>()
+        };
+        let missing = warnings(target.clone());
+        assert_eq!(missing.len(), 1);
+        assert_eq!(format!("{:?}", missing[0].view), "AmpNonReciprocal");
+        assert_eq!(missing[0].severity, Severity::Warning);
+        assert_eq!(missing[0].url, source.url);
+        assert!(
+            missing[0]
+                .message
+                .contains(source.amphtml.as_deref().unwrap())
+        );
+
+        target.canonical = Some(source.url.clone());
+        assert!(warnings(target.clone()).is_empty());
+        target.status_code = Some(404);
+        target.canonical = None;
+        assert!(warnings(target).is_empty());
     }
 
     #[test]

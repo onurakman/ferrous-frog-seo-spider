@@ -146,6 +146,7 @@ type IssueView =
   | "paginationNextNonReciprocal"
   | "paginationPrevNonReciprocal"
   | "ampToError"
+  | "ampNonReciprocal"
   | "directivesNoindex"
   | "imagesMissingAlt"
   | "imagesAltTooLong"
@@ -359,6 +360,7 @@ type CrawlSummary = {
   paginationNextNonReciprocal: number;
   paginationPrevNonReciprocal: number;
   ampToError: number;
+  ampNonReciprocal: number;
   noindex: number;
   imagesMissingAlt: number;
   imagesAltTooLong: number;
@@ -999,6 +1001,7 @@ const emptySummary: CrawlSummary = {
   paginationNextNonReciprocal: 0,
   paginationPrevNonReciprocal: 0,
   ampToError: 0,
+  ampNonReciprocal: 0,
   noindex: 0,
   imagesMissingAlt: 0,
   imagesAltTooLong: 0,
@@ -1330,6 +1333,7 @@ const views: Array<{ id: IssueView; label: string }> = [
   { id: "paginationNextNonReciprocal", label: "Next URL Non-Reciprocal" },
   { id: "paginationPrevNonReciprocal", label: "Previous URL Non-Reciprocal" },
   { id: "ampToError", label: "AMP URL to Error" },
+  { id: "ampNonReciprocal", label: "AMP Canonical Return Missing" },
   { id: "directivesNoindex", label: "Noindex" },
   { id: "imagesMissingAlt", label: "Missing Alt" },
   { id: "imagesAltTooLong", label: "Long Alt" },
@@ -1366,7 +1370,7 @@ const issueGroups: Array<{ label: string; tabLabel?: string; views: IssueView[];
   { label: "Canonicals & directives", tabLabel: "Indexing", views: ["canonicalMissing", "canonicalMultiple", "canonicalUncrawled", "canonicalToRedirect", "canonicalToError", "canonicalNonIndexable", "canonicalChain", "canonicalLoop", "directivesNoindex"], columns: ["canonical", "canonicalCount", "metaRobots", "xRobotsTag", "indexability", "indexabilityStatus"] },
   { label: "Images", views: ["imagesMissingAlt", "imagesAltTooLong"], columns: ["imageCount", "imagesMissingAlt", "imagesAltTooLong", "outlinkCount"] },
   { label: "Pagination", views: ["paginationNextToError", "paginationPrevToError", "paginationNextLoop", "paginationPrevLoop", "paginationNextNonReciprocal", "paginationPrevNonReciprocal"], columns: ["finalUrl", "relNext", "relPrev", "indexability"] },
-  { label: "AMP", views: ["ampToError"], columns: ["finalUrl", "amphtml", "indexability"] },
+  { label: "AMP", views: ["ampToError", "ampNonReciprocal"], columns: ["finalUrl", "amphtml", "indexability"] },
   { label: "Security", views: ["securityMixedContent", "securityInsecureForms", "securityMissingHsts", "securityMissingCsp", "securityMissingXFrameOptions", "securityMissingContentTypeOptions"], columns: ["mixedContentCount", "insecureFormCount", "hstsHeader", "contentSecurityPolicyHeader", "xFrameOptionsHeader", "xContentTypeOptionsHeader"] },
   { label: "International", tabLabel: "Hreflang", views: ["hreflangInvalid", "hreflangMissingSelfReference", "hreflangMissingReturnLink", "hreflangNonCanonicalTarget"], columns: ["hreflangCount", "hreflangInvalidCount", "canonical", "indexability"] },
   { label: "Structured data & HTML", tabLabel: "Markup", views: ["structuredDataInvalid", "structuredDataWarning", "htmlDeprecatedTags", "htmlDuplicateIds"], columns: ["jsonLdInvalidCount", "structuredDataErrorCount", "structuredDataWarningCount", "deprecatedHtmlTagCount", "duplicateIdCount"] },
@@ -1375,13 +1379,14 @@ const issueGroups: Array<{ label: string; tabLabel?: string; views: IssueView[];
 ];
 
 const canonicalSummaryKeys = ["canonicalUncrawled", "canonicalToRedirect", "canonicalToError", "canonicalNonIndexable", "canonicalChain", "canonicalLoop"] as const;
-const querySummaryKeys = [...canonicalSummaryKeys, "exactDuplicates", "paginationNextToError", "paginationPrevToError", "paginationNextLoop", "paginationPrevLoop", "paginationNextNonReciprocal", "paginationPrevNonReciprocal", "ampToError"] as const;
+const querySummaryKeys = [...canonicalSummaryKeys, "exactDuplicates", "paginationNextToError", "paginationPrevToError", "paginationNextLoop", "paginationPrevLoop", "paginationNextNonReciprocal", "paginationPrevNonReciprocal", "ampToError", "ampNonReciprocal"] as const;
 const viewSummaryKeys: Partial<Record<IssueView, keyof CrawlSummary>> = {
   ...Object.fromEntries(canonicalSummaryKeys.map((key) => [key, key])),
   paginationNextToError: "paginationNextToError", paginationPrevToError: "paginationPrevToError",
   paginationNextLoop: "paginationNextLoop", paginationPrevLoop: "paginationPrevLoop",
   paginationNextNonReciprocal: "paginationNextNonReciprocal", paginationPrevNonReciprocal: "paginationPrevNonReciprocal",
   ampToError: "ampToError",
+  ampNonReciprocal: "ampNonReciprocal",
   all: "total", internal: "internal", external: "external", status2xx: "success", status3xx: "redirects",
   status4xx: "clientErrors", status5xx: "serverErrors", noResponse: "noResponse", brokenLinks: "broken",
   titleMissing: "titleMissing", titleDuplicate: "titleDuplicate", metaMissing: "metaMissing", metaDuplicate: "metaDuplicate",
@@ -8173,6 +8178,7 @@ function OverviewPanel({
   ];
   const technicalRows: OverviewRowModel[] = [
     { label: "AMP URL to error", value: summary.ampToError, tone: "danger", view: "ampToError" },
+    { label: "AMP canonical return missing", value: summary.ampNonReciprocal, tone: "warning", view: "ampNonReciprocal" },
     { label: "Next URL to error", value: summary.paginationNextToError, tone: "danger", view: "paginationNextToError" },
     { label: "Previous URL to error", value: summary.paginationPrevToError, tone: "danger", view: "paginationPrevToError" },
     { label: "Next URL loops", value: summary.paginationNextLoop, tone: "danger", view: "paginationNextLoop" },

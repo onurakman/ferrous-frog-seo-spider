@@ -21,6 +21,121 @@ fn query() -> GridQuery {
     }
 }
 
+fn reciprocity_query() -> GridQuery {
+    GridQuery {
+        view: serde_json::from_value(serde_json::json!("ampNonReciprocal"))
+            .expect("AMP reciprocity audit view must be supported"),
+        sort_by: Some("url".into()),
+        ..GridQuery::default()
+    }
+}
+
+#[test]
+fn amp_reciprocity_uses_only_measured_html_targets_and_preserves_list_occurrences() {
+    let mut wrong_target = page("amp-wrong", None);
+    wrong_target.canonical = Some(url("known-other"));
+    let mut correct_target = page("amp-correct", None);
+    correct_target.canonical = Some("https://EXAMPLE.test:443/correct-return#section".into());
+    let mut invalid_return_target = page("amp-invalid-return", None);
+    invalid_return_target.canonical = Some("mailto:unknown@example.test".into());
+    let mut unknown_return_target = page("amp-unknown-return", None);
+    unknown_return_target.canonical = Some(url("not-crawled-return"));
+    let mut redirect_source = page("redirect-return", Some("amp-redirect"));
+    redirect_source.final_url = url("redirect-final");
+    let mut redirect_target = page("amp-redirect", None);
+    redirect_target.canonical = Some(url("redirect-return"));
+    let mut blocked = CrawlRecord::pending(url("amp-blocked"), 0);
+    blocked.error = Some("Blocked by robots.txt".into());
+    let mut failed = page("amp-failed", None);
+    failed.status_code = Some(404);
+    let mut incomplete = page("amp-incomplete", None);
+    incomplete.indexability_status = "Response body incomplete".into();
+    let mut non_html = page("amp-image", None);
+    non_html.content_type = Some("image/png".into());
+    let mut ineligible_source = page("ineligible-source", Some("amp-no-canonical"));
+    ineligible_source.indexability_status = "Response body incomplete".into();
+    let mut list_source = page("missing-return", Some("amp-no-canonical"));
+    list_source.storage_key = "list:30:missing-return".into();
+    list_source.list_position = Some(30);
+    let rows = [
+        page("missing-return", Some("amp-no-canonical")),
+        list_source,
+        page("amp-no-canonical", None),
+        page("wrong-return", Some("amp-wrong")),
+        wrong_target,
+        page("known-other", None),
+        page("correct-return", Some("amp-correct")),
+        correct_target,
+        page("invalid-return-source", Some("amp-invalid-return")),
+        invalid_return_target,
+        page("unknown-return-source", Some("amp-unknown-return")),
+        unknown_return_target,
+        redirect_source,
+        redirect_target,
+        page("unknown-source", Some("amp-unknown")),
+        page("blocked-source", Some("amp-blocked")),
+        blocked,
+        page("failed-source", Some("amp-failed")),
+        failed,
+        page("incomplete-source", Some("amp-incomplete")),
+        incomplete,
+        page("non-html-source", Some("amp-image")),
+        non_html,
+        ineligible_source,
+    ];
+    let memory = MemoryStore::new();
+    let sqlite = SqliteStore::in_memory().unwrap();
+    for row in rows {
+        memory.upsert(row.clone());
+        sqlite.try_upsert(row).unwrap();
+    }
+    for response in [
+        memory.query(reciprocity_query()),
+        sqlite.try_query(reciprocity_query()).unwrap(),
+    ] {
+        assert_eq!(response.total, 3);
+        assert_eq!(
+            response
+                .rows
+                .iter()
+                .map(|row| row.url.as_str())
+                .collect::<Vec<_>>(),
+            [
+                url("missing-return"),
+                url("missing-return"),
+                url("wrong-return")
+            ]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+        );
+        assert!(
+            response
+                .rows
+                .iter()
+                .any(|row| row.list_position == Some(30))
+        );
+        assert_eq!(
+            serde_json::to_value(response.summary).unwrap()["ampNonReciprocal"],
+            3
+        );
+    }
+    let mut corrected = page("amp-no-canonical", None);
+    corrected.canonical = Some(url("missing-return"));
+    memory.upsert(corrected.clone());
+    sqlite.try_upsert(corrected).unwrap();
+    for response in [
+        memory.query(reciprocity_query()),
+        sqlite.try_query(reciprocity_query()).unwrap(),
+    ] {
+        assert_eq!(
+            response.total, 1,
+            "changing a target canonical invalidates cached diagnostics"
+        );
+        assert_eq!(response.rows[0].url, url("wrong-return"));
+    }
+}
+
 #[test]
 fn amp_audits_only_known_failed_targets_and_preserves_list_and_alias_evidence() {
     let memory = MemoryStore::new();
@@ -178,8 +293,13 @@ fn amp_sorting_and_old_summary_defaults_match_both_stores() {
     }
     let mut value = serde_json::to_value(CrawlSummary::default()).unwrap();
     value.as_object_mut().unwrap().remove("ampToError");
+    value.as_object_mut().unwrap().remove("ampNonReciprocal");
     let restored: CrawlSummary = serde_json::from_value(value).unwrap();
-    assert_eq!(serde_json::to_value(restored).unwrap()["ampToError"], 0);
+    assert_eq!(serde_json::to_value(&restored).unwrap()["ampToError"], 0);
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap()["ampNonReciprocal"],
+        0
+    );
 }
 
 #[test]

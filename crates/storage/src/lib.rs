@@ -132,6 +132,7 @@ pub enum IssueView {
     PaginationNextNonReciprocal,
     PaginationPrevNonReciprocal,
     AmpToError,
+    AmpNonReciprocal,
     DirectivesNoindex,
     ImagesMissingAlt,
     ImagesAltTooLong,
@@ -662,6 +663,8 @@ pub struct CrawlSummary {
     pub pagination_prev_non_reciprocal: usize,
     #[serde(default)]
     pub amp_to_error: usize,
+    #[serde(default)]
+    pub amp_non_reciprocal: usize,
     pub noindex: usize,
     pub images_missing_alt: usize,
     pub images_alt_too_long: usize,
@@ -2093,7 +2096,7 @@ struct CachedSummary {
 
 struct CachedReferences {
     revision: i64,
-    counts: [usize; 13],
+    counts: [usize; 14],
 }
 
 struct CachedExactDuplicates {
@@ -3627,7 +3630,7 @@ impl SqliteStore {
         Ok(summary)
     }
 
-    fn ensure_reference_diagnostics(&self, conn: &Connection) -> Result<[usize; 13], StorageError> {
+    fn ensure_reference_diagnostics(&self, conn: &Connection) -> Result<[usize; 14], StorageError> {
         let revision = crawl_audit_revision(conn)?;
         let mut cache = self
             .reference_cache
@@ -7062,7 +7065,7 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
         | IssueView::PaginationNextToError | IssueView::PaginationPrevToError
         | IssueView::PaginationNextLoop | IssueView::PaginationPrevLoop
         | IssueView::PaginationNextNonReciprocal | IssueView::PaginationPrevNonReciprocal
-        | IssueView::AmpToError => {
+        | IssueView::AmpToError | IssueView::AmpNonReciprocal => {
             let mask = reference_view_mask(&query.view).expect("reference view");
             clauses.push(format!("id IN (SELECT record_id FROM ff_reference_diagnostics WHERE (flags & {mask}) != 0)"));
         }
@@ -7637,6 +7640,8 @@ pub struct ReferenceDiagnostics {
     pub pagination_next_to_error: bool,
     pub pagination_prev_to_error: bool,
     pub amp_to_error: bool,
+    /// An observed complete HTML AMP target does not canonically return to its source.
+    pub amp_non_reciprocal: bool,
     /// The source's next-only path enters a cycle, including self-pagination.
     pub pagination_next_loop: bool,
     /// The source's previous-only path enters a cycle, including self-pagination.
@@ -7657,6 +7662,7 @@ impl ReferenceDiagnostics {
             | (u16::from(self.pagination_prev_loop) << 10)
             | (u16::from(self.pagination_next_non_reciprocal) << 11)
             | (u16::from(self.pagination_prev_non_reciprocal) << 12)
+            | (u16::from(self.amp_non_reciprocal) << 13)
     }
 }
 
@@ -7861,11 +7867,44 @@ fn build_reference_diagnostics(records: &[ReferenceAuditRecord]) -> Vec<Referenc
             };
             let next_target = observed_target(record.rel_next.as_deref());
             let prev_target = observed_target(record.rel_prev.as_deref());
+            let amp_target = observed_target(record.amphtml.as_deref());
             let target_has_error =
                 |target: Option<usize>| target.is_some_and(|index| records[index].target_error);
             diagnostic.pagination_next_to_error = target_has_error(next_target);
             diagnostic.pagination_prev_to_error = target_has_error(prev_target);
-            diagnostic.amp_to_error = target_has_error(observed_target(record.amphtml.as_deref()));
+            diagnostic.amp_to_error = target_has_error(amp_target);
+            diagnostic.amp_non_reciprocal = amp_target
+                .filter(|&index| records[index].eligible)
+                .is_some_and(|index| {
+                    let canonical = records[index]
+                        .canonical
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let Some(canonical) = canonical else {
+                        return true;
+                    };
+                    let Some(canonical) = normalized_final_url(canonical) else {
+                        return false;
+                    };
+                    let aliases = url_aliases(&canonical);
+                    if aliases_overlap(&aliases, &source_aliases) {
+                        return false;
+                    }
+                    let returned = aliases
+                        .iter()
+                        .filter_map(|alias| targets.get(alias).and_then(|target| target.observed))
+                        .filter(|candidate| records[candidate.3].eligible)
+                        .min()
+                        .map(|candidate| candidate.3);
+                    match (
+                        normalized_final_url(&record.final_url),
+                        returned.and_then(|index| normalized_final_url(&records[index].final_url)),
+                    ) {
+                        (Some(source), Some(returned)) => source != returned,
+                        _ => false,
+                    }
+                });
             let source_final = normalized_final_url(&record.final_url);
             let loop_target = |target: Option<usize>| {
                 target
@@ -8068,12 +8107,13 @@ fn reference_view_mask(view: &IssueView) -> Option<u16> {
         IssueView::PaginationPrevLoop => 1024,
         IssueView::PaginationNextNonReciprocal => 2048,
         IssueView::PaginationPrevNonReciprocal => 4096,
+        IssueView::AmpNonReciprocal => 8192,
         _ => return None,
     })
 }
 
-fn reference_counts(diagnostics: &[ReferenceDiagnostics]) -> [usize; 13] {
-    let mut counts = [0; 13];
+fn reference_counts(diagnostics: &[ReferenceDiagnostics]) -> [usize; 14] {
+    let mut counts = [0; 14];
     for diagnostic in diagnostics {
         for (index, count) in counts.iter_mut().enumerate() {
             *count += usize::from(diagnostic.flags() & (1 << index) != 0);
@@ -8082,7 +8122,7 @@ fn reference_counts(diagnostics: &[ReferenceDiagnostics]) -> [usize; 13] {
     counts
 }
 
-fn set_reference_summary(summary: &mut CrawlSummary, counts: [usize; 13]) {
+fn set_reference_summary(summary: &mut CrawlSummary, counts: [usize; 14]) {
     [
         summary.canonical_uncrawled,
         summary.canonical_to_redirect,
@@ -8097,6 +8137,7 @@ fn set_reference_summary(summary: &mut CrawlSummary, counts: [usize; 13]) {
         summary.pagination_prev_loop,
         summary.pagination_next_non_reciprocal,
         summary.pagination_prev_non_reciprocal,
+        summary.amp_non_reciprocal,
     ] = counts;
 }
 
@@ -8326,6 +8367,7 @@ fn matches_view(
         IssueView::PaginationNextNonReciprocal => references.pagination_next_non_reciprocal,
         IssueView::PaginationPrevNonReciprocal => references.pagination_prev_non_reciprocal,
         IssueView::AmpToError => references.amp_to_error,
+        IssueView::AmpNonReciprocal => references.amp_non_reciprocal,
         IssueView::DirectivesNoindex => row.indexability_status.to_lowercase().contains("noindex"),
         IssueView::ImagesMissingAlt => row.images_missing_alt > 0,
         IssueView::ImagesAltTooLong => row.images_alt_too_long > 0,
@@ -8420,6 +8462,7 @@ fn is_html_audit_view(view: &IssueView) -> bool {
             | IssueView::PaginationNextNonReciprocal
             | IssueView::PaginationPrevNonReciprocal
             | IssueView::AmpToError
+            | IssueView::AmpNonReciprocal
             | IssueView::ImagesMissingAlt
             | IssueView::ImagesAltTooLong
             | IssueView::SecurityMixedContent
