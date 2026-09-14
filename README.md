@@ -148,6 +148,20 @@ Existing capabilities:
 
 See `ROADMAP.md` for the phased implementation plan.
 
+## Saved audit reports
+
+**Tools > Audit reports** prepares a separate report from a completed, stopped or imported saved crawl. Choose a title, English/Turkish output and either the whole crawl or the current crawl's explicit filter. Opening a report makes no website requests. Its evidence, counts, thresholds and source coverage stay fixed after the source crawl changes or is deleted.
+
+Reports currently cover 16 page rules plus retained broken-link evidence. Coverage lists unsupported checks and unavailable captures explicitly; imported crawls retain their provenance and partial-coverage label. Counts distinguish original page URLs, List records, source pages, targets and link occurrences; legacy links cannot be attributed to an exact List occurrence. Measured priorities and recommended actions remain available without AI. The evidence workspace queries 100 rows at a time, with search, HTTP status filtering and sorting over the full matching population. Large observed fields use labelled previews; complete stored values remain in the export.
+
+**Export complete report** creates a portable folder containing `index.html`, linked evidence pages with at most 1,000 rows each, complete per-finding CSV files and a manifest. Open `index.html` directly from disk. Share the entire folder to include every affected URL; copying only the index loses its linked evidence. The existing summary HTML export remains a separate, sampled summary. Cancellation or a write failure removes the unpublished package and preserves earlier exports.
+
+Optional AI explanations reuse **Settings > AI**. Review the provider, data categories, sampled evidence and request/input budget before sending. Only bounded captured excerpts are sent; no website refetch occurs. Model text is labelled as interpretation and cannot replace measured counts or evidence membership. Completed annotations survive failed or cancelled attempts; the same settings and frozen input resume unfinished findings. Different provider/model/prompt inputs create a separate generation. The latest attempt remains available for retry while a prior complete generation stays available for presentation and export with its own provenance. Token usage stays unavailable when the provider omits it.
+
+**Report follow-up** compares two frozen reports and saves its own before/after evidence. Status filters distinguish verified fixes, additions, unchanged findings and mixed changes. Missing, blocked, failed or incompatible current observations cannot become verified fixes. Saved comparisons remain accessible after either source report is deleted, and their complete HTML/CSV package also opens directly from disk. Optional comparison AI uses the same explicit budget/preview workflow, receiving computed states and bounded before/after examples. Its explanations stay separate from the measured changes and are included in the offline package with their generation provenance.
+
+The [report benchmark](docs/BENCHMARKS.md#frozen-audit-reports-100000-pages-and-1000001-links) reconciles 100,000 affected pages and 1,000,001 link occurrences across complete HTML/CSV output. `make test-audit-reports` verifies report and comparison navigation offline; the Linux native smoke additionally exercises real saved-report preparation, process restart and export.
+
 ## Goals
 
 - Crawl websites concurrently with configurable safety and throughput controls.

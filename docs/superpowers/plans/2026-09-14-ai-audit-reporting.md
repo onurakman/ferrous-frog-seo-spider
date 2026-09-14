@@ -2,7 +2,7 @@
 
 > **For agentic workers:** Use superpowers:subagent-driven-development or superpowers:executing-plans when implementation is requested. Work task by task; the checkboxes below track implementation, not planning completion.
 
-**Status:** Planned and authorized for implementation. Work starts with AI-R01; unchecked items remain incomplete. No external AI requests are required for development fixtures.
+**Status:** AI-R01–AI-R06 implemented and verified on 2026-09-14. Full CI, offline navigation, the 100,000-page / 1,000,001-link workload and the Linux native report lifecycle passed. AI fixtures use local mocks; no external AI requests or private crawl data were required. Windows/macOS and installer validation remain separate roadmap work.
 
 **Goal:** Produce a polished, shareable site audit with useful AI explanations and access to every affected URL and evidence occurrence, including reports comparing two crawls.
 
@@ -48,8 +48,8 @@ The first release includes a single-crawl report, complete evidence browsing, op
 
 ## Report workflow and presentation
 
-1. From a saved crawl, choose **Create audit report**. Select whole crawl (default) or an explicit saved filter/segment, report title and language; inspect the resulting scope. Enable **AI explanations** optionally using the existing provider configuration.
-2. Prepare deterministic findings first. Show progress and capture coverage, then estimate the request/input budget for optional AI work. Starting the report with AI enabled is the explicit send action; ordinary report opening/exporting sends nothing.
+1. Open **Tools > Audit reports**, select a saved crawl and choose **Create report**. Select whole crawl (default) or an explicit saved filter/segment, report title and language; inspect the resulting scope. Enable **AI explanations** optionally using the existing provider configuration.
+2. Prepare deterministic findings first. Show progress and capture coverage, then estimate the request/input budget for optional AI work. After preparation, **Review AI data and budget** previews the bounded request; the separate **Send evidence** action authorizes generation. Ordinary report opening/exporting sends nothing.
 3. Open a full workspace with report metadata, measured summary cards, an executive summary, finding filters and a prioritized action list. AI interpretation is identified separately from observed facts. Do not invent a numeric SEO score, delivery estimate, launch-blocker verdict or guaranteed ranking impact.
 4. Each finding includes severity, category, suggested responsible team, explanation, affected unique URL count, record/occurrence count, available evidence and recommended fix/verification steps. Distinguish a detected issue from a suggested cause or broader AI interpretation.
 5. **View all affected URLs** opens a dedicated evidence area, not another cramped modal. Provide backend search, sorting, filters, 100-row virtualized pages, full URL copy, selected evidence inspection and **Export all matching evidence**. Show `1–100 of N`; a small preview is explicitly labelled as examples.
@@ -69,7 +69,7 @@ Use a report-owned SQLite snapshot, with Memory/SQLite source adapters exposing 
 
 Unique URLs, List records, link/image occurrences and finding counts are different units. For example, one broken destination referenced 600 times on 40 pages must expose **1 target / 40 pages / 600 references** rather than one ambiguous “600 issues” figure. Percentages use an explicit eligible population and handle zero denominators.
 
-The proposed command boundary is `prepare_audit_report`, `query_audit_report_findings`, `query_audit_report_evidence`, `run_audit_report_ai`, `cancel_audit_report` (run-ID-based cancellation for preparation, AI and export), `export_audit_report` and `delete_audit_report`. Queries take a report ID plus validated filter/sort/offset/limit and return rows with a complete matching total. Use a 100-row default and a 1,000-row maximum; cap individual text previews separately at 64 KiB. These are new interfaces to implement, not current APIs.
+The implemented command boundary includes `prepare_audit_report`, `query_audit_report_findings`, `query_audit_report_evidence`, `run_audit_report_ai`, `cancel_audit_report` (run-ID-based cancellation for preparation, AI and export), `export_audit_report` and `delete_audit_report`. Queries take a report ID plus validated filter/sort/offset/limit and return rows with a complete matching total. Use a 100-row default and a 1,000-row maximum; cap individual text previews separately at 64 KiB. Single-crawl and comparison AI use corresponding preview/get/run commands with the same bounded job, status and cancellation model.
 
 Persist report evidence independently of source sessions, and delete it when its report is deleted. Partial preparation never becomes a ready report. AI failure preserves the deterministic report and prior completed annotations; interrupted runs can resume only unfinished batches for the same report/input/provider/model/prompt configuration. Changed inputs create a new generation version.
 
@@ -113,46 +113,46 @@ Show before/after values, changed coverage and separate full lists for resolved,
 
 ### AI-R02: Saved report lifecycle and full workspace
 
-**Files:** Add `src-tauri/src/audit_reports.rs` and `src/AuditReportWorkspace.tsx`; wire `src-tauri/src/main.rs`, `src/App.tsx` and `src/styles.css`. Extend `scripts/smoke-ui.mjs` with synthetic report IPC.
+**Files:** Add `src-tauri/src/audit_reports.rs` and `src/AuditReportWorkspace.tsx`; wire `src-tauri/src/main.rs`, `src/App.tsx` and `src/audit-report.css`. Extend `scripts/smoke-ui.mjs` with synthetic report IPC.
 
-- [ ] Exercise prepare/query/delete, cancellation, partial preparation, source deletion, restart/reopen and stale responses before adding UI wiring. Require no website requests and no active-session replacement.
-- [ ] Implement the report-owned worker lifecycle and proposed bounded commands, then the report launcher, summary/findings view and full evidence area. Persist report language and scope on the report itself.
-- [ ] Prove that `1–100 of 1,205` can reach record 1,205, search can find an off-page record, and count cards/filter totals remain consistent. Verify keyboard, both themes, narrow layouts and 64 KiB preview truncation.
-- [ ] Run `cargo test -p ferrous-frog-app --locked` and `make test-ui`; update user documentation and commit.
+- [x] Exercise prepare/query/delete, cancellation, partial preparation, source deletion, restart/reopen and stale responses before adding UI wiring. Require no website requests and no active-session replacement.
+- [x] Implement the report-owned worker lifecycle and proposed bounded commands, then the report launcher, summary/findings view and full evidence area. Persist report language and scope on the report itself.
+- [x] Prove that `1–100 of 1,205` can reach record 1,205, search can find an off-page record, and count cards/filter totals remain consistent. Verify keyboard, both themes, narrow layouts and 64 KiB preview truncation.
+- [x] Run `cargo test -p ferrous-frog-app --locked` and `make test-ui`; update user documentation and commit.
 
 ### AI-R03: Optional AI explanations over frozen findings
 
-**Files:** Reuse `src-tauri/src/ai.rs` settings and add report orchestration to `src-tauri/src/audit_reports.rs`. Add report prompt/validation helpers in `crates/integrations/src/llm.rs`; extend the report workspace and targeted fixtures.
+**Files:** Reuse `src-tauri/src/ai.rs` settings and add report orchestration in `src-tauri/src/audit_report_ai.rs`. Add report prompt/validation helpers in `crates/integrations/src/report_ai.rs` and bounded transport handling in `llm.rs`; extend the report workspace and targeted fixtures.
 
-- [ ] Add mock-provider failures for unknown evidence IDs, invalid/oversized/truncated output, refusal, timeout, rate limiting and injected page instructions. Assert that no provider output can replace counts or evidence membership.
-- [ ] Implement opt-in bounded batches, data/budget preview, progress, cancellation, usage reporting and resumable annotation versions. Reuse credentials without serializing them into reports or archives.
-- [ ] Test a report with more findings than its AI budget permits: all findings and all evidence must remain accessible, while unprocessed explanations stay explicitly pending. Preserve existing annotations on retry failure.
-- [ ] Run `cargo test -p ferrous-frog-integrations -p ferrous-frog-app --locked` and the report UI smoke; document provider/data limits and commit.
+- [x] Add mock-provider failures for unknown evidence IDs, invalid/oversized/truncated output, refusal, timeout, rate limiting and injected page instructions. Assert that no provider output can replace counts or evidence membership.
+- [x] Implement opt-in bounded batches, data/budget preview, progress, cancellation, usage reporting and resumable annotation versions. Reuse credentials without serializing them into reports or archives.
+- [x] Test a report with more findings than its AI budget permits: all findings and all evidence must remain accessible, while unprocessed explanations stay explicitly pending. Preserve existing annotations on retry failure.
+- [x] Run `cargo test -p ferrous-frog-integrations -p ferrous-frog-app --locked` and the report UI smoke; document provider/data limits and commit.
 
 ### AI-R04: Portable report with every affected URL
 
 **Files:** Add `crates/export/src/audit_report.rs` and a dedicated report template alongside `crates/export/templates/seo_report.html.j2`; integrate `crates/export/src/lib.rs` and native report export commands. Add a focused offline report check under `scripts/`.
 
-- [ ] Test a 1,205-row finding with a unique final record before implementing export. Require two linked evidence pages, exactly 1,205 CSV data rows, matching manifest totals and a reachable last record.
-- [ ] Build the self-contained HTML/CSV folder through bounded writers and atomic directory publication; reuse template escaping, spreadsheet safety and existing export destination conventions.
-- [ ] Verify direct `file://` navigation offline, full URL/value preservation, no remote assets, print styles and no lost rows at page boundaries. Inject write/cancellation failures and confirm prior exports survive.
-- [ ] Run `cargo test -p ferrous-frog-export -p ferrous-frog-app --locked` plus the offline browser check; document that the complete artifact includes its evidence folder and commit.
+- [x] Test a 1,205-row finding with a unique final record before implementing export. Require two linked evidence pages, exactly 1,205 CSV data rows, matching manifest totals and a reachable last record.
+- [x] Build the self-contained HTML/CSV folder through bounded writers and atomic directory publication; reuse template escaping, spreadsheet safety and existing export destination conventions.
+- [x] Verify direct `file://` navigation offline, full URL/value preservation, no remote assets, print styles and no lost rows at page boundaries. Inject write/cancellation failures and confirm prior exports survive.
+- [x] Run `cargo test -p ferrous-frog-export -p ferrous-frog-app --locked` plus the offline browser check; document that the complete artifact includes its evidence folder and commit.
 
 ### AI-R05: Comparison and remediation follow-up
 
 **Files:** Extend report storage/native/export/workspace modules. Reuse `src-tauri/src/comparison.rs`, `src-tauri/src/comparison_sources.rs` and comparison identity helpers only where their semantics apply; record-only comparison snapshots do not supply link/image evidence automatically.
 
-- [ ] Add fixtures for a verified fix, recurrence, additions/removals with unchanged net counts, changed rule thresholds, response-only noise, shuffled duplicate List inputs and a removed/blocked baseline URL.
-- [ ] Compute before/after membership and comparability from frozen snapshots. Expose status filters, measured deltas and complete evidence sets in both the workspace and portable report.
-- [ ] Verify that missing pages cannot become “Resolved” and AI text cannot change computed status. Keep report generation isolated from the active comparison workspace and crawl.
-- [ ] Run the affected Rust suites, comparison/report UI smoke and offline export check; update comparison documentation and commit.
+- [x] Add fixtures for a verified fix, recurrence, additions/removals with unchanged net counts, changed rule thresholds, response-only noise, shuffled duplicate List inputs and a removed/blocked baseline URL.
+- [x] Compute before/after membership and comparability from frozen snapshots. Expose status filters, measured deltas and complete evidence sets in both the workspace and portable report.
+- [x] Verify that missing pages cannot become “Resolved” and AI text cannot change computed status. Keep report generation isolated from the active comparison workspace and crawl.
+- [x] Run the affected Rust suites, comparison/report UI smoke and offline export check; update comparison documentation and commit.
 
 ### AI-R06: Scale and release acceptance
 
-- [ ] Exercise at least 100,000 affected evidence rows and more than 1,000,000 link occurrences. Demonstrate bounded UI/IPC/export pages, full final-record reachability and count reconciliation; record memory, preparation, query and export measurements in `docs/BENCHMARKS.md`.
-- [ ] Verify incomplete/legacy evidence is labelled accurately, report restart/reopen remains independent of source edits, and cancelled generation/export frees temporary resources.
-- [ ] Run `make ci` and the new offline report check. Fix and complete the existing native Linux harness before relying on a real desktop report workflow check; document unavailable platform checks separately.
-- [ ] Mark individual AI-R items complete only after their evidence passes. Update `README.md`, `ROADMAP.md` and `docs/CONFIGURATION_BACKLOG.md`; do not mark sitewide reporting available based solely on existing per-URL AI.
+- [x] Exercise at least 100,000 affected evidence rows and more than 1,000,000 link occurrences. Demonstrate bounded UI/IPC/export pages, full final-record reachability and count reconciliation; record memory, preparation, query and export measurements in `docs/BENCHMARKS.md`.
+- [x] Verify incomplete/legacy evidence is labelled accurately, report restart/reopen remains independent of source edits, and cancelled generation/export frees temporary resources.
+- [x] Run `make ci` and the new offline report check. Fix and complete the existing native Linux harness before relying on a real desktop report workflow check; document unavailable platform checks separately.
+- [x] Mark individual AI-R items complete only after their evidence passes. Update `README.md`, `ROADMAP.md` and `docs/CONFIGURATION_BACKLOG.md`; do not mark sitewide reporting available based solely on existing per-URL AI.
 
 ## Main acceptance example
 
@@ -160,9 +160,12 @@ For a finding with **12,480 affected pages**, the report may display 10 labelled
 
 ## Implementation checkpoint
 
-- AI-R01 storage foundation is verified with focused Memory/SQLite fixtures and storage/analysis suites. It supports 16 page rules plus retained broken-link evidence; unsupported checks remain explicit.
-- AI-R02 native preparation/query/reopen/cancellation/source-change checks pass. Workspace interaction and integrated UI acceptance are still in progress.
-- AI-R03 strict prompt/reference validation, bounded provider reads, retry metadata, optional usage and resumable native annotations are implemented; final review/UI acceptance remain in progress.
-- AI-R04 deterministic export passed 1,205-row reconciliation, full CSV, cancellation, hostile text and real offline Chrome navigation. AI annotation presentation and integrated native/UI acceptance are in progress.
-- AI-R05 comparison storage and AI-R06 scale/release acceptance remain in progress; no completion claim for these items.
-- The existing local Linux native crawl/reopen/quit smoke passed after its harness repair. Windows, macOS and installer checks remain outstanding.
+- AI-R01: 16 page rules and retained broken-link evidence use consistent frozen Memory/SQLite snapshots. Counts, source identities, eligibility, unsupported checks and imported/partial provenance are explicit.
+- AI-R02: the full workspace supports saved reports, measured priorities, severity/category/team filters, bounded evidence search/sort/HTTP status filtering and complete matching CSV export. UI smoke reaches record 1,205, preserves stale-response isolation and checks themes, keyboard access and narrow windows.
+- AI-R03: optional annotations and executive overviews use strict reference validation, bounded provider reads, request/input budgets, retry metadata, cancellation and resumable sidecar versions. Failed new attempts preserve earlier usable generations with explicit model/version provenance in UI and export.
+- AI-R04: complete offline HTML/CSV packages preserve full stored evidence, escape captured/model text, reconcile all counts and publish atomically. Real Chrome opens local pages and reaches the last row; cancellation/write failures preserve earlier exports.
+- AI-R05: independent frozen comparisons retain complete before/after evidence after source-report deletion. Missing/incompatible observations never imply a verified fix. Optional AI consumes typed computed changes through the same runner, and complete comparison packages include validated commentary and generation provenance.
+- AI-R06: the scale fixture reconciles 1,100,002 evidence rows from 100,000 affected pages and 1,000,001 links. Indexed export cursors eliminate repeated full counts/offset scans on complete exports; measurements and known limits are in `docs/BENCHMARKS.md`.
+- `make ci` passed, including full workspace tests, formatting, Clippy, UI/offline checks and seven serialized real-Chrome rendering fixtures. After the final shared deletion rollback fix, all 121 native application tests, application Clippy and formatting passed again. The rebuilt embedded-assets debug application passed the complete Linux crawl/report/restart/export/quit smoke.
+- Additional authorized roadmap work: recovery summaries now read native counts without hydrating the full queue/seen checkpoint. The one-million-seen SQLite median fell from 72.260 ms to 1.158 ms in the isolated benchmark; UI Resume selection uses the same stale-response guard as the recovery data.
+- Windows, macOS, installers, broader physical-disk/concurrent-UI benchmarks and remaining technical audit rules are still tracked separately; this delivery does not claim those complete.

@@ -53,6 +53,10 @@ function setupFixture(mockIPC, emit) {
   window.testCaptureQueries = [];
   window.testCaptureDelays = {};
   window.testComparisonRequests = [];
+  window.testAuditReports = [];
+  window.testAuditRequests = [];
+  window.testAuditCancels = [];
+  window.testAuditComparisons = [];
   window.testPendingComparisons = [];
   window.testDuplicates = false;
   window.testEmptyDataset = false;
@@ -357,6 +361,47 @@ function setupFixture(mockIPC, emit) {
       delete window.testComparisonSnapshots?.[args.comparisonId];
       return;
     }
+    if (cmd === "list_audit_reports") return { rows: window.testAuditReports.slice(args.offset, args.offset + args.limit), total: window.testAuditReports.length };
+    if (cmd === "prepare_audit_report") {
+      if (window.testHoldAuditPrepare) await new Promise((resolve) => { window.testFinishAuditPrepare = resolve; });
+      const request = { id: args.request.requestId, ...args.request, sourceStatus: "completed" };
+      const report = { request, status: "ready", partial: false, sourceRecords: 1205, scopeRecords: 1205, eligibleHtmlRecords: 1205, blockedRecords: 0, failedRecords: 0, unavailableHtmlRecords: 0, findingCount: 1, coverage: [{ ruleId: "title.missing", state: "measured", eligibleRecords: 1205, reason: "Captured HTML titles." }] };
+      window.testAuditReports.unshift(report); window.testAuditRequests.push({ command: cmd, ...args.request }); return report;
+    }
+    if (cmd === "get_audit_report") return window.testAuditReports.find((report) => report.request.id === args.reportId);
+    if (cmd === "list_audit_report_comparisons") return { rows: window.testAuditComparisons.slice(args.offset, args.offset + args.limit), total: window.testAuditComparisons.length };
+    if (cmd === "prepare_audit_report_comparison") {
+      const baseline = window.testAuditReports.find((report) => report.request.id === args.baselineReportId); const current = window.testAuditReports.find((report) => report.request.id === args.currentReportId); if (!baseline || !current) throw new Error("Comparison reports are missing");
+      const item = { id: args.requestId, summary: { schemaVersion: 1, identityVersion: "request-url-occurrence-v1", status: "ready", baselineReportId: baseline.request.id, currentReportId: current.request.id, baseline, current, findingCount: 2, evidenceRows: 2, compatibilityReasons: [] } }; window.testAuditComparisons.unshift(item); return item;
+    }
+    if (cmd === "get_audit_report_comparison") return window.testAuditComparisons.find((item) => item.id === args.comparisonId);
+    if (cmd === "query_audit_report_comparison_findings") {
+      const rows = [{ findingId: "title.missing", title: "Missing page title", severity: "error", category: "Titles", status: "resolved", added: 0, persisting: 0, resolved: 1, notObserved: 0, newlyObservedCurrent: 0, unverifiedCurrent: 0, countUnit: "original requests", compatibilityReasons: [] }, { findingId: "links.broken", title: "Broken links", severity: "warning", category: "Links", status: "notComparable", added: 0, persisting: 0, resolved: 0, notObserved: 1, newlyObservedCurrent: 0, unverifiedCurrent: 1, countUnit: "targets", compatibilityReasons: ["The rule was not measured with compatible coverage in both reports."] }]; const filtered = rows.filter((row) => (!args.query.status || row.status === args.query.status) && (!args.query.search || row.title.toLowerCase().includes(args.query.search.toLowerCase()))); return { rows: filtered.slice(args.query.offset, args.query.offset + args.query.limit), total: filtered.length };
+    }
+    if (cmd === "query_audit_report_comparison_evidence") {
+      if (window.testHoldComparisonEvidence) await new Promise((resolve) => { window.testFinishComparisonEvidence = resolve; });
+      const rows = args.query.findingId === "title.missing" ? [{ id: 1, findingId: "title.missing", identityKey: "row-1", requestUrl: "https://example.test/fixed", occurrence: 1, state: "resolved", reason: "The baseline observation was not present in the current report.", baseline: { originalUrl: "https://example.test/fixed", observed: { title: "" } }, current: { originalUrl: "https://example.test/fixed", observed: { title: "Fixed title" } }, previewTruncated: false }] : [{ id: 2, findingId: "links.broken", identityKey: "row-2", requestUrl: "https://example.test/not-observed", occurrence: 1, state: "notObserved", reason: "Current evidence was not observed; this does not verify a fix.", baseline: { originalUrl: "https://example.test/not-observed", observed: { statusCode: 404 } }, current: null, previewTruncated: false }]; const filtered = rows.filter((row) => (!args.query.state || row.state === args.query.state) && (!args.query.search || row.requestUrl.includes(args.query.search))); return { rows: filtered.slice(args.query.offset, args.query.offset + args.query.limit), total: filtered.length };
+    }
+    if (cmd === "export_audit_report_comparison") { window.testAuditRequests.push({ command: cmd, ...args }); return { path: "/tmp/ferrous-report-comparison/index.html", rowCount: 2 }; }
+    if (cmd === "delete_audit_report_comparison") { window.testAuditComparisons = window.testAuditComparisons.filter((item) => item.id !== args.comparisonId); return; }
+    if (cmd === "get_audit_report_comparison_ai") return null;
+    if (cmd === "preview_audit_report_comparison_ai") { window.testAuditRequests.push({ command: cmd, ...args }); return { version: "fixture-comparison-ai-v1", previewDigest: "fixture-comparison-preview-digest", provider: "Fixture provider", model: "fixture-comparison-model", endpoint: "https://ai.fixture.test", findingCount: 2, completedFindings: 0, pendingFindings: 2, estimatedRequests: 1, estimatedInputChars: 1200, sampledEvidence: 2, overviewPending: true, overviewPlanned: true, samplingPolicy: "One stored comparison observation per finding.", dataCategories: ["Measured comparison states", "Before and after observations"], options: args.options }; }
+    if (cmd === "run_audit_report_comparison_ai") { window.testAuditRequests.push({ command: cmd, ...args.request }); if (window.testComparisonAiError) throw new Error("Comparison AI provider unavailable"); return { version: args.request.expectedVersion, status: "completed", provider: "Fixture provider", model: "fixture-comparison-model", findingCount: 2, completedFindings: 2, requests: 1, inputChars: 1200, rows: [{ findingId: "title.missing", evidenceIds: ["1"], explanation: "The title issue was resolved.", recommendation: "Keep the title check.", verification: "Run another frozen comparison.", suggestedTeam: "Content", model: "fixture-comparison-model", generatedAtMs: 0, sampleCount: 1, evidenceTotal: 1 }] }; }
+    if (cmd === "get_audit_report_ai") return null;
+    if (cmd === "preview_audit_report_ai") return { version: "fixture-ai-v1", previewDigest: "fixture-preview-digest", provider: "Fixture provider", model: "fixture-model", endpoint: "https://ai.fixture.test", findingCount: 205, completedFindings: 0, pendingFindings: 205, estimatedRequests: 10, estimatedInputChars: 12_000, sampledEvidence: 30, overviewPending: true, overviewPlanned: true, samplingPolicy: "Up to 3 stored examples per finding.", dataCategories: ["Finding titles", "Measured counts", "Captured URL examples"], options: args.options };
+    if (cmd === "run_audit_report_ai") { if (window.testAuditAiError) throw new Error("AI provider unavailable"); const preservedGeneration = { version: args.request.expectedVersion, status: "completed", provider: "Fixture provider", model: "fixture-model", findingCount: 205, completedFindings: 205, requests: 10, inputChars: 12_000, overview: { summary: "<strong>Fixture overview</strong>", prioritizedFindingIds: ["title.missing"], limitations: ["<em>Only validated annotations are included.</em>"], model: "fixture-model", generatedAtMs: 0, includedFindingCount: 2, totalFindingCount: 205, sampledEvidenceCount: 30, partialCoverage: true }, rows: [{ findingId: "title.missing", evidenceIds: ["evidence-1"], explanation: "Fixture explanation.", recommendation: "Add titles.", verification: "Recrawl.", suggestedTeam: "Content", model: "fixture-model", generatedAtMs: 0, sampleCount: 1, evidenceTotal: 1205 }] }; return { version: "fixture-ai-v2", status: "failed", provider: "Fixture provider", model: "failed-fixture-model", findingCount: 205, completedFindings: 0, requests: 1, inputChars: 1200, error: "Fixture provider timed out", rows: [], exportGenerationVersion: args.request.expectedVersion, preservedGeneration }; }
+    if (cmd === "delete_audit_report") { if (window.testAuditDeleteError) throw new Error("Could not delete this report"); window.testAuditReports = window.testAuditReports.filter((report) => report.request.id !== args.reportId); return; }
+    if (cmd === "query_audit_report_findings") {
+      window.testAuditRequests.push({ command: cmd, ...args.query }); const rows = [{ id: "title.missing", title: "Missing page title", severity: "error", category: "Titles", counts: { uniqueUrls: 1205, sourceRecords: 1205, sourcePages: 1205, occurrences: 1205 }, coverage: "measured", explanation: "Captured pages have no title.", recommendation: "Add a descriptive title.", verification: "Recrawl and confirm the title is present.", suggestedTeam: "Content" }, ...Array.from({ length: 204 }, (_, index) => ({ id: `fixture-${index + 1}`, title: `Fixture finding ${index + 1}`, severity: "info", category: "Fixture", counts: { uniqueUrls: 1, sourcePages: 1, occurrences: 1 }, coverage: "measured", explanation: "Fixture finding.", recommendation: "Review fixture.", verification: "Verify fixture.", suggestedTeam: "Engineering" }))];
+      const filtered = rows.filter((row) => (!args.query.search || row.title.toLowerCase().includes(args.query.search.toLowerCase())) && (!args.query.category || row.category.toLowerCase().includes(args.query.category.toLowerCase())) && (!args.query.team || row.suggestedTeam.toLowerCase().includes(args.query.team.toLowerCase())) && (!args.query.severity || row.severity === args.query.severity)); return { rows: filtered.slice(args.query.offset, args.query.offset + args.query.limit), total: filtered.length };
+    }
+    if (cmd === "query_audit_report_evidence") {
+      window.testAuditRequests.push({ command: cmd, ...args.query }); const rows = Array.from({ length: 1205 }, (_, index) => ({ id: `evidence-${index + 1}`, originalUrl: `https://example.test/report-${String(index + 1).padStart(4, "0")}`, finalUrl: `https://example.test/report-${String(index + 1).padStart(4, "0")}`, kind: "page", attribution: "exactRecord", listPosition: index + 1, previewTruncated: index === 1204, observed: { title: index === 1204 ? "Last observed title" : "", statusCode: index === 1204 ? 404 : 200 } }));
+      const filtered = rows.filter((row) => (!args.query.search || row.originalUrl.includes(args.query.search)) && (!args.query.statusCode || row.observed.statusCode === args.query.statusCode)); return { rows: filtered.slice(args.query.offset, args.query.offset + args.query.limit), total: filtered.length };
+    }
+    if (cmd === "export_audit_report") { if (window.testHoldAuditExport) await new Promise((resolve) => { window.testFinishAuditExport = resolve; }); return { path: "/tmp/ferrous-audit-report/index.html", rowCount: 1205 }; }
+    if (cmd === "export_audit_report_evidence") { window.testAuditRequests.push({ command: cmd, ...args.query }); if (window.testHoldAuditEvidenceExport) await new Promise((resolve) => { window.testFinishAuditEvidenceExport = resolve; }); return { path: "/tmp/ferrous-audit-report/title-missing.csv", rowCount: 1 }; }
+    if (cmd === "cancel_audit_report") { window.testAuditCancels.push(args.requestId); return true; }
     if (cmd === "list_config_profiles") return window.testProfiles ?? (window.testProfile ? [window.testProfile] : []);
     if (cmd === "load_config_profile") {
       const profile = (window.testProfiles ?? [window.testProfile]).find((item) => item.id === args.profileId);
@@ -396,7 +441,7 @@ function setupFixture(mockIPC, emit) {
       window.testEmit({ kind: "started" });
       return session;
     }
-    if (cmd === "pause_crawl" || cmd === "resume_crawl") return;
+    if (cmd === "pause_crawl" || cmd === "resume_crawl" || cmd === "stop_crawl") return;
     if (cmd === "open_database_path") {
       window.testWorkspaceCalls = (window.testWorkspaceCalls ?? 0) + 1;
       if (window.testHoldWorkspace) await new Promise((resolve) => { window.testFinishWorkspace = resolve; });
@@ -2375,6 +2420,133 @@ try {
   assert.equal(await evaluate("testComparisonRequests.filter((request) => request.command === 'open_crawl_comparison').length"), archivePreparations, "Archive filters must reuse the prepared snapshot");
   await evaluate("testComparisonOnlyResponses = false");
   await click('[title="Close crawl comparison"]');
+  await menuItem("Audit reports");
+  await until("document.querySelector('.audit-report-modal')", "Audit reports must open from Tools");
+  await fill('[aria-label="Audit report title"]', 'Saved deterministic audit');
+  await click('.audit-report-launcher .primary');
+  await until("document.querySelector('.audit-report-summary')?.textContent.includes('1,205') && document.querySelector('[data-audit-finding-id=\"title.missing\"]')", "Preparing a saved crawl must publish frozen findings and coverage");
+  await until("document.querySelector('.audit-findings + .audit-evidence-pagination')?.textContent.includes('1–100 of 205')", "Findings must use a bounded first page");
+  await click('.audit-findings + .audit-evidence-pagination button:last-child');
+  await until("document.querySelector('.audit-findings + .audit-evidence-pagination')?.textContent.includes('101–200 of 205')", "Findings paging must replace the previous page");
+  await click('.audit-findings + .audit-evidence-pagination button:first-of-type');
+  await until("document.querySelector('[data-audit-finding-id=\"title.missing\"]')", "Findings paging must return to the first page");
+  const findingQueriesBeforeSearch = await evaluate("testAuditRequests.filter((request) => request.command === 'query_audit_report_findings').length");
+  await fill('[aria-label="Search audit findings"]', 'Missing');
+  await delay(100);
+  assert.equal(await evaluate("testAuditRequests.filter((request) => request.command === 'query_audit_report_findings').length"), findingQueriesBeforeSearch, "Finding search must wait for its debounce window");
+  await until("testAuditRequests.at(-1).search === 'Missing'", "Finding search must reach the server after its debounce window");
+  await fill('[aria-label="Audit finding category"]', 'Titles');
+  await until("testAuditRequests.at(-1).category === 'Titles'", "Finding category must reach the server after its debounce window");
+  await click('[data-audit-finding-id="title.missing"]');
+  await until("document.querySelector('.audit-evidence .audit-evidence-pagination')?.textContent.includes('1–100 of 1,205')", "Evidence must use a bounded first page");
+  for (let page = 1; page <= 12; page++) {
+    await click('.audit-evidence .audit-evidence-pagination button:last-child');
+    await until(`document.querySelector('.audit-evidence .audit-evidence-pagination')?.textContent.includes(${JSON.stringify((page * 100 + 1).toLocaleString())})`, `Evidence page ${page + 1} must replace the previous page`);
+  }
+  await until("document.querySelector('.audit-evidence .audit-evidence-pagination')?.textContent.includes('1,201–1,205') && document.querySelector('[data-audit-evidence-id=\"evidence-1205\"]')", "Evidence paging must reach record 1,205");
+  const evidenceQueriesBeforeSearch = await evaluate("testAuditRequests.filter((request) => request.command === 'query_audit_report_evidence').length");
+  await fill('[aria-label="Search audit evidence"]', 'report-1205');
+  await delay(100);
+  assert.equal(await evaluate("testAuditRequests.filter((request) => request.command === 'query_audit_report_evidence').length"), evidenceQueriesBeforeSearch, "Evidence search must wait for its debounce window");
+  await until("document.querySelector('.audit-evidence .audit-evidence-pagination')?.textContent.includes('1–1 of 1')", "Evidence search must find an off-page record");
+  await fill('[aria-label="Evidence HTTP status"]', '404');
+  await until("testAuditRequests.at(-1).statusCode === 404 && document.querySelector('.audit-evidence .audit-evidence-pagination')?.textContent.includes('1–1 of 1')", "Evidence HTTP status must reach the server with the matching evidence query");
+  await evaluate("document.querySelector('[data-audit-evidence-id=\"evidence-1205\"]').focus()");
+  await pressKey("Enter");
+  await until("document.querySelector('.audit-evidence-detail')?.textContent.includes('report-1205')", "Keyboard evidence selection must open its captured detail");
+  await click('.audit-evidence-detail button');
+  assert.equal(await evaluate("testCopiedText"), "https://example.test/report-1205", "Evidence copy must use the full original URL");
+  await click('[aria-label="Export all matching evidence (CSV)"]');
+  await until("document.querySelector('.audit-evidence')?.textContent.includes('/tmp/ferrous-audit-report/title-missing.csv')", "Evidence export must disclose its CSV artifact path");
+  assert.deepEqual(await evaluate("(({ command, findingId, search, statusCode, sortBy, sortDir, offset, limit, preview }) => ({ command, findingId, search, statusCode, sortBy, sortDir, offset, limit, preview }))(testAuditRequests.at(-1))"), { command: "export_audit_report_evidence", findingId: "title.missing", search: "report-1205", statusCode: 404, sortBy: "originalUrl", sortDir: "asc", offset: 0, limit: 100, preview: true }, "Evidence export must preserve the active matching status and search query for native full-result export");
+  await evaluate("testHoldAuditEvidenceExport = true");
+  await click('[aria-label="Export all matching evidence (CSV)"]');
+  await until("[...document.querySelectorAll('.audit-report-launcher button')].some((button) => button.textContent.includes('Cancel preparation'))", "An in-flight evidence export must be cancellable");
+  await evaluate("[...document.querySelectorAll('.audit-report-launcher button')].find((button) => button.textContent.includes('Cancel preparation')).click()");
+  await until("testAuditCancels.length > 0", "Cancelling evidence export must call the shared native cancellation command");
+  await evaluate("testFinishAuditEvidenceExport(); testHoldAuditEvidenceExport = false");
+  await fill('[aria-label="Search audit findings"]', '');
+  await fill('[aria-label="Audit finding category"]', '');
+  await until("document.querySelector('[data-audit-finding-id=\"fixture-1\"]')", "Clearing a finding filter must restore another finding choice");
+  await click('[data-audit-finding-id="fixture-1"]');
+  await until("document.querySelector('[aria-label=\"Evidence HTTP status\"]')?.value === ''", "Choosing another finding must reset the evidence HTTP status filter");
+  await click('.audit-report-summary button');
+  await until("document.querySelector('.audit-report-summary')?.textContent.includes('/tmp/ferrous-audit-report/index.html')", "Report export must disclose its complete artifact path");
+  assert.ok(await evaluate("document.querySelector('.audit-report-priorities')?.textContent.includes('Missing page title') && document.querySelector('.audit-report-priorities')?.textContent.includes('Add a descriptive title.')"), "The workspace must show measured action priorities before any AI generation");
+  await click('.audit-report-ai fieldset button');
+  await until("document.querySelector('.audit-ai-preview')?.textContent.includes('Sampling policy: Up to 3 stored examples per finding.') && document.querySelector('.audit-ai-preview')?.textContent.includes('Overview pending: Yes')", "AI preview must disclose overview planning and its actual sampling policy");
+  await evaluate("[...document.querySelectorAll('.audit-ai-preview button')].find((button) => button.textContent.includes('overview')).click()");
+  await until("document.querySelector('.audit-ai-overview')?.textContent.includes('<strong>Fixture overview</strong>') && document.querySelector('.audit-report-ai')?.textContent.includes('205 / 205 findings explained')", "AI overview must preserve literal provider text and retain complete finding counts");
+  assert.equal(await evaluate("document.querySelector('.audit-ai-overview strong')"), null, "AI overview text must be escaped rather than interpreted as markup");
+  assert.ok(await evaluate("document.querySelector('.audit-ai-preserved')?.textContent.includes('fixture-ai-v1') && document.querySelector('.audit-ai-preserved')?.textContent.includes('fixture-model') && document.querySelector('.audit-report-ai')?.textContent.includes('Latest generation failed: Fixture provider timed out')"), "A failed latest generation must keep its error while showing the preserved export generation provenance");
+  assert.ok(await evaluate("document.querySelector('.audit-report-summary')?.textContent.includes('1,205')"), "AI output must not change frozen report counts");
+  await fill('[aria-label="Audit report title"]', 'Follow-up deterministic audit');
+  await click('.audit-report-launcher .primary');
+  await until("document.querySelector('.audit-report-summary h3')?.textContent.includes('Follow-up deterministic audit')", "A second frozen report must become the comparison current report");
+  await until("!document.querySelector('[aria-label=\"Comparison baseline report\"]').disabled && !document.querySelector('[aria-label=\"Comparison current report\"]').disabled", "Comparison controls must offer saved baseline and current reports");
+  await evaluate("[...document.querySelectorAll('.audit-report-comparisons button')].find((button) => button.textContent.includes('Compare reports')).click()");
+  await until("document.querySelector('.audit-comparison-summary')?.textContent.includes('2 findings') && document.querySelector('[data-audit-comparison-finding=\"title.missing\"]')", "Comparison preparation must publish persisted follow-up counts");
+  await click('[data-audit-comparison-finding="title.missing"]');
+  await until("document.querySelector('.audit-comparison-evidence-table')?.textContent.includes('resolved') && document.querySelector('.audit-comparison-evidence-table')?.textContent.includes('Fixed title')", "A resolved finding must show measured before and after values");
+  await evaluate("[...document.querySelectorAll('.audit-report-comparisons .audit-report-ai fieldset button')].find((button) => button.textContent.includes('Review AI data')).click()");
+  await until("document.querySelector('.audit-report-comparisons .audit-ai-preview')?.textContent.includes('One stored comparison observation per finding.')", "Comparison AI must be an explicit preview with comparison sampling details");
+  await evaluate("[...document.querySelectorAll('.audit-report-comparisons .audit-ai-preview button')].find((button) => button.textContent.includes('overview')).click()");
+  await until("testAuditRequests.at(-1).command === 'run_audit_report_comparison_ai' && testAuditRequests.at(-1).comparisonId === testAuditComparisons[0].id", "Comparison AI send must use the comparison command and frozen comparison ID");
+  await evaluate("testComparisonAiError = true");
+  await evaluate("[...document.querySelectorAll('.audit-report-comparisons .audit-report-ai fieldset button')].find((button) => button.textContent.includes('Review AI data')).click()");
+  await until("document.querySelector('.audit-report-comparisons .audit-ai-preview')", "Comparison AI failure setup must still require a fresh preview");
+  await evaluate("[...document.querySelectorAll('.audit-report-comparisons .audit-ai-preview button')].find((button) => button.textContent.includes('overview')).click()");
+  await until("document.querySelector('.audit-report-comparisons .audit-report-ai [role=alert]')?.textContent.includes('Comparison AI provider unavailable')", "A comparison AI failure must remain visible without altering measured comparison data");
+  assert.ok(await evaluate("document.querySelector('.audit-comparison-evidence-table')?.textContent.includes('resolved') && document.querySelector('.audit-comparison-evidence-table')?.textContent.includes('Fixed title')"), "Comparison evidence must remain reachable after AI failure");
+  await evaluate("testComparisonAiError = false");
+  await click('[data-audit-comparison-finding="links.broken"]');
+  await until("document.querySelector('.audit-comparison-evidence-table')?.textContent.includes('notObserved') && document.querySelector('.audit-comparison-evidence-table')?.textContent.includes('does not verify a fix')", "Missing current evidence must remain not observed rather than a verified fix");
+  await evaluate("testAuditDeleteError = true");
+  await click('[aria-label="Delete Saved deterministic audit"]');
+  await click('.quit-modal .destructive');
+  await until("document.querySelector('.quit-modal .error-bar')?.textContent.includes('Could not delete')", "A failed report deletion must remain retryable in its confirmation dialog");
+  await evaluate("testAuditDeleteError = false");
+  await click('.quit-modal .destructive');
+  await until("!document.querySelector('[aria-label=\"Delete Saved deterministic audit\"]')", "Retrying deletion must remove only the requested report after native success");
+  await click('[aria-label="Delete Follow-up deterministic audit"]');
+  await click('.quit-modal .destructive');
+  await until("!document.querySelector('[data-audit-report-id]') && document.querySelector('[data-audit-comparison-id]')", "Deleting source reports must retain the persisted comparison library");
+  await click('[title="Close audit reports"]');
+  await menuItem("Audit reports");
+  await click('[data-audit-comparison-id]');
+  await until("document.querySelector('.audit-comparison-summary')?.textContent.includes('Follow-up deterministic audit')", "A stored comparison must reopen after its source reports were deleted");
+  await click('.audit-comparison-summary button');
+  await until("document.querySelector('.audit-comparison-summary')?.textContent.includes('/tmp/ferrous-report-comparison/index.html')", "A reopened comparison must export independently of deleted source reports");
+  assert.equal(await evaluate("testAuditRequests.at(-1).command"), "export_audit_report_comparison", "Comparison export must call its native command");
+  await evaluate("testHoldComparisonEvidence = true");
+  await click('[data-audit-comparison-finding="title.missing"]');
+  await click('[title="Close audit reports"]');
+  await evaluate("testFinishComparisonEvidence(); testHoldComparisonEvidence = false");
+  await menuItem("Audit reports");
+  await click('[data-audit-comparison-id]');
+  await until("document.querySelector('.audit-comparison-summary')", "A late evidence query must not block reopening its saved comparison");
+  await click('.audit-comparison-summary button');
+  await until("document.querySelector('.audit-comparison-summary')?.textContent.includes('/tmp/ferrous-report-comparison/index.html')", "Reopened comparison export must remain usable after a cancelled late evidence query");
+  await click('[title="Close audit reports"]');
+  await evaluate("testHoldAuditPrepare = true");
+  await menuItem("Audit reports");
+  await fill('[aria-label="Audit report title"]', 'Cancelled late audit');
+  await click('.audit-report-launcher .primary');
+  await until("[...document.querySelectorAll('.audit-report-launcher button')].some((button) => button.textContent.includes('Cancel preparation'))", "An in-flight report preparation must be cancellable");
+  await click('[title="Close audit reports"]');
+  await evaluate("testFinishAuditPrepare(); testHoldAuditPrepare = false");
+  await delay(100);
+  await menuItem("Audit reports");
+  await until("document.querySelector('.audit-report-modal') && !document.querySelector('.audit-report-summary') && testAuditCancels.length > 0", "A late prepared report must not reopen or publish after cancellation");
+  await click('[data-audit-report-id]');
+  await until("document.querySelector('.audit-report-summary')", "Saved report cards must reopen their frozen report");
+  await evaluate("testHoldAuditExport = true");
+  await click('.audit-report-summary button');
+  await until("[...document.querySelectorAll('.audit-report-launcher button')].some((button) => button.textContent.includes('Cancel preparation'))", "An in-flight report export must be cancellable");
+  await evaluate("[...document.querySelectorAll('.audit-report-launcher button')].find((button) => button.textContent.includes('Cancel preparation')).click()");
+  await until("testAuditCancels.length > 1", "Cancelling a report export must call the shared native cancellation command");
+  await evaluate("testFinishAuditExport(); testHoldAuditExport = false");
+  await click('[title="Close audit reports"]');
   await fill('[aria-label="Seed URL"]', "");
   assert.ok(await evaluate("document.querySelector('[title=\"Start crawl\"]').disabled"), "An empty seed must not offer a runnable crawl");
   await fill('[aria-label="Seed URL"]', "https://keyboard.test/");
@@ -2960,6 +3132,22 @@ try {
   await until("document.querySelector('.update-modal [data-state=\"current\"]')", "The failed update check must be retryable");
   await pressKey("Escape");
   await until("!document.querySelector('.update-modal')", "The update dialog must dismiss after retry");
+
+  await fill('.crawl-launcher [aria-label="Crawl URL"]', "https://recovery.test/");
+  await click('[data-action="start-new-crawl"]');
+  await until("document.querySelector('[title=\"Pause crawl\"]') && document.querySelector('.data-table tbody tr:not(.virtual-spacer)')", "Start a crawl for the delayed Stop recovery check");
+  await delay(100);
+  await evaluate("window.testPendingQueries = {}; window.testHeldQueries = { get_recovery_state: { recoverable: false, queued: 0, seen: 20, crawled: 20 } }");
+  await click('[title="Stop crawl"]');
+  await until("window.testPendingQueries.get_recovery_state", "The stopped crawl's recovery query must be pending");
+  await evaluate("window.testRecovery = { recoverable: true, queued: 2, seen: 20, crawled: 18 }");
+  await click('[aria-label="Crawl library"]');
+  await click('[data-session-id="fixture-other"] [data-action="open-saved-crawl"]');
+  await until("!document.querySelector('.crawl-home') && document.querySelector('.data-table tbody tr:not(.virtual-spacer)')", "A different recoverable crawl must open before the old Stop query returns");
+  assert.ok((await savedSettings()).resumeCrawl, "The new crawl must enable its queued work");
+  await evaluate("window.testPendingQueries.get_recovery_state()");
+  await delay(150);
+  assert.ok((await savedSettings()).resumeCrawl, "A stale Stop response must not clear another crawl's Resume selection");
 
   const splashWindow = JSON.parse(await readFile('src-tauri/tauri.conf.json', 'utf8')).app.windows.find((window) => window.label === 'splashscreen');
   await cdp("Emulation.setDeviceMetricsOverride", { width: splashWindow.width, height: splashWindow.height, deviceScaleFactor: 1, mobile: false });

@@ -236,6 +236,29 @@ SQLite medians fell another 16–17% in this fixture. Every run verified 1,030 r
 
 These measurements do not bound whole-crawl cost: progress summaries and other record/edge operations still grow with the dataset. Larger mixed sites, concurrent UI queries, initial/Stop snapshot hydration and broader disk/memory measurements remain open.
 
+## Recovery Counts Without Frontier Hydration
+
+```bash
+cargo test --release --locked -p ferrous-frog-storage frontier_recovery_summary_workload -- --ignored --nocapture
+```
+
+Measured on 2026-09-14 using the CPU/toolchain described above. The desktop recovery query previously loaded every pending item and seen URL just to return queued, seen and completed counts. This query runs when opening saved sessions/databases and Settings, and after stopping a crawl. SQLite now reads the two counts and completed metadata in one statement; Memory reads the lengths of its borrowed checkpoint. The native command performs the query on a blocking worker after releasing the application store mutex.
+
+The ignored optimized workload stores 500 pending entries and either 100,000 or 1,000,000 seen URLs. Crawl record and edge tables are empty; SQLite is in memory. Both paths warm once, then seven paired calls alternate measurement order. Fixture creation, insertion, compilation and result assertions are excluded. The old path includes full snapshot loading, deriving the three counts and dropping the snapshot; the new path returns the same counts directly.
+
+| Backend | Seen URLs | Full hydration median | Counts-only median |
+| --- | ---: | ---: | ---: |
+| Memory | 100,000 | 3.422349 ms | 0.000060 ms |
+| SQLite | 100,000 | 6.638960 ms | 0.034355 ms |
+| Memory | 1,000,000 | 38.547188 ms | 0.000141 ms |
+| SQLite | 1,000,000 | 72.260097 ms | 1.158042 ms |
+
+SQLite hydration ranges were 6.585–7.193 ms and 71.460–73.247 ms; counts-only ranges were 0.023–0.042 ms and 0.450–1.265 ms. Memory counts-only measurements are near the clock/measurement overhead floor and should not be interpreted as reliable speedup ratios. These are one local seven-pair run per case, not application latency guarantees. No allocation or RSS measurement was taken.
+
+Run the focused correctness checks with `cargo test --locked -p ferrous-frog-storage frontier_summary`. They cover separate List occurrences, pending/seen-only/empty states, incremental changes, clear, external commits, rollback, reopening and existing completed-counter defaults. A deterministic guard puts invalid values in unused queue and seen fields: full hydration fails, while the summary and ActiveStore forwarding return correct counts. Missing storage tables still produce an error rather than an empty recovery state. Custom storage implementations retain a default method based on their existing snapshot API.
+
+This change does not alter scheduler startup, Stop or worker-error checkpoint persistence, resume normalization, record summaries or event frequency. SQLite counts still traverse database pages as needed. Physical-disk behavior, concurrent ingestion/UI queries, total Stop latency, memory peaks and broader frontier hardening remain unmeasured here.
+
 ## Paged Sitemap Validation
 
 ```bash
@@ -299,3 +322,35 @@ The graph still uses literal final URLs and existing backend record order. Node 
 - Memory upsert still scans existing edges for status updates and first-inlink source annotations, and its progress summaries still scan retained records. Alias indexing removes repeated record lookup scans without making all ingestion work constant-time.
 - Graph hydration is capped, but its record/key scans and internal-edge counts still grow with the crawl. Measure concurrent ingestion and SQLite temporary working memory before claiming constant-cost refreshes at larger scales.
 - The 1,000-page local crawler now covers edges, a live frontier, interrupted/reopened crawls and an initial physical NVMe comparison. Increase workload variety and scale, add concurrent UI query traffic, broader disk measurements and packaged desktop memory before making large-site capacity claims.
+
+## Frozen Audit Reports: 100,000 Pages and 1,000,001 Links
+
+Measured on 2026-09-14 with an AMD Ryzen 9 9955HX, approximately 59.5 GiB RAM, Linux 6.17.0, the pinned Rust toolchain and the **debug** profile. SQLite source/report/package files were on `/tmp` tmpfs. These are single-run acceptance measurements, not release-profile throughput guarantees or end-to-end desktop memory measurements.
+
+```bash
+cargo run -p ferrous-frog-export --example audit_report_scale --locked -- /tmp/ff-report-scale 100000 1000001
+# Reuse the same frozen input for a query/export implementation comparison:
+cargo run -p ferrous-frog-export --example audit_report_scale --locked -- /tmp/ff-report-scale 100000 1000001 --reuse
+```
+
+The workload creates 100,000 successful HTML pages missing titles and one 404 target, with 1,000,001 retained links distributed across those pages. The frozen findings reconcile as **100,000 title occurrences + 1 response error + 1,000,001 link occurrences = 1,100,002 evidence rows**. Broken-link units remain **1 target / 100,000 source pages / 1,000,001 references**; exact List-record attribution remains unavailable and is labelled incomplete.
+
+| Operation | Observed result |
+| --- | --- |
+| Insert 100,001 source records | 21.63 s |
+| Insert 1,000,001 source links | 97.51 s |
+| Prepare consistent frozen report, including pruning and vacuum | 138.65 s |
+| Preparation-process peak RSS | 75,716 KiB (73.94 MiB) |
+| Frozen report database | 3,040,432,128 bytes |
+| Export first 50,000 rows with repeated counts and offsets | 96.32 s; baseline run interrupted after this measurement |
+| Export first 50,000 rows with native sequence cursor | 6.15 s, approximately 15.7 times faster |
+| Export all 1,100,002 rows using the cursor | 138.84 s |
+| Export plus streaming CSV reconciliation | 146.42 s |
+| Export-process peak RSS, reopening the existing frozen report | 15,520 KiB (15.16 MiB) |
+| Complete portable package | 1,109 files, 3,144,579,949 bytes |
+
+The report query fixture reads first, middle and last windows of 100 rows for both the 100,000-row page finding and the 1,000,001-row link finding. It asserts every matching total, expected page length and final evidence ID. Example serialized responses range from 67,800 to 93,227 bytes; these sizes describe this synthetic text, not worst-case retained fields. Native IPC still bounds rows and individual previews independently.
+
+The portable writer now reads an immutable finding total once and advances through an indexed sequence cursor. It verifies the expected count and the absence of an unexpected trailing row. The workload then streams every emitted CSV, checks its exact row count, and reconciles the number of 1,000-row HTML pages. A separate 1,205-row Chrome fixture verifies real `file://` navigation to the last row, escaped text, local assets and both themes. Comparison exports use the equivalent indexed cursor with request-URL/occurrence ordering.
+
+Limits: source ingestion, snapshot preparation and the export process were measured separately; kernel page cache and tmpfs file memory are excluded from RSS. Full stored values make complete exports large. Filtered or custom-sort evidence CSV keeps the corresponding query's offset semantics and may cost more than the unfiltered cursor path. Preparation still uses native global diagnostic context, and a running diagnostic statement or vacuum completes before cancellation is observed. Large-scale physical-disk runs, concurrent desktop UI measurements and other-platform runs remain separate acceptance work.

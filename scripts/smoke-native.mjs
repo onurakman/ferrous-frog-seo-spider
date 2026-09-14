@@ -1,11 +1,11 @@
 // Linux desktop smoke: real WebKitGTK, Tauri IPC, crawler and SQLite; no browser mocks.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { access, chmod, mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import { parseArgs } from "node:util";
@@ -73,17 +73,34 @@ async function webdriver(method, path, body, timeout = 15_000) {
 }
 
 const evaluate = (script, args = []) => webdriver("POST", `/session/${session}/execute/sync`, { script, args });
-const element = (selector) => webdriver("POST", `/session/${session}/element`, { using: "css selector", value: selector });
+const element = (selector) => evaluate(`return [...document.querySelectorAll(${JSON.stringify(selector)})].find((candidate) => {
+  const style = getComputedStyle(candidate);
+  const rect = candidate.getBoundingClientRect();
+  return !candidate.hidden && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) > 0
+    && rect.width > 0 && rect.height > 0 && rect.top < innerHeight && rect.bottom > 0 && rect.left < innerWidth && rect.right > 0;
+})`);
 const elementId = (element) => element["element-6066-11e4-a52e-4f735466cecf"];
 async function click(selector) {
   const target = await until(() => element(selector), `find ${selector}`);
   await webdriver("POST", `/session/${session}/element/${elementId(target)}/click`, {});
 }
 async function fill(selector, text) {
-  const target = await element(selector);
+  const target = await until(() => element(selector), `find ${selector}`);
   const path = `/session/${session}/element/${elementId(target)}`;
   await webdriver("POST", `${path}/clear`, {});
   await webdriver("POST", `${path}/value`, { text });
+}
+
+async function clickText(selector, text) {
+  const target = await until(() => evaluate(`const target = [...document.querySelectorAll(arguments[0])].find(item => item.textContent.trim() === arguments[1] && !item.disabled);
+    target?.scrollIntoView({ block: 'center' }); return target;`, [selector, text]), `find ${text}`);
+  await webdriver("POST", `/session/${session}/element/${elementId(target)}/click`, {});
+}
+
+async function openAuditReports() {
+  await click('[aria-label="More tools"]');
+  await clickText('[role="menuitem"]', "Audit reports");
+  await until(() => element('.audit-report-modal [aria-label="Audit report title"]'), "the native audit report workspace opens");
 }
 
 async function launch() {
@@ -130,10 +147,10 @@ async function quit(cancelFirst = false) {
     await openQuit();
   }
   try { await click(".quit-modal button.destructive"); } catch (error) {
-    // The native process can exit before WebDriver acknowledges the click.
-    if (appRunning()) throw error;
+    // The native process can close the driver session before replying to its final click.
+    if (!error.message.includes("Session terminated without a reply")) throw error;
   }
-  await until(() => !appRunning(), "confirmed quit exits the native application", 20_000);
+  await until(() => !appRunning(), "confirmed quit drains report work and exits the native application", 30_000);
   appPid = undefined;
   await webdriver("DELETE", `/session/${session}`).catch(() => {});
   session = undefined;
@@ -155,6 +172,75 @@ function savedRecords() {
   } finally { index.close(); }
 }
 
+async function savedReport() {
+  const directory = join(artifacts, "data", "com.ferrousfrog.seospider", "audit-reports");
+  const files = await readdir(directory);
+  const reports = files.filter((name) => name.endsWith(".sqlite3"));
+  assert.equal(reports.length, 1, "The smoke must create exactly one frozen report.");
+  assert.ok(!files.some((name) => name.endsWith(".ai")), "AI must remain off; no generation sidecar may be created.");
+  assert.deepEqual(files, reports, "Completed preparation must leave no temporary report files.");
+  const path = await realpath(join(directory, reports[0]));
+  assert.ok(path.startsWith(`${directory}/`), "The report must stay inside isolated app data.");
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const summary = JSON.parse(database.prepare("SELECT payload FROM audit_report WHERE id=1").get().payload);
+    const evidence = database.prepare("SELECT payload FROM audit_evidence ORDER BY finding_id, sequence").all().map((row) => JSON.parse(row.payload));
+    const records = database.prepare("SELECT url, status_code, status_text FROM crawl_records ORDER BY url").all();
+    assert.equal(summary.sourceRecords, 4);
+    assert.equal(summary.scopeRecords, 4);
+    assert.equal(summary.request.sourceStatus, "completed");
+    assert.equal(records.length, 4, "The frozen report must retain unaffected and blocked source records too.");
+    assert.ok(evidence.length > 0, "The report must retain measured evidence.");
+    return { path, summary, records, evidence };
+  } finally { database.close(); }
+}
+
+async function verifyReportPackage(indexPath, frozen) {
+  const isolatedData = await realpath(join(artifacts, "data"));
+  const actualIndex = await realpath(indexPath);
+  assert.ok(actualIndex.startsWith(`${isolatedData}/`), "Native exports must stay inside the isolated XDG data/download directory.");
+  assert.equal(actualIndex.split("/").at(-1), "index.html");
+  const directory = dirname(actualIndex);
+  const manifest = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8"));
+  assert.equal(manifest.status, "complete");
+  assert.equal(manifest.reportId, frozen.summary.request.id);
+  assert.equal(manifest.findingCount, frozen.summary.findingCount);
+  assert.equal(manifest.evidenceRows, frozen.evidence.length);
+  assert.equal(manifest.aiAnnotatedFindings, 0);
+  assert.ok(!manifest.aiOverview, "The offline-only workflow must not create an AI overview.");
+  assert.deepEqual(manifest.summary, frozen.summary);
+  for (const filename of manifest.files) {
+    const path = await realpath(join(directory, filename));
+    assert.ok(path.startsWith(`${directory}/`), "Manifest assets must remain inside the published folder.");
+    await access(path, constants.R_OK);
+  }
+  const index = await readFile(actualIndex, "utf8");
+  for (const finding of manifest.findings) {
+    const rows = frozen.evidence.filter((row) => row.findingId === finding.findingId);
+    assert.equal(finding.counts.occurrences, rows.length);
+    assert.equal(finding.htmlPages.length, Math.ceil(rows.length / 1_000));
+    assert.ok(index.includes(finding.csvFile) && index.includes(finding.htmlPages[0]), "The index must link to the full CSV and evidence pages.");
+  }
+  // Python's standard CSV reader handles quoted JSON and multiline cells without a second parser.
+  execFileSync("python3", ["-c", `import csv, html, json, pathlib, sys
+fixture = json.load(sys.stdin)
+root = pathlib.Path(fixture['directory'])
+count = 0
+for finding in fixture['manifest']['findings']:
+    expected = [row for row in fixture['evidence'] if row['findingId'] == finding['findingId']]
+    final_page = html.unescape((root / finding['htmlPages'][-1]).read_text(encoding='utf-8'))
+    assert expected[-1]['id'] in final_page and expected[-1]['originalUrl'] in final_page, 'The final stored evidence row must be reachable in HTML'
+    with (root / finding['csvFile']).open(newline='', encoding='utf-8') as source:
+        rows = list(csv.DictReader(source))
+    assert len(rows) == len(expected), 'CSV must retain every evidence row'
+    assert [json.loads(row['evidenceJson']) for row in rows] == expected, 'CSV evidence must exactly match the frozen report, including its final row'
+    count += len(rows)
+assert count == fixture['manifest']['evidenceRows'], 'CSV and manifest totals must agree'
+`], { input: JSON.stringify({ directory, manifest, evidence: frozen.evidence }), encoding: "utf8" });
+  assert.ok(!(await readdir(dirname(directory))).includes(".preparing"), "Published exports must leave no preparation folder.");
+  return { indexPath: actualIndex, findingCount: manifest.findingCount, evidenceRows: manifest.evidenceRows };
+}
+
 try {
   const xvfb = await executable(process.env.XVFB_BIN, "Xvfb", join(toolsDirectory, "extracted/usr/bin/Xvfb"));
   const nativeDriver = await executable(process.env.WEBKIT_WEBDRIVER, "WebKitWebDriver", join(toolsDirectory, "extracted/usr/bin/WebKitWebDriver"));
@@ -163,6 +249,8 @@ try {
     throw new Error(`The desktop executable is unavailable at ${application}. Build it with make build or pass --app; see docs/NATIVE_TESTING.md.`);
   });
   for (const directory of ["data", "config", "cache", "runtime"]) await mkdir(join(artifacts, directory), { mode: 0o700 });
+  await mkdir(join(artifacts, "data", "Downloads"), { mode: 0o700 });
+  await writeFile(join(artifacts, "config", "user-dirs.dirs"), `XDG_DOWNLOAD_DIR="${join(artifacts, "data", "Downloads")}"\n`);
   await writeFile(join(artifacts, "launch-app"), '#!/bin/sh\nprintf "%s\\n" "$$" > "$FF_NATIVE_PID_FILE"\nexec "$FF_NATIVE_APP"\n');
   await chmod(join(artifacts, "launch-app"), 0o700);
   const display = await start(xvfb, ["-displayfd", "3", "-screen", "0", "1280x960x24", "-nolisten", "tcp"], {}, "xvfb.log", true);
@@ -201,7 +289,7 @@ try {
     const origin = `http://127.0.0.1:${fixture.address().port}`;
     await launch();
     assert.equal(requests.length, 0, "Opening the library must not start crawl requests.");
-    await fill('[aria-label="Crawl URL"]', `${origin}/`);
+    await fill('.crawl-launcher [aria-label="Crawl URL"]', `${origin}/`);
     await click('[data-action="start-new-crawl"]');
     await until(() => evaluate("return document.querySelector('.status-main strong')?.textContent === 'Finished'"), "the real crawler finishes", 60_000);
     await until(() => evaluate("return [...document.querySelectorAll('.data-table tbody tr')].some(row => row.textContent.includes('/missing') && row.textContent.includes('404'))"), "the planted 404 appears in the native results grid");
@@ -227,9 +315,40 @@ try {
     const after = savedRecords();
     assert.equal(after.saved.id, before.saved.id);
     assert.deepEqual(after.rows, before.rows);
+    assert.equal(after.rows.length, 4, "The completed source fixture must contain all four records.");
+
+    await openAuditReports();
+    await fill('[aria-label="Audit report title"]', "Native saved audit report");
+    assert.equal(await evaluate('return document.querySelector(\'[aria-label="Use current audit filter"]\').checked'), false);
+    await clickText(".audit-report-launcher button", "Create report");
+    await until(() => evaluate("return document.querySelector('.audit-report-summary h3')?.textContent === 'Native saved audit report' && Boolean(document.querySelector('[data-audit-finding-id]'))"), "the native report freezes the completed crawl and displays measured findings");
+    const frozen = await savedReport();
+    assert.equal(frozen.summary.request.sourceSessionId, after.saved.id);
+    assert.deepEqual(frozen.records, after.rows);
+    assert.ok(frozen.evidence.some((row) => row.findingId === "response.clientError" && row.originalUrl === `${origin}/missing`));
+    assert.ok(await evaluate("return Boolean(document.querySelector('.audit-report-ai')) && !document.querySelector('.audit-ai-preview')"), "AI must remain optional and unapproved.");
+    await click('[title="Close audit reports"]');
     await quit();
-    await writeFile(join(artifacts, "report.json"), JSON.stringify({ application, saved: after.saved, rows: after.rows, requests }, null, 2));
-    console.log("Native smoke passed: library → polite crawl → persisted reopen → cancel/confirm quit → process exit.");
+
+    await launch();
+    await openAuditReports();
+    await click(`[data-audit-report-id="${frozen.summary.request.id}"]`);
+    await until(() => evaluate("return document.querySelector('.audit-report-summary h3')?.textContent === 'Native saved audit report' && Boolean(document.querySelector('[data-audit-finding-id]'))"), "the saved report reopens after a native process restart");
+    assert.deepEqual(await savedReport(), frozen, "Reopening must retain the same frozen report and every evidence row.");
+    await evaluate('document.querySelector(\'[data-audit-finding-id="response.clientError"]\').scrollIntoView({ block: "center" })');
+    await click('[data-audit-finding-id="response.clientError"]');
+    await until(() => evaluate("return [...document.querySelectorAll('[data-audit-evidence-id]')].some(row => row.textContent.includes('/missing'))"), "the saved 404 evidence is available through native paging");
+    await clickText(".audit-report-summary button", "Export complete report folder");
+    const indexPath = await until(() => evaluate("const status = [...document.querySelectorAll('.audit-report-summary [role=status]')].find(item => item.textContent.startsWith('Report folder: ')); return status && [...status.childNodes].filter(node => node.nodeType === Node.TEXT_NODE).map(node => node.textContent).join('').replace(/^Report folder: /, '').trim();"), "the native report package publishes successfully", 60_000);
+    const exported = await verifyReportPackage(indexPath, frozen);
+    assert.equal(requests.length, requestCount, "Report preparation, restart, evidence paging and export must not fetch the source again.");
+    assert.deepEqual(savedRecords(), after, "Report operations must not start another crawl or change its saved records.");
+    await savedReport(); // No AI sidecar or partial report may appear during the export.
+    await click('[title="Close audit reports"]');
+    await quit();
+    assert.deepEqual(await savedReport(), frozen, "Clean shutdown must preserve the complete saved report.");
+    await writeFile(join(artifacts, "report.json"), JSON.stringify({ application, saved: after.saved, rows: after.rows, report: frozen.summary, exported, requests }, null, 2));
+    console.log("Native smoke passed: polite crawl → saved reopen → frozen report → report restart/reopen → complete offline export → clean quit.");
   }
   success = true;
 } catch (error) {

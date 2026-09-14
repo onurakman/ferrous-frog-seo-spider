@@ -1,6 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod audit_report_ai;
+mod audit_report_comparison;
+mod audit_report_export;
+mod audit_reports;
 mod comparison;
 mod comparison_sources;
 mod content;
@@ -861,14 +865,20 @@ async fn quit_app(
     app: AppHandle,
     state: State<'_, AppState>,
     page_speed: State<'_, pagespeed::PageSpeedState>,
+    reports: State<'_, audit_reports::AuditReportsState>,
 ) -> Result<(), String> {
     let page_speed_shutdown = page_speed.begin_shutdown()?;
     let mut task = state.crawl_task.lock().await;
     stop_active_crawl(&state, &mut task).await?;
+    state.exit_confirmed.store(true, Ordering::SeqCst);
+    drop(task);
+    if let Err(error) = reports.cancel_for_shutdown().await {
+        state.exit_confirmed.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
     if let Err(error) = app.save_window_state(window_state::FLAGS) {
         eprintln!("failed to save window position: {error}");
     }
-    state.exit_confirmed.store(true, Ordering::SeqCst);
     page_speed_shutdown.commit();
     app.exit(0);
     Ok(())
@@ -1314,32 +1324,23 @@ fn activate_database_path(
 }
 
 #[tauri::command]
-fn get_recovery_state(state: State<'_, AppState>) -> CrawlRecoveryState {
-    let frontier_state = state
+async fn get_recovery_state(state: State<'_, AppState>) -> Result<CrawlRecoveryState, String> {
+    let store = state
         .store
         .lock()
-        .expect("store lock poisoned")
-        .load_frontier_state();
-    match frontier_state {
-        Some(frontier) if !frontier.queued.is_empty() => CrawlRecoveryState {
-            recoverable: true,
-            queued: frontier.queued.len(),
-            seen: frontier.seen.len(),
-            crawled: frontier.crawled,
-        },
-        Some(frontier) => CrawlRecoveryState {
-            recoverable: false,
-            queued: 0,
-            seen: frontier.seen.len(),
-            crawled: frontier.crawled,
-        },
-        None => CrawlRecoveryState {
-            recoverable: false,
-            queued: 0,
-            seen: 0,
-            crawled: 0,
-        },
-    }
+        .map_err(|_| "store lock poisoned")?
+        .clone();
+    let frontier = tauri::async_runtime::spawn_blocking(move || store.try_frontier_summary())
+        .await
+        .map_err(|error| format!("Recovery query worker failed: {error}"))?
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    Ok(CrawlRecoveryState {
+        recoverable: frontier.queued > 0,
+        queued: frontier.queued,
+        seen: frontier.seen,
+        crawled: frontier.crawled,
+    })
 }
 
 #[tauri::command]
@@ -3982,6 +3983,7 @@ fn main() {
         .manage(pagespeed::PageSpeedState::default())
         .manage(google_oauth::GoogleOAuthState::default())
         .manage(ai::AiState::default())
+        .manage(audit_reports::AuditReportsState::default())
         .setup(|app| {
             // Start the splash minimum after Tauri has created its windows.
             app.manage(Instant::now());
@@ -4001,6 +4003,28 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            audit_reports::list_audit_reports,
+            audit_reports::get_audit_report,
+            audit_reports::prepare_audit_report,
+            audit_reports::query_audit_report_findings,
+            audit_reports::query_audit_report_evidence,
+            audit_reports::cancel_audit_report,
+            audit_reports::delete_audit_report,
+            audit_report_export::export_audit_report,
+            audit_report_export::export_audit_report_evidence,
+            audit_report_export::export_audit_report_comparison,
+            audit_report_ai::preview_audit_report_ai,
+            audit_report_ai::get_audit_report_ai,
+            audit_report_ai::run_audit_report_ai,
+            audit_report_ai::preview_audit_report_comparison_ai,
+            audit_report_ai::get_audit_report_comparison_ai,
+            audit_report_ai::run_audit_report_comparison_ai,
+            audit_report_comparison::prepare_audit_report_comparison,
+            audit_report_comparison::list_audit_report_comparisons,
+            audit_report_comparison::get_audit_report_comparison,
+            audit_report_comparison::query_audit_report_comparison_findings,
+            audit_report_comparison::query_audit_report_comparison_evidence,
+            audit_report_comparison::delete_audit_report_comparison,
             content::preview_content_area,
             content::preview_custom_extractor,
             updates::check_for_updates,

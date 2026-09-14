@@ -2,6 +2,7 @@ import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import CrawlHome, { type SavedCrawl } from "./CrawlHome";
 import ComparisonWorkspace from "./ComparisonWorkspace";
+import AuditReportWorkspace from "./AuditReportWorkspace";
 import AdvancedFilters, { type GridFilterGroup } from "./AdvancedFilters";
 import { FieldVitalsPanel, PageSpeedPanel, PageSpeedSettings, usePageSpeedCredentials, type FieldFormFactor, type FieldVitalsSnapshot, type PageSpeedCategory, type PageSpeedSnapshot, type PageSpeedStrategy } from "./PageSpeed";
 import { HttpAuthSettings, formLoginCommands, useHttpAuthCredentials } from "./HttpAuth";
@@ -2254,6 +2255,7 @@ export default function App() {
   };
   const [aboutOpen, setAboutOpen] = useState(false);
   const [comparisonOpen, setComparisonOpen] = useState(false);
+  const [auditReportsOpen, setAuditReportsOpen] = useState(false);
   const [serpOpen, setSerpOpen] = useState(false);
   const [serpVisited, setSerpVisited] = useState(false);
   const [comparisonSessions, setComparisonSessions] = useState<[SavedCrawl, SavedCrawl]>();
@@ -2682,7 +2684,7 @@ export default function App() {
     }
   }, [desktopRuntime, setError]);
 
-  const loadRecoveryState = useCallback(async () => {
+  const loadRecoveryState = useCallback(async (selectResume = false) => {
     if (!desktopRuntime) {
       return undefined;
     }
@@ -2691,6 +2693,7 @@ export default function App() {
       const state = await invoke<CrawlRecoveryState>("get_recovery_state");
       if (request !== recoveryRequest.current) return undefined;
       setRecoveryState(state);
+      if (selectResume) setResumeCrawl(state.recoverable);
       return state;
     } catch (caught) {
       if (request === recoveryRequest.current) setError(errorMessage(caught));
@@ -3234,8 +3237,7 @@ export default function App() {
       setRunning(false);
       setPaused(false);
       await loadRows();
-      const recovery = await loadRecoveryState();
-      setResumeCrawl(recovery?.recoverable === true);
+      await loadRecoveryState(true);
       await loadSessions();
     } catch (caught) {
       setError(errorMessage(caught));
@@ -3745,8 +3747,7 @@ export default function App() {
       restoreSession(session);
       resetCrawlResults();
       await loadSessions();
-      const recovery = await loadRecoveryState();
-      setResumeCrawl(recovery?.recoverable === true);
+      const recovery = await loadRecoveryState(true);
       setWorkspaceAvailable(true);
       setShowHome(false);
       changeSettingsOpen(false);
@@ -3809,8 +3810,7 @@ export default function App() {
       setCustomDatabasePath(location.path);
       if (location.session) restoreSession(location.session);
       await resetCrawlResults();
-      const recovery = await loadRecoveryState();
-      setResumeCrawl(recovery?.recoverable === true);
+      const recovery = await loadRecoveryState(true);
       setWorkspaceAvailable(true);
       setShowHome(false);
       setNotice(
@@ -4146,8 +4146,7 @@ export default function App() {
         `Imported ${result.records.toLocaleString()} URLs, ${result.linkEdges.toLocaleString()} links, ${result.imageAssets.toLocaleString()} images, and ${result.frontierItems.toLocaleString()} frontier items.`,
       );
       await resetCrawlResults();
-      const recovery = await loadRecoveryState();
-      setResumeCrawl(recovery?.recoverable === true);
+      await loadRecoveryState(true);
       setWorkspaceAvailable(true);
       setShowHome(false);
       await loadSessions();
@@ -4491,6 +4490,10 @@ export default function App() {
                 >
                   <GitFork size={15} />
                   <span>Crawl Graph</span>
+                </DropdownMenu.Item>
+                <DropdownMenu.Item className="dropdown-item toolbar-menu-item" disabled={!desktopRuntime} onSelect={() => setAuditReportsOpen(true)}>
+                  <FileText size={15} />
+                  <span>Audit reports</span>
                 </DropdownMenu.Item>
                 <DropdownMenu.Separator className="dropdown-separator" />
                 <DropdownMenu.Label className="dropdown-label">Appearance</DropdownMenu.Label>
@@ -6322,6 +6325,7 @@ export default function App() {
       {serpVisited ? <Suspense fallback={null}><SerpPreviewDialog open={serpOpen} onOpenChange={setSerpOpen}
         selected={selected ? { url: selected.url, title: selected.title ?? "", description: selected.metaDescription ?? "" } : undefined} /></Suspense> : null}
       <ComparisonWorkspace open={comparisonOpen} onOpenChange={setComparisonOpen} sessions={comparisonSessions} />
+      <AuditReportWorkspace open={auditReportsOpen} onOpenChange={setAuditReportsOpen} sessions={crawlSessions} currentSessionId={selectedSessionId || undefined} scope={{ offset: 0, limit: resultsPageSize, globalSearch, ...segmentQuery(activeSegment), ...(advancedFilters ? { filters: advancedFilters } : {}), sortBy, sortDir, view: selectedView }} />
 
       {!settingsOpen && !linkReportsOpen && !graphOpen && !comparisonOpen && !sessionDeleteOpen ? <FeedbackMessages /> : null}
       {pageSpeedActive ? <div className="notice-bar page-speed-running" role="status">
