@@ -402,3 +402,35 @@ The three measured ranges were 132.437–133.320 ms versus 5.630–6.045 ms for 
 Focused fixtures also cover all ten populated HTML sections, global duplicates, List storage keys and redirect aliases, borrowed Memory payloads, late SQLite decode errors, visitor/write failures, escaping and a broken edge first encountered at position 1,000,001. Desktop HTML tests preserve existing files on failure. Legacy whole-link CSV and HTML string commands now use the idle background worker, reject active or closing crawls, and retain their complete output strings.
 
 This removes edge-count-dependent report input buffers and the HTML/whole-link CSV ceiling. It does not make full record hydration, duplicate analysis, arbitrary captured string sizes, archive import or every export format bounded. The HTML remains a sampled summary; the separate frozen audit package supplies complete per-finding evidence pages. These measurements exclude HTTP, rendering, physical-disk crawl storage and concurrent ingestion.
+
+## Larger Local Crawls With Concurrent Queries
+
+```bash
+FERROUS_CRAWLER_PAGES=2000 FERROUS_CRAWLER_QUERIES=1 cargo test --release --locked -p ferrous-frog-crawler-core synthetic_local_site_crawler_load -- --ignored --nocapture
+```
+
+Measured on 2026-09-14 with the optimized crawler test executable. The existing local HTTP fixture now accepts a page count (100 to 100,000, in multiples of 100; default 1,000) and optional concurrent storage queries. Each run still exercises Memory and file-backed SQLite, both uninterrupted and stopped/reopened/resumed. Set `TMPDIR` to a private directory on the desired filesystem for the SQLite files. The fixture removes its databases after a successful run.
+
+With `FERROUS_CRAWLER_QUERIES=1`, a separate thread queries a sorted 50-row grid window, a searched 50-edge window and recovery counts, then waits 1.5 seconds like the workbench refresh. Offsets rotate through ten windows. Each poll checks bounded response sizes and frontier consistency. The worker stops and releases its store before reopening SQLite, and wakes immediately at shutdown. Reported poll latency includes storage-lock waits and all three queries; it excludes IPC, React rendering and window interaction.
+
+| Backend / run | 1,000 pages, no polls (tmpfs) | 1,000 pages, polls (tmpfs) | 2,000 pages, polls (NVMe/ext4) |
+| --- | ---: | ---: | ---: |
+| Memory, uninterrupted | 6.589 s | 6.574 s | 27.949 s |
+| Memory, stop/resume | 6.775 s | 6.740 s | 27.879 s |
+| SQLite, uninterrupted | 3.416 s | 3.348 s | 12.393 s |
+| SQLite, stop/reopen/resume | 3.353 s | 3.351 s | 12.634 s |
+
+Each cell is one run; the small differences in the 1,000-page pair do not establish a speedup or a general polling cost. The larger case also changes the SQLite filesystem, so it is not an isolated size-scaling comparison. Memory's data remains in process memory in every case. Compilation, browser checks and package compression were kept outside the measured runs.
+
+| Backend / run, 2,000 pages | Polls | Median poll | Maximum poll |
+| --- | ---: | ---: | ---: |
+| Memory, uninterrupted | 19 | 38.746 ms | 50.686 ms |
+| Memory, stop/resume | 20 | 36.864 ms | 54.810 ms |
+| SQLite, uninterrupted | 9 | 15.749 ms | 28.077 ms |
+| SQLite, stop/reopen/resume | 9 | 15.868 ms | 23.976 ms |
+
+The 1,000-page polling cases produced only 3–6 samples each, with medians of 17.356–18.014 ms for Memory and 6.529–9.373 ms for SQLite. These sample counts do not characterize tail latency. Peak process RSS across all four cases was 27.49 MiB without polls and 32.78 MiB with polls at 1,000 pages, and 52.75 MiB at 2,000 pages. This includes the mock server, retained request log, allocator state and both backends; it is not a per-backend allocation measurement or a desktop memory estimate.
+
+The larger fixture verified 2,060 unique stored URLs, 14,220 edges, 20 planted HTTP failures, 20 robots-blocked URLs and 20 redirects. It made 2,061 uninterrupted or 2,069 interrupted HTTP requests, never requested excluded/robots paths or stripped tracking queries, and retained all completed IDs after stopping at 500 records. The smaller case retained the original 1,030 URLs, 7,110 edges and request-count invariants. No external website was crawled.
+
+Progress summaries and other whole-record operations still grow with the dataset. More than 2,000 live pages, denser reference/resource graphs, repeated physical-disk trials, rendering and actual desktop frame/input responsiveness remain open scale work.

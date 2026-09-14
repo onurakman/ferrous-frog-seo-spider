@@ -12242,18 +12242,22 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "runs a 1,000-page localhost crawler load test against Memory and file-backed SQLite"]
+    #[ignore = "runs a configurable localhost crawler load with optional concurrent storage queries"]
     async fn synthetic_local_site_crawler_load() {
         use ferrous_frog_storage::{ActiveStore, LinkEdgeQuery};
 
-        const PAGES: usize = 1_000;
+        let pages = std::env::var("FERROUS_CRAWLER_PAGES")
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(1_000);
+        assert!((100..=100_000).contains(&pages) && pages.is_multiple_of(100));
+        let concurrent_queries = std::env::var("FERROUS_CRAWLER_QUERIES").as_deref() == Ok("1");
         const PLANT_EVERY: usize = 100;
-        const PLANTED: usize = PAGES / PLANT_EVERY;
+        let planted = pages / PLANT_EVERY;
         const CONCURRENCY: usize = 8;
-        const STOP_AFTER: usize = 250;
-        const EXPECTED_URLS: usize = PAGES + 3 * PLANTED;
-        const EXPECTED_EDGES: usize = 7 * PAGES + 11 * PLANTED;
-        const FRESH_REQUESTS: usize = PAGES + 3 * PLANTED + 1;
+        let stop_after = pages / 4;
+        let expected_urls = pages + 3 * planted;
+        let expected_edges = 7 * pages + 11 * planted;
+        let fresh_requests = pages + 3 * planted + 1;
 
         let in_flight = Arc::new(AtomicUsize::new(0));
         let peak_in_flight = Arc::new(AtomicUsize::new(0));
@@ -12262,10 +12266,10 @@ mod tests {
         let (base_url, requests, server) = spawn_recording_site_with_async_response(move |path, _| {
             let reply = if path == "/robots.txt" {
                 response(200, "OK", "text/plain", "User-agent: *\nDisallow: /private/\n")
-            } else if let Some(index) = path.strip_prefix("/page/").and_then(|value| value.parse::<usize>().ok()).filter(|index| *index < PAGES) {
-                let next = (index + 1) % PAGES;
+            } else if let Some(index) = path.strip_prefix("/page/").and_then(|value| value.parse::<usize>().ok()).filter(|index| *index < pages) {
+                let next = (index + 1) % pages;
                 let mut html = format!("<html><head><title>Page {index}</title><meta name='description' content='Synthetic page {index}'><link rel='canonical' href='/page/{index}'></head><body><h1>Page {index}</h1>");
-                for target in [next, (index + PAGES - 1) % PAGES, (index + 31) % PAGES, (index * 2 + 1) % PAGES, (index * 2 + 2) % PAGES] {
+                for target in [next, (index + pages - 1) % pages, (index + 31) % pages, (index * 2 + 1) % pages, (index * 2 + 2) % pages] {
                     html.push_str(&format!("<a href='/page/{target}'>Page</a>"));
                 }
                 html.push_str(&format!("<a href='/page/{next}#duplicate'>Fragment duplicate</a><a href='/page/{next}?tracking={index}'>Query duplicate</a>"));
@@ -12277,7 +12281,7 @@ mod tests {
                 }
                 html.push_str("</body></html>");
                 response(200, "OK", "text/html", &html)
-            } else if let Some(index) = path.strip_prefix("/redirect/").and_then(|value| value.parse::<usize>().ok()).filter(|index| *index < PLANTED) {
+            } else if let Some(index) = path.strip_prefix("/redirect/").and_then(|value| value.parse::<usize>().ok()).filter(|index| *index < planted) {
                 redirect_response(&format!("/page/{}", index * PLANT_EVERY + 1))
             } else {
                 response(404, "Not Found", "text/html", "<title>Missing</title>")
@@ -12294,8 +12298,8 @@ mod tests {
         }).await;
         let config = CrawlConfig {
             start_url: format!("{base_url}page/0"),
-            max_urls: EXPECTED_URLS,
-            max_depth: PAGES,
+            max_urls: expected_urls,
+            max_depth: pages,
             concurrency: CONCURRENCY,
             requests_per_second: 0,
             request_delay_ms: 0,
@@ -12332,48 +12336,51 @@ mod tests {
                 } else {
                     ActiveStore::memory()
                 };
+                let mut query_worker = spawn_crawl_load_queries(store.clone(), concurrent_queries);
+                let mut query_times = Vec::new();
                 let control = CrawlControl::default();
                 let cancel = control.clone();
                 let deadline_control = control.clone();
                 let deadline = tokio::spawn(async move {
-                    sleep(Duration::from_secs(120)).await;
+                    sleep(Duration::from_secs(600)).await;
                     deadline_control.cancel();
                 });
                 let started = Instant::now();
                 let mut completed_before_stop = HashMap::new();
                 let first = tokio::time::timeout(
-                    Duration::from_secs(120),
+                    Duration::from_secs(600),
                     crawl(config.clone(), store.clone(), control, move |event| {
                         if interrupted
                             && event.kind == "record"
                             && event
                                 .progress
-                                .is_some_and(|progress| progress.crawled == STOP_AFTER)
+                                .is_some_and(|progress| progress.crawled == stop_after)
                         {
                             cancel.cancel();
                         }
                     }),
                 )
                 .await
-                .expect("synthetic crawl exceeded its 120-second limit")
+                .expect("synthetic crawl exceeded its 600-second limit")
                 .unwrap();
                 deadline.abort();
+                query_times.extend(finish_crawl_load_queries(query_worker.take()));
                 if interrupted {
                     assert_eq!(first.status, "stopped");
-                    assert_eq!(first.crawled, STOP_AFTER);
+                    assert_eq!(first.crawled, stop_after);
                     let frontier = store
                         .load_frontier_state()
                         .expect("Stop must retain the frontier");
                     assert!(!frontier.queued.is_empty());
-                    assert_eq!(frontier.crawled, STOP_AFTER);
+                    assert_eq!(frontier.crawled, stop_after);
                     assert_eq!(
                         frontier.queued.len() + frontier.crawled,
                         frontier.seen.len()
                     );
-                    assert!(frontier.seen.len() <= EXPECTED_URLS);
+                    assert!(frontier.seen.len() <= expected_urls);
                     completed_before_stop
                         .extend(store.records().into_iter().map(|row| (row.url, row.id)));
-                    assert_eq!(completed_before_stop.len(), STOP_AFTER);
+                    assert_eq!(completed_before_stop.len(), stop_after);
                     eprintln!(
                         "Crawler load {backend}/stop: {} records, {} pending, {} seen, {:.3}s",
                         frontier.crawled,
@@ -12397,14 +12404,15 @@ mod tests {
                     })
                     .await
                     .unwrap();
+                    query_worker = spawn_crawl_load_queries(store.clone(), concurrent_queries);
                     let resume_control = CrawlControl::default();
                     let deadline_control = resume_control.clone();
                     let deadline = tokio::spawn(async move {
-                        sleep(Duration::from_secs(120)).await;
+                        sleep(Duration::from_secs(600)).await;
                         deadline_control.cancel();
                     });
                     let resumed = tokio::time::timeout(
-                        Duration::from_secs(120),
+                        Duration::from_secs(600),
                         crawl(
                             CrawlConfig {
                                 resume_from_state: true,
@@ -12416,43 +12424,61 @@ mod tests {
                         ),
                     )
                     .await
-                    .expect("resumed synthetic crawl exceeded its 120-second limit")
+                    .expect("resumed synthetic crawl exceeded its 600-second limit")
                     .unwrap();
                     deadline.abort();
+                    query_times.extend(finish_crawl_load_queries(query_worker.take()));
                     assert_eq!(resumed.status, "finished");
-                    assert_eq!(resumed.crawled, EXPECTED_URLS);
+                    assert_eq!(resumed.crawled, expected_urls);
                 } else {
                     assert_eq!(first.status, "finished");
-                    assert_eq!(first.crawled, EXPECTED_URLS);
+                    assert_eq!(first.crawled, expected_urls);
                 }
                 let elapsed = started.elapsed();
+                if concurrent_queries {
+                    assert!(
+                        !query_times.is_empty(),
+                        "concurrent polls must run during the crawl"
+                    );
+                    query_times.sort();
+                    eprintln!(
+                        "Crawler queries {backend}/{}: {} polls, median {:.3}ms, p95 {:.3}ms, max {:.3}ms",
+                        if interrupted { "resumed" } else { "complete" },
+                        query_times.len(),
+                        query_times[query_times.len() / 2].as_secs_f64() * 1000.0,
+                        query_times[(query_times.len() * 95 / 100).min(query_times.len() - 1)]
+                            .as_secs_f64()
+                            * 1000.0,
+                        query_times.last().unwrap().as_secs_f64() * 1000.0
+                    );
+                }
                 assert!(store.load_frontier_state().is_none());
                 let rows = store.records();
-                assert_eq!(rows.len(), EXPECTED_URLS);
+                assert_eq!(rows.len(), expected_urls);
                 assert_eq!(
                     rows.iter()
                         .map(|row| &row.url)
                         .collect::<HashSet<_>>()
                         .len(),
-                    EXPECTED_URLS
+                    expected_urls
                 );
                 assert_eq!(
                     rows.iter()
                         .filter(|row| row.status_code == Some(404))
                         .count(),
-                    PLANTED
+                    planted
                 );
                 assert_eq!(
                     rows.iter()
                         .filter(|row| row.status_text == "Blocked by robots.txt")
                         .count(),
-                    PLANTED
+                    planted
                 );
                 assert_eq!(
                     rows.iter()
                         .filter(|row| !row.redirect_chain.is_empty())
                         .count(),
-                    PLANTED
+                    planted
                 );
                 assert!(rows.iter().all(|row| row.status_code == Some(200)
                     || row.status_code == Some(404)
@@ -12472,10 +12498,10 @@ mod tests {
                     limit: 1,
                     ..LinkEdgeQuery::default()
                 });
-                assert_eq!(edges.total, EXPECTED_EDGES);
+                assert_eq!(edges.total, expected_edges);
                 let summary = store.summary();
-                assert_eq!(summary.total, EXPECTED_URLS);
-                assert_eq!(summary.broken, PLANTED);
+                assert_eq!(summary.total, expected_urls);
+                assert_eq!(summary.broken, planted);
                 assert_eq!(
                     store
                         .query(GridQuery {
@@ -12484,7 +12510,7 @@ mod tests {
                             ..GridQuery::default()
                         })
                         .total,
-                    PLANTED
+                    planted
                 );
                 let requests = requests.lock().unwrap();
                 assert!(
@@ -12500,7 +12526,7 @@ mod tests {
                         .map(|(path, _)| path)
                         .collect::<HashSet<_>>()
                         .len(),
-                    PAGES + 2 * PLANTED + 1
+                    pages + 2 * planted + 1
                 );
                 assert_eq!(
                     requests
@@ -12511,7 +12537,7 @@ mod tests {
                 );
                 if interrupted {
                     assert!(
-                        (FRESH_REQUESTS + 1..=FRESH_REQUESTS + 1 + 2 * CONCURRENCY)
+                        (fresh_requests + 1..=fresh_requests + 1 + 2 * CONCURRENCY)
                             .contains(&requests.len()),
                         "Stop may retry only the bounded in-flight requests: {}",
                         requests.len()
@@ -12519,7 +12545,7 @@ mod tests {
                 } else {
                     assert_eq!(
                         requests.len(),
-                        FRESH_REQUESTS,
+                        fresh_requests,
                         "Cycles and duplicate links must not refetch pages"
                     );
                 }
@@ -12547,6 +12573,58 @@ mod tests {
             }
         }
         server.abort();
+    }
+
+    type CrawlLoadQueries = (
+        Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<Vec<Duration>>,
+    );
+
+    fn spawn_crawl_load_queries(
+        store: ferrous_frog_storage::ActiveStore,
+        enabled: bool,
+    ) -> Option<CrawlLoadQueries> {
+        enabled.then(|| {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let worker_stop = stop.clone();
+            let worker = std::thread::spawn(move || {
+                let mut elapsed = Vec::new();
+                while !worker_stop.load(Ordering::SeqCst) {
+                    let started = Instant::now();
+                    let offset = elapsed.len() % 10 * 50;
+                    let grid = store.query(GridQuery {
+                        offset,
+                        limit: 50,
+                        sort_by: Some("url".into()),
+                        ..GridQuery::default()
+                    });
+                    assert!(grid.rows.len() <= 50 && grid.rows.len() <= grid.total);
+                    let links = store.link_edges(ferrous_frog_storage::LinkEdgeQuery {
+                        offset,
+                        limit: 50,
+                        global_search: Some("page".into()),
+                        ..Default::default()
+                    });
+                    assert!(links.edges.len() <= 50 && links.edges.len() <= links.total);
+                    if let Some(frontier) = store.frontier_summary() {
+                        assert!(frontier.queued + frontier.crawled <= frontier.seen);
+                    }
+                    elapsed.push(started.elapsed());
+                    // Match the workbench's refresh delay without delaying test shutdown.
+                    std::thread::park_timeout(Duration::from_millis(1_500));
+                }
+                elapsed
+            });
+            (stop, worker)
+        })
+    }
+
+    fn finish_crawl_load_queries(worker: Option<CrawlLoadQueries>) -> Vec<Duration> {
+        worker.map_or_else(Vec::new, |(stop, worker)| {
+            stop.store(true, Ordering::SeqCst);
+            worker.thread().unpark();
+            worker.join().expect("concurrent storage polling failed")
+        })
     }
 
     type RecordedRequests = Arc<std::sync::Mutex<Vec<(String, Instant)>>>;
