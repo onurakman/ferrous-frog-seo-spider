@@ -5665,11 +5665,11 @@ mod tests {
             assert!(root.rel_prev.as_deref().unwrap().ends_with("/previous"));
             assert_eq!(
                 root.rel_next_targets.as_ref().unwrap(),
-                &[root.rel_next.clone().unwrap()]
+                &[format!("{base_url}next"), format!("{base_url}amp-page")]
             );
             assert_eq!(
                 root.rel_prev_targets.as_ref().unwrap(),
-                &[root.rel_prev.clone().unwrap()]
+                &[format!("{base_url}previous"), format!("{base_url}older")]
             );
             assert!(root.amphtml.as_deref().unwrap().ends_with("/amp-page"));
             let references = store.page_references(ferrous_frog_storage::PageReferenceQuery {
