@@ -1311,6 +1311,39 @@ pub trait CrawlStore: Clone + Send + Sync + 'static {
     fn records(&self) -> Vec<CrawlRecord>;
     fn query(&self, query: GridQuery) -> GridResponse;
     fn link_edges(&self, query: LinkEdgeQuery) -> LinkEdgeResponse;
+    /// Visit all retained edges in storage order. The callback must not reenter this store.
+    /// Built-in backends stream a stable snapshot; custom backends retain paged compatibility.
+    fn try_visit_link_edges(
+        &self,
+        visitor: &mut dyn FnMut(&LinkEdge) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        let mut offset = 0;
+        let mut expected = None;
+        loop {
+            let page = self.link_edges(LinkEdgeQuery {
+                offset,
+                limit: 1_000,
+                ..Default::default()
+            });
+            if expected.is_some_and(|total| total != page.total)
+                || (page.edges.is_empty() && offset < page.total)
+                || offset.saturating_add(page.edges.len()) > page.total
+            {
+                return Err(
+                    std::io::Error::other("link edge snapshot changed during export").into(),
+                );
+            }
+            expected = Some(page.total);
+            for edge in &page.edges {
+                visitor(edge)?;
+            }
+            offset += page.edges.len();
+            if offset == page.total {
+                return Ok(offset);
+            }
+        }
+    }
+
     fn image_assets(&self, query: ImageAssetQuery) -> ImageAssetResponse;
     fn page_references(&self, query: PageReferenceQuery) -> PageReferenceResponse;
     fn page_captures(&self, query: PageCaptureQuery) -> PageCaptureResponse;
@@ -2025,6 +2058,13 @@ impl CrawlStore for MemoryStore {
 
     fn link_edges(&self, query: LinkEdgeQuery) -> LinkEdgeResponse {
         Self::link_edges(self, query)
+    }
+
+    fn try_visit_link_edges(
+        &self,
+        visitor: &mut dyn FnMut(&LinkEdge) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        Self::try_visit_link_edges(self, visitor)
     }
 
     fn image_assets(&self, query: ImageAssetQuery) -> ImageAssetResponse {
@@ -4329,6 +4369,13 @@ impl CrawlStore for SqliteStore {
             .expect("sqlite link edge query failed")
     }
 
+    fn try_visit_link_edges(
+        &self,
+        visitor: &mut dyn FnMut(&LinkEdge) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        Self::try_visit_link_edges(self, visitor)
+    }
+
     fn image_assets(&self, query: ImageAssetQuery) -> ImageAssetResponse {
         self.try_image_assets(query)
             .expect("sqlite image asset query failed")
@@ -4563,6 +4610,13 @@ impl CrawlStore for ActiveStore {
             ActiveStore::Memory(store) => store.link_edges(query),
             ActiveStore::Sqlite(store) => store.link_edges(query),
         }
+    }
+
+    fn try_visit_link_edges(
+        &self,
+        visitor: &mut dyn FnMut(&LinkEdge) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        Self::try_visit_link_edges(self, visitor)
     }
 
     fn image_assets(&self, query: ImageAssetQuery) -> ImageAssetResponse {

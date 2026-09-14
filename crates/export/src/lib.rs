@@ -17,8 +17,8 @@ mod audit_report_tests;
 use csv::Writer;
 use ferrous_frog_storage::{
     AuditThresholds, CrawlRecord, CrawlStore, CrawlSummary, GraphNode, GridQuery, GridResponse,
-    IssueView, LinkEdge, LinkEdgeQuery, SitemapValidationRow, is_broken_record,
-    is_success_html_record, is_success_record, summarize, validate_grid_query,
+    IssueView, LinkEdge, SitemapValidationRow, is_broken_record, is_success_html_record,
+    is_success_record, summarize, validate_grid_query,
 };
 use minijinja::{Environment, context};
 use rust_xlsxwriter::{Format, Workbook, Worksheet, XlsxError};
@@ -328,16 +328,14 @@ pub fn write_export_files<S: CrawlStore>(
         return Ok(Vec::new());
     }
     std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
-    let records = store.records();
-    let edges = store.link_edges(LinkEdgeQuery {
-        offset: 0,
-        limit: 1_000_000,
-        ..LinkEdgeQuery::default()
-    });
-    if kinds.contains(&ExportKind::HtmlReport) && edges.edges.len() != edges.total {
-        return Err("HTML report requires all link edges; this crawl exceeds the 1,000,000-edge report limit".into());
-    }
-    let edges = edges.edges;
+    let records = if kinds
+        .iter()
+        .any(|kind| !matches!(kind, ExportKind::LinksCsv | ExportKind::AuditWorkbook))
+    {
+        store.records()
+    } else {
+        Vec::new()
+    };
     let mut written = Vec::new();
     for kind in kinds {
         let path = dir.join(kind.file_name());
@@ -353,8 +351,7 @@ pub fn write_export_files<S: CrawlStore>(
                 .write_all(records_to_sitemap_xml(&records).as_bytes())
                 .map_err(|e| e.to_string()),
             ExportKind::HtmlReport => {
-                records_to_html_report_writer(&records, &edges, thresholds, &mut writer)
-                    .map_err(|e| e.to_string())
+                records_to_html_report_store_writer(&records, store, thresholds, &mut writer)
             }
             ExportKind::AuditWorkbook => audit_workbook_to_writer(
                 |mut query: GridQuery| {
@@ -364,9 +361,7 @@ pub fn write_export_files<S: CrawlStore>(
                 &mut writer,
             )
             .map(|_| ()),
-            ExportKind::LinksCsv => {
-                link_edges_to_csv(&edges, &mut writer).map_err(|e| e.to_string())
-            }
+            ExportKind::LinksCsv => store_link_edges_to_csv(store, &mut writer).map(|_| ()),
             ExportKind::RedirectsCsv => {
                 redirect_chains_to_csv(&records, &mut writer).map_err(|e| e.to_string())
             }
@@ -568,31 +563,53 @@ pub fn link_edges_to_csv<W: Write>(edges: &[LinkEdge], writer: W) -> csv::Result
     writer.write_record(LINK_EDGE_HEADERS)?;
 
     for edge in edges {
-        writer.write_record([
-            edge.id.to_string(),
-            edge.source_url.clone(),
-            edge.target_url.clone(),
-            edge.anchor_text.clone(),
-            edge.rel.clone(),
-            edge.rel_nofollow.to_string(),
-            format!("{:?}", edge.link_type),
-            edge.source_status_code
-                .map(|code| code.to_string())
-                .unwrap_or_default(),
-            edge.target_status_code
-                .map(|code| code.to_string())
-                .unwrap_or_default(),
-            edge.source_depth.to_string(),
-            edge.target_depth
-                .map(|depth| depth.to_string())
-                .unwrap_or_default(),
-            edge.source_position.to_string(),
-            edge.discovery_order.to_string(),
-        ])?;
+        write_link_edge_csv_row(&mut writer, edge)?;
     }
 
     writer.flush()?;
     Ok(())
+}
+
+fn write_link_edge_csv_row<W: Write>(writer: &mut Writer<W>, edge: &LinkEdge) -> csv::Result<()> {
+    writer.write_record([
+        edge.id.to_string(),
+        edge.source_url.clone(),
+        edge.target_url.clone(),
+        edge.anchor_text.clone(),
+        edge.rel.clone(),
+        edge.rel_nofollow.to_string(),
+        format!("{:?}", edge.link_type),
+        edge.source_status_code
+            .map(|code| code.to_string())
+            .unwrap_or_default(),
+        edge.target_status_code
+            .map(|code| code.to_string())
+            .unwrap_or_default(),
+        edge.source_depth.to_string(),
+        edge.target_depth
+            .map(|depth| depth.to_string())
+            .unwrap_or_default(),
+        edge.source_position.to_string(),
+        edge.discovery_order.to_string(),
+    ])
+}
+
+/// Stream every retained edge in storage order, including crawls above one million edges.
+pub fn store_link_edges_to_csv<S: CrawlStore, W: Write>(
+    store: &S,
+    writer: W,
+) -> Result<usize, String> {
+    let mut writer = Writer::from_writer(writer);
+    writer
+        .write_record(LINK_EDGE_HEADERS)
+        .map_err(|error| error.to_string())?;
+    let count = store
+        .try_visit_link_edges(&mut |edge| {
+            write_link_edge_csv_row(&mut writer, edge).map_err(std::io::Error::other)
+        })
+        .map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())?;
+    Ok(count)
 }
 
 pub fn link_edges_to_csv_string(edges: &[LinkEdge]) -> csv::Result<String> {
@@ -1440,7 +1457,51 @@ pub fn records_to_html_report_writer<W: Write>(
     thresholds: &AuditThresholds,
     writer: W,
 ) -> Result<(), minijinja::Error> {
-    let report = build_html_report(records, edges, thresholds);
+    render_html_report_writer(build_html_report(records, edges, thresholds), writer)
+}
+
+/// Render the complete summary while streaming link edges from storage.
+/// Records remain a full snapshot for global audit predicates and duplicate diagnostics.
+/// Callers must hold the crawl idle and flush buffered writers before publication.
+pub fn records_to_html_report_store_writer<S: CrawlStore, W: Write>(
+    records: &[CrawlRecord],
+    store: &S,
+    thresholds: &AuditThresholds,
+    writer: W,
+) -> Result<(), String> {
+    records_to_html_report_edge_stream_writer(
+        records,
+        thresholds,
+        |visitor| {
+            store
+                .try_visit_link_edges(visitor)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        },
+        writer,
+    )
+}
+
+fn records_to_html_report_edge_stream_writer<W: Write>(
+    records: &[CrawlRecord],
+    thresholds: &AuditThresholds,
+    visit_edges: impl FnOnce(&mut dyn FnMut(&LinkEdge) -> std::io::Result<()>) -> Result<(), String>,
+    writer: W,
+) -> Result<(), String> {
+    let failed_urls = failed_report_urls(records);
+    let mut links = BrokenLinkReport::default();
+    visit_edges(&mut |edge| {
+        links.observe(edge, &failed_urls);
+        Ok(())
+    })?;
+    let report = build_html_report_with_broken_links(records, thresholds, links.section());
+    render_html_report_writer(report, writer).map_err(|error| error.to_string())
+}
+
+fn render_html_report_writer<W: Write>(
+    report: HtmlReport,
+    writer: W,
+) -> Result<(), minijinja::Error> {
     let mut env = Environment::new();
     env.add_template("seo_report.html", HTML_REPORT_TEMPLATE)?;
     env.get_template("seo_report.html")?
@@ -1509,27 +1570,41 @@ fn build_html_report(
     edges: &[LinkEdge],
     thresholds: &AuditThresholds,
 ) -> HtmlReport {
-    let summary = summarize(records);
-    let failed_urls =
-        records
-            .iter()
-            .filter(|record| is_broken_record(record))
-            .flat_map(|record| {
-                [
-                    record.storage_key.as_str(),
-                    record.url.as_str(),
-                    record.final_url.as_str(),
-                ]
-                .into_iter()
-                .chain(record.redirect_chain.iter().flat_map(|hop| {
-                    std::iter::once(hop.url.as_str()).chain(hop.location.as_deref())
-                }))
-            })
-            .collect::<HashSet<_>>();
-    let broken_edge_count = edges
+    let failed_urls = failed_report_urls(records);
+    let mut links = BrokenLinkReport::default();
+    for edge in edges {
+        links.observe(edge, &failed_urls);
+    }
+    build_html_report_with_broken_links(records, thresholds, links.section())
+}
+
+fn failed_report_urls(records: &[CrawlRecord]) -> HashSet<&str> {
+    records
         .iter()
-        .filter(|edge| broken_edge(edge, &failed_urls))
-        .count();
+        .filter(|record| is_broken_record(record))
+        .flat_map(|record| {
+            [
+                record.storage_key.as_str(),
+                record.url.as_str(),
+                record.final_url.as_str(),
+            ]
+            .into_iter()
+            .chain(
+                record.redirect_chain.iter().flat_map(|hop| {
+                    std::iter::once(hop.url.as_str()).chain(hop.location.as_deref())
+                }),
+            )
+        })
+        .collect::<HashSet<_>>()
+}
+
+fn build_html_report_with_broken_links(
+    records: &[CrawlRecord],
+    thresholds: &AuditThresholds,
+    broken_links: ReportSection,
+) -> HtmlReport {
+    let summary = summarize(records);
+    let broken_edge_count = broken_links.count;
     let image_issue_count = records
         .iter()
         .filter(|record| !image_issues(record, thresholds).is_empty())
@@ -1572,7 +1647,7 @@ fn build_html_report(
         ],
         sections: vec![
             broken_url_section(records),
-            broken_link_section(edges, &failed_urls),
+            broken_links,
             metadata_section(records, thresholds),
             headings_and_canonicals_section(records, thresholds),
             image_section(records, thresholds),
@@ -1673,38 +1748,47 @@ fn broken_url_section(records: &[CrawlRecord]) -> ReportSection {
     )
 }
 
-fn broken_link_section(edges: &[LinkEdge], failed_urls: &HashSet<&str>) -> ReportSection {
-    let matching = edges.iter().filter(|edge| broken_edge(edge, failed_urls));
-    let total_count = matching.clone().count();
-    let rows = matching
-        .take(HTML_REPORT_ROW_LIMIT)
-        .map(|edge| {
-            row(vec![
+#[derive(Default)]
+struct BrokenLinkReport {
+    count: usize,
+    rows: Vec<ReportRow>,
+}
+
+impl BrokenLinkReport {
+    fn observe(&mut self, edge: &LinkEdge, failed_urls: &HashSet<&str>) {
+        if !broken_edge(edge, failed_urls) {
+            return;
+        }
+        self.count += 1;
+        if self.rows.len() < HTML_REPORT_ROW_LIMIT {
+            self.rows.push(row(vec![
                 safe_text(&edge.source_url),
                 safe_text(&edge.target_url),
                 safe_text(&edge.anchor_text),
                 safe_text(&edge_status_label(edge)),
                 "Update, redirect, or remove this link from the source page.".to_string(),
-            ])
-        })
-        .collect();
+            ]));
+        }
+    }
 
-    make_section(
-        "Broken Links",
-        "Engineering",
-        "High",
-        "Source pages that link to known broken or unreachable targets.",
-        &[
-            "Source",
-            "Target",
-            "Anchor",
-            "Target status",
-            "Recommended action",
-        ],
-        rows,
-        total_count,
-        "No broken link edges were found.",
-    )
+    fn section(self) -> ReportSection {
+        make_section(
+            "Broken Links",
+            "Engineering",
+            "High",
+            "Source pages that link to known broken or unreachable targets.",
+            &[
+                "Source",
+                "Target",
+                "Anchor",
+                "Target status",
+                "Recommended action",
+            ],
+            self.rows,
+            self.count,
+            "No broken link edges were found.",
+        )
+    }
 }
 
 fn metadata_section(records: &[CrawlRecord], thresholds: &AuditThresholds) -> ReportSection {
@@ -2704,6 +2788,315 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::WriteZero
         );
+    }
+
+    #[test]
+    fn html_report_edge_stream_matches_complete_snapshot_and_propagates_failure() {
+        let mut failed = CrawlRecord::pending("https://example.test/failed".into(), 1);
+        failed.status_code = Some(404);
+        failed.storage_key = "list:2:https://example.test/failed".into();
+        failed.final_url = "https://example.test/final-failed".into();
+        failed.redirect_chain.push(RedirectHop {
+            url: "https://example.test/redirect".into(),
+            status_code: 301,
+            location: Some(failed.final_url.clone()),
+            dns_lookup_time_ms: None,
+            tcp_connect_time_ms: None,
+            tls_handshake_time_ms: None,
+            ttfb_ms: None,
+            elapsed_ms: None,
+        });
+        let mut page = CrawlRecord::pending("https://example.test/page".into(), 0);
+        page.status_code = Some(200);
+        page.content_type = Some("text/html".into());
+        page.title = Some("Shared title".into());
+        page.meta_description = Some("Shared description".into());
+        page.h1 = Some("Shared heading".into());
+        page.images_missing_alt = 2;
+        page.response_time_ms = 3_500;
+        page.mixed_content_count = 1;
+        page.structured_data_error_count = 1;
+        page.deprecated_html_tag_count = 1;
+        page.rendered_dom_changed = true;
+        let mut duplicate = page.clone();
+        duplicate.url = "https://example.test/duplicate".into();
+        duplicate.final_url = duplicate.url.clone();
+        duplicate.storage_key = duplicate.url.clone();
+        let records = vec![failed, page, duplicate];
+        let edges = (0..57)
+            .map(|index| LinkEdge {
+                id: index + 1,
+                source_url: format!("https://example.test/source/{index}"),
+                target_url: match index % 5 {
+                    0 => "list:2:https://example.test/failed",
+                    1 => "https://example.test/failed",
+                    2 => "https://example.test/final-failed",
+                    3 => "https://example.test/redirect",
+                    _ => "https://example.test/uncrawled-error",
+                }
+                .into(),
+                anchor_text: format!("<script>🐸 {index}</script>"),
+                rel: String::new(),
+                rel_nofollow: false,
+                link_type: LinkType::Internal,
+                source_status_code: Some(200),
+                target_status_code: (index % 5 == 4).then_some(500),
+                source_depth: 0,
+                target_depth: Some(1),
+                source_position: index as u32,
+                discovery_order: index,
+            })
+            .collect::<Vec<_>>();
+        let thresholds = AuditThresholds::default();
+        let expected = records_to_html_report(&records, &edges, &thresholds).unwrap();
+        assert!(expected.contains("57 issues"));
+        assert!(expected.contains("Duplicate title"));
+        assert!(expected.contains("Duplicate H1"));
+        let report = build_html_report(&records, &edges, &thresholds);
+        assert_eq!(report.sections.len(), 10);
+        assert!(report.sections.iter().all(|section| section.count > 0));
+        for store in [
+            ferrous_frog_storage::ActiveStore::memory(),
+            ferrous_frog_storage::ActiveStore::Sqlite(
+                ferrous_frog_storage::SqliteStore::in_memory().unwrap(),
+            ),
+        ] {
+            // Keep supplied edge fields unchanged; records are a separate frozen input.
+            for edge in &edges {
+                store.add_link_edge(edge.clone());
+            }
+            let mut output = Vec::new();
+            records_to_html_report_store_writer(&records, &store, &thresholds, &mut output)
+                .unwrap();
+            assert_eq!(String::from_utf8(output).unwrap(), expected);
+        }
+        let mut actual = Vec::new();
+        records_to_html_report_edge_stream_writer(
+            &records,
+            &thresholds,
+            |visitor| {
+                for edge in &edges {
+                    visitor(edge).map_err(|error| error.to_string())?;
+                }
+                Ok(())
+            },
+            &mut actual,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(actual).unwrap(), expected);
+        let mut output = Vec::new();
+        let error = records_to_html_report_edge_stream_writer(
+            &records,
+            &thresholds,
+            |_| Err("edge read failed".into()),
+            &mut output,
+        )
+        .unwrap_err();
+        assert_eq!(error, "edge read failed");
+        assert!(output.is_empty());
+        let mut too_small = [0_u8; 10];
+        assert!(
+            records_to_html_report_edge_stream_writer(
+                &records,
+                &thresholds,
+                |_| Ok(()),
+                too_small.as_mut_slice()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn html_report_edge_stream_observes_the_edge_beyond_one_million() {
+        let mut edge = LinkEdge {
+            id: 0,
+            source_url: "https://example.test/final-source".into(),
+            target_url: "https://example.test/target".into(),
+            anchor_text: "last edge 🐸".into(),
+            rel: String::new(),
+            rel_nofollow: false,
+            link_type: LinkType::Internal,
+            source_status_code: Some(200),
+            target_status_code: Some(200),
+            source_depth: 0,
+            target_depth: None,
+            source_position: 0,
+            discovery_order: 0,
+        };
+        let mut visits = 0;
+        let mut output = Vec::new();
+        records_to_html_report_edge_stream_writer(
+            &[],
+            &AuditThresholds::default(),
+            |visitor| {
+                for id in 1..=1_000_001 {
+                    edge.id = id;
+                    edge.target_status_code = Some(if id == 1_000_001 { 404 } else { 200 });
+                    visitor(&edge).map_err(|error| error.to_string())?;
+                    visits += 1;
+                }
+                Ok(())
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(visits, 1_000_001);
+        let html = String::from_utf8(output).unwrap();
+        assert!(html.contains("final-source"));
+        assert!(html.contains("last edge 🐸"));
+        assert!(html.contains("1 issue"));
+    }
+
+    #[test]
+    fn store_link_csv_matches_snapshot_and_propagates_write_failure() {
+        for store in [
+            ferrous_frog_storage::ActiveStore::memory(),
+            ferrous_frog_storage::ActiveStore::Sqlite(
+                ferrous_frog_storage::SqliteStore::in_memory().unwrap(),
+            ),
+        ] {
+            let edges = (0..57)
+                .map(|index| {
+                    store.add_link_edge(LinkEdge {
+                        id: 0,
+                        source_url: format!("https://example.test/{index}"),
+                        target_url: "https://example.test/target?x=1&y=2".into(),
+                        anchor_text: "\"quote\", newline\n🐸".into(),
+                        rel: "nofollow".into(),
+                        rel_nofollow: true,
+                        link_type: LinkType::Internal,
+                        source_status_code: Some(200),
+                        target_status_code: Some(404),
+                        source_depth: 0,
+                        target_depth: None,
+                        source_position: index,
+                        discovery_order: 0,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let expected = link_edges_to_csv_string(&edges).unwrap();
+            let mut output = Vec::new();
+            assert_eq!(store_link_edges_to_csv(&store, &mut output).unwrap(), 57);
+            assert_eq!(String::from_utf8(output).unwrap(), expected);
+            let mut full = [0_u8; 10];
+            assert!(store_link_edges_to_csv(&store, full.as_mut_slice()).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "optimized synthetic HTML/CSV export benchmark; run separately from browser workloads"]
+    fn legacy_html_edge_stream_workload() {
+        use ferrous_frog_storage::{ActiveStore, SqliteStore};
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        let backend = std::env::var("FF_HTML_BACKEND").unwrap_or_else(|_| "sqlite".into());
+        let mode = std::env::var("FF_HTML_MODE").unwrap_or_else(|_| "stream".into());
+        let edge_count: usize = std::env::var("FF_HTML_EDGES")
+            .ok()
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(1_000_001);
+        assert!(matches!(mode.as_str(), "snapshot" | "stream"));
+        let store = match backend.as_str() {
+            "memory" => ActiveStore::memory(),
+            "sqlite" => ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+            _ => panic!("FF_HTML_BACKEND must be memory or sqlite"),
+        };
+        let mut source = CrawlRecord::pending("https://example.test/source".into(), 0);
+        source.status_code = Some(200);
+        source.content_type = Some("text/html".into());
+        let mut failed = CrawlRecord::pending("https://example.test/failed".into(), 1);
+        failed.status_code = Some(404);
+        store.upsert(source);
+        store.upsert(failed);
+        for index in 0..edge_count {
+            store.add_link_edge(LinkEdge {
+                id: 0,
+                source_url: "https://example.test/source".into(),
+                target_url: "https://example.test/failed".into(),
+                anchor_text: format!("Link {index}, \"résumé\"\n🐸"),
+                rel: "nofollow".into(),
+                rel_nofollow: true,
+                link_type: LinkType::Internal,
+                source_status_code: Some(200),
+                target_status_code: Some(404),
+                source_depth: 0,
+                target_depth: Some(1),
+                source_position: index as u32,
+                discovery_order: 0,
+            });
+        }
+        let records = store.records();
+        let thresholds = AuditThresholds::default();
+        let mut measurements = Vec::new();
+        for pass in 0..4 {
+            let mut output = Vec::new();
+            let started = Instant::now();
+            if mode == "snapshot" {
+                // Matched baseline: use the same cursor but retain its complete edge payload.
+                // The previous public snapshot query could not return more than one million.
+                let mut edges = Vec::new();
+                store
+                    .try_visit_link_edges(&mut |edge| {
+                        edges.push(edge.clone());
+                        Ok(())
+                    })
+                    .unwrap();
+                records_to_html_report_writer(&records, &edges, &thresholds, &mut output).unwrap();
+            } else {
+                records_to_html_report_store_writer(&records, &store, &thresholds, &mut output)
+                    .unwrap();
+            }
+            let elapsed = started.elapsed();
+            let html = String::from_utf8(output).unwrap();
+            assert!(html.contains(&format!("{edge_count} issues")));
+            assert!(html.trim_end().ends_with("</html>"));
+            if pass > 0 {
+                measurements.push(elapsed);
+            }
+        }
+        measurements.sort();
+        eprintln!(
+            "legacy_html backend={backend} mode={mode} records={} edges={edge_count} median_ms={:.3} min_ms={:.3} max_ms={:.3}",
+            records.len(),
+            measurements[1].as_secs_f64() * 1000.0,
+            measurements[0].as_secs_f64() * 1000.0,
+            measurements[2].as_secs_f64() * 1000.0
+        );
+        if mode == "stream" {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let directory = std::env::temp_dir()
+                .join(format!("ferrous-html-edge-{}-{nonce}", std::process::id()));
+            let files = write_export_files(
+                &store,
+                &thresholds,
+                &[ExportKind::HtmlReport, ExportKind::LinksCsv],
+                &directory,
+            )
+            .unwrap();
+            assert_eq!(files.len(), 2);
+            let mut reader = csv::Reader::from_path(directory.join("links.csv")).unwrap();
+            assert_eq!(
+                reader.headers().unwrap().iter().collect::<Vec<_>>(),
+                LINK_EDGE_HEADERS
+            );
+            let mut count = 0;
+            for row in reader.records() {
+                let row = row.unwrap();
+                count += 1;
+                assert_eq!(&row[0], count.to_string());
+                assert_eq!(&row[3], format!("Link {}, \"résumé\"\n🐸", count - 1));
+            }
+            assert_eq!(count, edge_count);
+            assert!(
+                std::fs::read_to_string(directory.join("seo-report.html"))
+                    .unwrap()
+                    .contains(&format!("{edge_count} issues"))
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+            eprintln!("legacy_csv backend={backend} exact_rows={count} last_id={count}");
+        }
     }
 
     #[test]

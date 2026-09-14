@@ -35,8 +35,8 @@ use ferrous_frog_crawler_core::{
 use ferrous_frog_export::{
     audit_workbook_to_writer, export_preset, graph_nodes_to_csv, link_edges_to_csv,
     link_edges_to_csv_string, query_to_xlsx_writer, records_to_csv, records_to_csv_string,
-    records_to_html_report, records_to_html_report_writer, records_to_sitemap_xml,
-    records_to_xlsx_bytes, redirect_chains_to_csv_string, sitemap_validation_to_csv_string,
+    records_to_html_report_store_writer, records_to_sitemap_xml, records_to_xlsx_bytes,
+    redirect_chains_to_csv_string, sitemap_validation_to_csv_string, store_link_edges_to_csv,
     write_export_files,
 };
 use ferrous_frog_integrations::{
@@ -1553,18 +1553,17 @@ fn export_sitemap(state: State<'_, AppState>, query: GridQuery) -> Result<String
 }
 
 #[tauri::command]
-fn export_link_edges_csv(state: State<'_, AppState>) -> Result<String, String> {
-    let edges = state
-        .store
-        .lock()
-        .map_err(|_| "store lock poisoned".to_string())?
-        .link_edges(LinkEdgeQuery {
-            offset: 0,
-            limit: 1_000_000,
-            ..LinkEdgeQuery::default()
-        })
-        .edges;
-    link_edges_to_csv_string(&edges).map_err(|error| error.to_string())
+async fn export_link_edges_csv(state: State<'_, AppState>) -> Result<String, String> {
+    complete_link_edges_csv(&state).await
+}
+
+async fn complete_link_edges_csv(state: &AppState) -> Result<String, String> {
+    with_store_worker(state, true, move |store| {
+        let mut output = Vec::new();
+        store_link_edges_to_csv(store, &mut output)?;
+        String::from_utf8(output).map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1578,20 +1577,17 @@ fn export_redirect_chains_csv(state: State<'_, AppState>) -> Result<String, Stri
 }
 
 #[tauri::command]
-fn export_html_report(state: State<'_, AppState>) -> Result<String, String> {
-    let store = state
-        .store
-        .lock()
-        .map_err(|_| "store lock poisoned".to_string())?;
-    let records = store.records();
-    let edges = store
-        .link_edges(LinkEdgeQuery {
-            offset: 0,
-            limit: 1_000_000,
-            ..LinkEdgeQuery::default()
-        })
-        .edges;
-    records_to_html_report(&records, &edges, &audit_thresholds()).map_err(|error| error.to_string())
+async fn export_html_report(state: State<'_, AppState>) -> Result<String, String> {
+    with_store_worker(&state, true, move |store| {
+        let records = match store {
+            ActiveStore::Memory(store) => store.records(),
+            ActiveStore::Sqlite(store) => store.try_records().map_err(|error| error.to_string())?,
+        };
+        let mut output = Vec::new();
+        records_to_html_report_store_writer(&records, store, &audit_thresholds(), &mut output)?;
+        String::from_utf8(output).map_err(|error| error.to_string())
+    })
+    .await
 }
 
 fn stream_export_file(
@@ -1896,32 +1892,15 @@ async fn export_html_report_file(
 ) -> Result<ExportFileResult, String> {
     with_store_worker(state, true, move |store| {
         write_atomic_export(&path, |file| {
-            // ponytail: retain record/link snapshots for report-wide counts and duplicates;
-            // replace with aggregate storage queries if large reports need bounded hydration.
+            // ponytail: full record snapshot retains global audit semantics; link edges stream.
             let records = match store {
                 ActiveStore::Memory(store) => store.records(),
                 ActiveStore::Sqlite(store) => {
                     store.try_records().map_err(|error| error.to_string())?
                 }
             };
-            let edges = query_store_link_edges(
-                store,
-                LinkEdgeQuery {
-                    limit: 1_000_000,
-                    ..LinkEdgeQuery::default()
-                },
-            )?;
-            if edges.edges.len() != edges.total {
-                return Err("HTML report requires all link edges; this crawl exceeds the 1,000,000-edge report limit".into());
-            }
             let mut writer = BufWriter::new(file);
-            records_to_html_report_writer(
-                &records,
-                &edges.edges,
-                &audit_thresholds(),
-                &mut writer,
-            )
-            .map_err(|error| error.to_string())?;
+            records_to_html_report_store_writer(&records, store, &audit_thresholds(), &mut writer)?;
             writer.flush().map_err(|error| error.to_string())?;
             Ok(records.len())
         })

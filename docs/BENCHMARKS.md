@@ -373,3 +373,32 @@ The report query fixture reads first, middle and last windows of 100 rows for bo
 The portable writer now reads an immutable finding total once and advances through an indexed sequence cursor. It verifies the expected count and the absence of an unexpected trailing row. The workload then streams every emitted CSV, checks its exact row count, and reconciles the number of 1,000-row HTML pages. A separate 1,205-row Chrome fixture verifies real `file://` navigation to the last row, escaped text, local assets and both themes. Comparison exports use the equivalent indexed cursor with request-URL/occurrence ordering.
 
 Limits: source ingestion, snapshot preparation and the export process were measured separately; kernel page cache and tmpfs file memory are excluded from RSS. Full stored values make complete exports large. Filtered or custom-sort evidence CSV keeps the corresponding query's offset semantics and may cost more than the unfiltered cursor path. Preparation still uses native global diagnostic context, and a running diagnostic statement or vacuum completes before cancellation is observed. Large-scale physical-disk runs, concurrent desktop UI measurements and other-platform runs remain separate acceptance work.
+
+## Legacy HTML And Link CSV: 1,000,001 Edges
+
+The legacy ten-section HTML summary now streams retained link edges through a storage visitor. Memory borrows each edge under one read lock; SQLite decodes one row at a time from a single ordered statement. The report retains an exact broken-edge count and at most 50 display rows. Its record snapshot and global duplicate/audit predicates remain unchanged. CLI and automatic whole-link CSV exports use the same visitor and preserve the existing columns and quoting.
+
+Reproduce each backend/mode in a separate process after compiling the test binary:
+
+```sh
+cargo test --locked --release -p ferrous-frog-export legacy_html_edge_stream_workload --no-run
+FF_HTML_BACKEND=memory FF_HTML_MODE=snapshot /usr/bin/time -f 'peak_rss_kib=%M' target/release/deps/ferrous_frog_export-<hash> --ignored --exact tests::legacy_html_edge_stream_workload --nocapture
+FF_HTML_BACKEND=memory FF_HTML_MODE=stream /usr/bin/time -f 'peak_rss_kib=%M' target/release/deps/ferrous_frog_export-<hash> --ignored --exact tests::legacy_html_edge_stream_workload --nocapture
+FF_HTML_BACKEND=sqlite FF_HTML_MODE=snapshot /usr/bin/time -f 'peak_rss_kib=%M' target/release/deps/ferrous_frog_export-<hash> --ignored --exact tests::legacy_html_edge_stream_workload --nocapture
+FF_HTML_BACKEND=sqlite FF_HTML_MODE=stream /usr/bin/time -f 'peak_rss_kib=%M' target/release/deps/ferrous_frog_export-<hash> --ignored --exact tests::legacy_html_edge_stream_workload --nocapture
+```
+
+Use the executable path printed by the compilation command. `FF_HTML_EDGES` optionally changes the default 1,000,001 edges. Each process creates two records and repeated links with distinct positions and Unicode, quotes and newlines in their anchors. SQLite runs in memory. One warmup precedes three measured renders; timing includes edge traversal, rendering and disposal of the temporary edge snapshot, but excludes insertion, record hydration, assertions and compilation.
+
+The matched snapshot baseline uses the same visitor to collect a full edge vector before rendering. It measures the removed allocation and retention while preserving identical input; the old public query itself could return only one million edges. This is a complete-input comparison, not a successful timing of the old capped desktop command.
+
+| Backend | Complete edge snapshot median | Streaming median | Snapshot process peak RSS | Streaming process peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| Memory | 132.557 ms | 5.650 ms | 632.012 MiB | 319.070 MiB |
+| SQLite | 1,313.368 ms | 1,067.597 ms | 558.020 MiB | 288.488 MiB |
+
+The three measured ranges were 132.437–133.320 ms versus 5.630–6.045 ms for Memory, and 1,287.293–1,326.815 ms versus 1,062.753–1,074.367 ms for SQLite. Process peak RSS includes fixture insertion and the retained store, including SQLite C allocations; it is not an isolated Rust allocation count. Streaming processes additionally write the actual HTML and link CSV files through `write_export_files`, read every CSV record, verify all 1,000,001 IDs and original anchors including the final row, then remove their temporary output. Those CSV operations are outside the HTML timing measurements.
+
+Focused fixtures also cover all ten populated HTML sections, global duplicates, List storage keys and redirect aliases, borrowed Memory payloads, late SQLite decode errors, visitor/write failures, escaping and a broken edge first encountered at position 1,000,001. Desktop HTML tests preserve existing files on failure. Legacy whole-link CSV and HTML string commands now use the idle background worker, reject active or closing crawls, and retain their complete output strings.
+
+This removes edge-count-dependent report input buffers and the HTML/whole-link CSV ceiling. It does not make full record hydration, duplicate analysis, arbitrary captured string sizes, archive import or every export format bounded. The HTML remains a sampled summary; the separate frozen audit package supplies complete per-finding evidence pages. These measurements exclude HTTP, rendering, physical-disk crawl storage and concurrent ingestion.

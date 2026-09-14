@@ -84,6 +84,39 @@ async fn html_report_storage_failures_preserve_existing_files_and_remove_tempora
     }
 }
 
+#[tokio::test]
+async fn complete_link_csv_streams_both_backends_and_rejects_active_or_closing_crawls() {
+    for store in [
+        ActiveStore::memory(),
+        ActiveStore::Sqlite(ferrous_frog_storage::SqliteStore::in_memory().unwrap()),
+    ] {
+        for index in 0..57 {
+            store.add_link_edge(archive_edge(index));
+        }
+        let state = state_with_store(store);
+        let output = complete_link_edges_csv(&state).await.unwrap();
+        let mut reader = csv::Reader::from_reader(output.as_bytes());
+        let rows = reader.records().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(rows.len(), 57);
+        assert_eq!(&rows.last().unwrap()[11], "56");
+        *state.crawl_task.lock().await = Some(tauri::async_runtime::spawn(std::future::pending()));
+        assert!(
+            complete_link_edges_csv(&state)
+                .await
+                .unwrap_err()
+                .contains("stop")
+        );
+        state.crawl_task.lock().await.take().unwrap().abort();
+        state.exit_confirmed.store(true, Ordering::SeqCst);
+        assert!(
+            complete_link_edges_csv(&state)
+                .await
+                .unwrap_err()
+                .contains("closing")
+        );
+    }
+}
+
 fn archive_edge(position: u32) -> LinkEdge {
     LinkEdge {
         id: 0,

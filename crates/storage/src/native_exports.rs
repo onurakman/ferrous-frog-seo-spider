@@ -1,6 +1,49 @@
 use crate::*;
 
+impl MemoryStore {
+    /// Stream borrowed edges under one read lock; the visitor must not reenter this store.
+    pub fn try_visit_link_edges(
+        &self,
+        visitor: &mut dyn FnMut(&LinkEdge) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        let inner = self.inner.read().map_err(|_| StorageError::LockPoisoned)?;
+        for edge in &inner.link_edges {
+            visitor(edge)?;
+        }
+        Ok(inner.link_edges.len())
+    }
+}
+
+impl SqliteStore {
+    /// Stream one SQLite statement snapshot without an edge Vec or repeated count queries.
+    pub fn try_visit_link_edges(
+        &self,
+        visitor: &mut dyn FnMut(&LinkEdge) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare("SELECT * FROM link_edges ORDER BY id ASC")?;
+        let mut count = 0;
+        for edge in statement.query_map([], link_edge_from_row)? {
+            visitor(&edge?)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
 impl ActiveStore {
+    /// Visit a stable edge snapshot without cloning the full collection.
+    /// The visitor runs under the storage lock and must not reenter this store.
+    pub fn try_visit_link_edges(
+        &self,
+        visitor: &mut dyn FnMut(&LinkEdge) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        match self {
+            Self::Memory(store) => store.try_visit_link_edges(visitor),
+            Self::Sqlite(store) => store.try_visit_link_edges(visitor),
+        }
+    }
+
     /// Read only the requested records, preserving ID order and omitting unknown IDs.
     pub fn try_records_by_ids(&self, ids: &[u64]) -> Result<Vec<CrawlRecord>, StorageError> {
         if ids.is_empty() {
@@ -103,6 +146,110 @@ mod tests {
             assert!(selected.iter().all(|record| record.id != duplicate.id));
             assert!(store.try_records_by_ids(&[]).unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn link_edge_visit_preserves_exact_order_values_and_stops_on_error() {
+        for store in stores() {
+            let edges = (0..57)
+                .map(|index| {
+                    store.add_link_edge(LinkEdge {
+                        id: 0,
+                        source_url: format!("https://example.test/source/{index}"),
+                        target_url: "https://example.test/target?x=🐸&y=1".into(),
+                        anchor_text: format!("<script>é {index}</script>"),
+                        rel: "ugc".into(),
+                        rel_nofollow: false,
+                        link_type: LinkType::Internal,
+                        source_status_code: Some(200),
+                        target_status_code: Some(404),
+                        source_depth: 1,
+                        target_depth: Some(2),
+                        source_position: index,
+                        discovery_order: u64::from(index),
+                    })
+                })
+                .collect::<Vec<_>>();
+            // Identical values alone would not detect cloning the entire edge collection.
+            let original_urls = match &store {
+                ActiveStore::Memory(memory) => Some(
+                    memory
+                        .inner
+                        .read()
+                        .unwrap()
+                        .link_edges
+                        .iter()
+                        .map(|edge| edge.source_url.as_ptr() as usize)
+                        .collect::<Vec<_>>(),
+                ),
+                ActiveStore::Sqlite(_) => None,
+            };
+            let mut visited = Vec::new();
+            assert_eq!(
+                store
+                    .try_visit_link_edges(&mut |edge| {
+                        if let Some(urls) = &original_urls {
+                            assert_eq!(
+                                edge.source_url.as_ptr() as usize,
+                                urls[visited.len()],
+                                "Memory visitor must borrow the retained edge payload"
+                            );
+                        }
+                        visited.push(edge.clone());
+                        Ok(())
+                    })
+                    .unwrap(),
+                edges.len()
+            );
+            assert_eq!(visited, edges);
+            let mut calls = 0;
+            let error = store
+                .try_visit_link_edges(&mut |_| {
+                    calls += 1;
+                    Err(std::io::Error::other("cancelled"))
+                })
+                .unwrap_err();
+            assert_eq!(calls, 1);
+            assert!(error.to_string().contains("cancelled"));
+            store.clear();
+            assert_eq!(
+                store
+                    .try_visit_link_edges(&mut |_| panic!("empty edges"))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_link_edge_visit_reports_query_and_late_decode_errors() {
+        let store = SqliteStore::in_memory().unwrap();
+        let conn = store.connection().unwrap();
+        conn.execute_batch("INSERT INTO link_edges (id, source_url, target_url, anchor_text,
+            rel, rel_nofollow, link_type, source_depth, source_position, discovery_order)
+            VALUES (1, 'https://example.test/a', 'https://example.test/b', '', '', 0, 'internal', 0, 1, 1),
+                   (2, 'https://example.test/c', 'https://example.test/b', '', '', 0, 'internal', 'invalid-depth', 2, 2)").unwrap();
+        drop(conn);
+        let mut calls = 0;
+        assert!(
+            store
+                .try_visit_link_edges(&mut |_| {
+                    calls += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(calls, 1, "late decode failure must stop the stream");
+        store
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TABLE link_edges")
+            .unwrap();
+        assert!(
+            store
+                .try_visit_link_edges(&mut |_| panic!("query failed"))
+                .is_err()
+        );
     }
 
     #[test]
