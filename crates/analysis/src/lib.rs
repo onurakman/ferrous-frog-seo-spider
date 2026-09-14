@@ -448,13 +448,14 @@ fn reference_target_issues(
     diagnostic: ReferenceDiagnostics,
     issues: &mut Vec<Issue>,
 ) {
-    for (matches, rule, label, view, target, severity) in [
+    for (matches, rule, label, view, target, targets, severity) in [
         (
             diagnostic.pagination_next_to_error,
             "pagination.next_to_error",
             "Pagination next target has a response or fetch error",
             IssueView::PaginationNextToError,
             &record.rel_next,
+            record.rel_next_targets.as_ref(),
             Severity::Error,
         ),
         (
@@ -463,6 +464,7 @@ fn reference_target_issues(
             "Pagination prev target has a response or fetch error",
             IssueView::PaginationPrevToError,
             &record.rel_prev,
+            record.rel_prev_targets.as_ref(),
             Severity::Error,
         ),
         (
@@ -471,6 +473,7 @@ fn reference_target_issues(
             "AMP target has a response or fetch error",
             IssueView::AmpToError,
             &record.amphtml,
+            None,
             Severity::Error,
         ),
         (
@@ -479,6 +482,7 @@ fn reference_target_issues(
             "Observed AMP target does not canonically return to the declaring page",
             IssueView::AmpNonReciprocal,
             &record.amphtml,
+            None,
             Severity::Warning,
         ),
         (
@@ -487,6 +491,7 @@ fn reference_target_issues(
             "Next pagination path enters a loop",
             IssueView::PaginationNextLoop,
             &record.rel_next,
+            record.rel_next_targets.as_ref(),
             Severity::Error,
         ),
         (
@@ -495,6 +500,7 @@ fn reference_target_issues(
             "Previous pagination path enters a loop",
             IssueView::PaginationPrevLoop,
             &record.rel_prev,
+            record.rel_prev_targets.as_ref(),
             Severity::Error,
         ),
         (
@@ -503,6 +509,7 @@ fn reference_target_issues(
             "Captured next target does not link back through its captured previous relation",
             IssueView::PaginationNextNonReciprocal,
             &record.rel_next,
+            record.rel_next_targets.as_ref(),
             Severity::Warning,
         ),
         (
@@ -511,16 +518,31 @@ fn reference_target_issues(
             "Captured previous target does not link back through its captured next relation",
             IssueView::PaginationPrevNonReciprocal,
             &record.rel_prev,
+            record.rel_prev_targets.as_ref(),
             Severity::Warning,
         ),
     ] {
         if matches {
+            let context = match targets {
+                Some(targets) if targets.len() > 1 => {
+                    format!(
+                        "{} captured targets; inspect the selected page's target list",
+                        targets.len()
+                    )
+                }
+                Some(targets) => targets
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                None => target.as_deref().unwrap_or_default().to_string(),
+            };
             issues.push(issue(
                 rule,
                 view,
                 severity,
                 record,
-                format!("{label}: {}", target.as_deref().unwrap_or_default()),
+                format!("{label}: {context}"),
             ));
         }
     }
@@ -980,6 +1002,31 @@ mod tests {
                 .any(|issue| issue.rule_id == "pagination.multiple_targets"
                     && issue.message.contains("2 next, unknown previous"))
         );
+    }
+
+    #[test]
+    fn pagination_issues_do_not_attribute_a_later_target_failure_to_the_first_url() {
+        let mut source = CrawlRecord::pending("https://example.test/source".into(), 0);
+        source.status_code = Some(200);
+        source.content_type = Some("text/html".into());
+        source.rel_next = Some("https://example.test/healthy".into());
+        source.rel_next_targets = Some(vec![
+            "https://example.test/healthy".into(),
+            "https://example.test/failed".into(),
+        ]);
+        let mut healthy = CrawlRecord::pending("https://example.test/healthy".into(), 0);
+        healthy.status_code = Some(200);
+        healthy.content_type = Some("text/html".into());
+        let mut failed = CrawlRecord::pending("https://example.test/failed".into(), 0);
+        failed.status_code = Some(404);
+        let issues = analyze_records(&[source, healthy, failed], &AuditThresholds::default());
+        let issue = issues
+            .iter()
+            .find(|issue| issue.rule_id == "pagination.next_to_error")
+            .expect("second declared target must be checked");
+        assert_eq!(issue.view, IssueView::PaginationNextToError);
+        assert!(!issue.message.contains("https://example.test/healthy"));
+        assert!(issue.message.contains("2 captured targets"));
     }
 
     #[test]

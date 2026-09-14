@@ -3723,7 +3723,8 @@ impl SqliteStore {
                 COALESCE((status_code IS NOT NULL OR ({NO_RESPONSE_SQL})), 0),
                 COALESCE((status_code BETWEEN 400 AND 599 OR ({NO_RESPONSE_SQL})
                     OR (status_code BETWEEN 300 AND 399 AND error IS NOT NULL)), 0),
-                COALESCE(error != 'Redirect limit exceeded', 1), amphtml
+                COALESCE(error != 'Redirect limit exceeded', 1), amphtml,
+                rel_next_targets, rel_prev_targets
                 FROM crawl_records ORDER BY id", broken_record_sql(), broken_record_sql());
             let mut statement = transaction.prepare(&sql)?;
             let rows = statement.query_map([], reference_audit_record_from_row)?;
@@ -7787,6 +7788,8 @@ struct ReferenceAuditRecord {
     canonical: Option<String>,
     rel_next: Option<String>,
     rel_prev: Option<String>,
+    rel_next_targets: Option<Vec<String>>,
+    rel_prev_targets: Option<Vec<String>>,
     amphtml: Option<String>,
     eligible: bool,
     internal: bool,
@@ -7809,6 +7812,8 @@ impl From<&CrawlRecord> for ReferenceAuditRecord {
             canonical: record.canonical.clone(),
             rel_next: record.rel_next.clone(),
             rel_prev: record.rel_prev.clone(),
+            rel_next_targets: record.rel_next_targets.clone(),
+            rel_prev_targets: record.rel_prev_targets.clone(),
             amphtml: record.amphtml.clone(),
             eligible: is_success_html_record(record),
             internal: record.classification == UrlClassification::Internal,
@@ -7856,6 +7861,8 @@ fn reference_audit_record_from_row(
         canonical: row.get(3)?,
         rel_next: row.get(11)?,
         rel_prev: row.get(12)?,
+        rel_next_targets: json_column(row, "rel_next_targets")?,
+        rel_prev_targets: json_column(row, "rel_prev_targets")?,
         amphtml: row.get(16)?,
         eligible: row.get(4)?,
         internal: row.get(5)?,
@@ -7900,6 +7907,37 @@ struct ReferenceTarget {
     observed: Option<ReferenceCandidate>,
 }
 
+fn pagination_targets(record: &ReferenceAuditRecord, next: bool) -> impl Iterator<Item = &str> {
+    let (captured, first) = if next {
+        (&record.rel_next_targets, &record.rel_next)
+    } else {
+        (&record.rel_prev_targets, &record.rel_prev)
+    };
+    captured
+        .iter()
+        .flat_map(|targets| targets.iter())
+        .chain(first.iter().filter(move |_| captured.is_none()))
+        .map(String::as_str)
+}
+
+fn multiple_distinct_pagination_targets(record: &ReferenceAuditRecord, next: bool) -> bool {
+    let mut first = None;
+    for value in pagination_targets(record, next) {
+        let value = normalized_final_url(value).unwrap_or_else(|| value.trim().to_string());
+        if value.is_empty() {
+            continue;
+        }
+        if let Some(first) = &first {
+            if first != &value {
+                return true;
+            }
+        } else {
+            first = Some(value);
+        }
+    }
+    false
+}
+
 fn build_reference_diagnostics(records: &[ReferenceAuditRecord]) -> Vec<ReferenceDiagnostics> {
     // Direct request evidence outranks redirect hops, then final URL aliases. Earliest List
     // occurrences break ties; a pending occurrence must not hide an observed response.
@@ -7941,8 +7979,10 @@ fn build_reference_diagnostics(records: &[ReferenceAuditRecord]) -> Vec<Referenc
         add(&record.final_url, 2, record.redirect);
     }
     let canonical = build_canonical_diagnostics(records, &targets);
-    let mut next = vec![None; records.len()];
-    let mut prev = vec![None; records.len()];
+    let mut next = vec![Vec::<usize>::new(); records.len()];
+    let mut prev = vec![Vec::<usize>::new(); records.len()];
+    let mut next_branch = vec![false; records.len()];
+    let mut prev_branch = vec![false; records.len()];
     let mut diagnostics = records
         .iter()
         .zip(canonical)
@@ -7952,13 +7992,11 @@ fn build_reference_diagnostics(records: &[ReferenceAuditRecord]) -> Vec<Referenc
                 canonical,
                 ..ReferenceDiagnostics::default()
             };
-            if !record.eligible
-                || (record.rel_next.is_none()
-                    && record.rel_prev.is_none()
-                    && record.amphtml.is_none())
-            {
+            if !record.eligible {
                 return diagnostic;
             }
+            next_branch[source_index] = multiple_distinct_pagination_targets(record, true);
+            prev_branch[source_index] = multiple_distinct_pagination_targets(record, false);
             // A successful source proves its own route and final page work even when an older
             // List occurrence failed. Recorded redirect hops are part of that successful route.
             let source_aliases = url_aliases_many(
@@ -7966,8 +8004,8 @@ fn build_reference_diagnostics(records: &[ReferenceAuditRecord]) -> Vec<Referenc
                     .into_iter()
                     .chain(record.redirect_urls.iter().map(String::as_str)),
             );
-            let observed_target = |value: Option<&str>| {
-                let target = value.and_then(normalized_final_url)?;
+            let observed_target = |value: &str| {
+                let target = normalized_final_url(value)?;
                 let aliases = url_aliases(&target);
                 if aliases_overlap(&aliases, &source_aliases) {
                     return Some(source_index);
@@ -7978,13 +8016,23 @@ fn build_reference_diagnostics(records: &[ReferenceAuditRecord]) -> Vec<Referenc
                     .min()
                     .map(|(_, _, _, index, _)| index)
             };
-            let next_target = observed_target(record.rel_next.as_deref());
-            let prev_target = observed_target(record.rel_prev.as_deref());
-            let amp_target = observed_target(record.amphtml.as_deref());
+            let next_targets = pagination_targets(record, true)
+                .filter_map(&observed_target)
+                .collect::<Vec<_>>();
+            let prev_targets = pagination_targets(record, false)
+                .filter_map(&observed_target)
+                .collect::<Vec<_>>();
+            let amp_target = record.amphtml.as_deref().and_then(observed_target);
             let target_has_error =
                 |target: Option<usize>| target.is_some_and(|index| records[index].target_error);
-            diagnostic.pagination_next_to_error = target_has_error(next_target);
-            diagnostic.pagination_prev_to_error = target_has_error(prev_target);
+            diagnostic.pagination_next_to_error = next_targets
+                .iter()
+                .copied()
+                .any(|target| target_has_error(Some(target)));
+            diagnostic.pagination_prev_to_error = prev_targets
+                .iter()
+                .copied()
+                .any(|target| target_has_error(Some(target)));
             diagnostic.amp_to_error = target_has_error(amp_target);
             diagnostic.amp_non_reciprocal = amp_target
                 .filter(|&index| records[index].eligible)
@@ -8034,24 +8082,29 @@ fn build_reference_diagnostics(records: &[ReferenceAuditRecord]) -> Vec<Referenc
                         }
                     })
             };
-            next[source_index] = loop_target(next_target);
-            prev[source_index] = loop_target(prev_target);
+            next[source_index] = next_targets
+                .into_iter()
+                .filter_map(|target| loop_target(Some(target)))
+                .collect();
+            prev[source_index] = prev_targets
+                .into_iter()
+                .filter_map(|target| loop_target(Some(target)))
+                .collect();
+            next[source_index].sort_unstable();
+            next[source_index].dedup();
+            prev[source_index].sort_unstable();
+            prev[source_index].dedup();
             diagnostic
         })
         .collect::<Vec<_>>();
     for (source_index, ((diagnostic, next_loop), prev_loop)) in diagnostics
         .iter_mut()
-        .zip(paths_entering_cycles(&next))
-        .zip(paths_entering_cycles(&prev))
+        .zip(pagination_paths_entering_cycles(&next, &next_branch))
+        .zip(pagination_paths_entering_cycles(&prev, &prev_branch))
         .enumerate()
     {
         diagnostic.pagination_next_loop = next_loop;
         diagnostic.pagination_prev_loop = prev_loop;
-        if next[source_index].is_none_or(|index| index == source_index)
-            && prev[source_index].is_none_or(|index| index == source_index)
-        {
-            continue;
-        }
         let source = &records[source_index];
         let source_final = normalized_final_url(&source.final_url);
         let source_aliases = url_aliases_many(
@@ -8059,40 +8112,60 @@ fn build_reference_diagnostics(records: &[ReferenceAuditRecord]) -> Vec<Referenc
                 .into_iter()
                 .chain(source.redirect_urls.iter().map(String::as_str)),
         );
-        let non_reciprocal = |target: Option<usize>, return_is_prev: bool| {
-            // The existing edges contain only complete HTML targets, resolved in each source's
-            // own context. Self-pagination is already reported by the direction-specific loops.
-            let Some(target_index) = target.filter(|&index| index != source_index) else {
-                return false;
-            };
-            let target = &records[target_index];
-            let (return_url, return_target) = if return_is_prev {
-                (target.rel_prev.as_deref(), prev[target_index])
-            } else {
-                (target.rel_next.as_deref(), next[target_index])
-            };
-            let Some(return_url) = return_url.filter(|value| !value.trim().is_empty()) else {
-                return true;
-            };
-            let Some(return_url) = normalized_final_url(return_url) else {
-                return false;
-            };
-            // Current source evidence outranks an older failed List occurrence of its route.
-            if aliases_overlap(&url_aliases(&return_url), &source_aliases) {
-                return false;
-            }
-            // A different URL may redirect back to this page. Only a known complete return
-            // destination supports a mismatch; robots, errors and uncrawled returns stay unknown.
-            match (
-                source_final.as_ref(),
-                return_target.and_then(|index| normalized_final_url(&records[index].final_url)),
-            ) {
-                (Some(source), Some(returned)) => source != &returned,
-                _ => false,
-            }
+        let non_reciprocal = |target_indices: &[usize], return_is_prev: bool| {
+            target_indices.iter().copied().any(|target_index| {
+                // Each observed complete destination is checked separately. Its own unrelated
+                // sequence declarations cannot mask an actual return to this source.
+                if target_index == source_index {
+                    return false;
+                }
+                let target = &records[target_index];
+                let target_aliases = url_aliases_many(
+                    [target.url.as_str(), target.final_url.as_str()]
+                        .into_iter()
+                        .chain(target.redirect_urls.iter().map(String::as_str)),
+                );
+                let mut saw_return = false;
+                let mut uncertain = false;
+                for return_url in pagination_targets(target, !return_is_prev) {
+                    if return_url.trim().is_empty() {
+                        continue;
+                    }
+                    saw_return = true;
+                    let Some(return_url) = normalized_final_url(return_url) else {
+                        uncertain = true;
+                        continue;
+                    };
+                    let aliases = url_aliases(&return_url);
+                    // This successful source outranks a failed older List occurrence.
+                    if aliases_overlap(&aliases, &source_aliases) {
+                        return false;
+                    }
+                    let returned = if aliases_overlap(&aliases, &target_aliases) {
+                        normalized_final_url(&target.final_url)
+                    } else {
+                        aliases
+                            .iter()
+                            .filter_map(|alias| {
+                                targets.get(alias).and_then(|target| target.observed)
+                            })
+                            .min()
+                            .filter(|candidate| records[candidate.3].eligible)
+                            .and_then(|candidate| {
+                                normalized_final_url(&records[candidate.3].final_url)
+                            })
+                    };
+                    match (source_final.as_ref(), returned.as_ref()) {
+                        (Some(source), Some(returned)) if source == returned => return false,
+                        (Some(_), Some(_)) => {}
+                        _ => uncertain = true,
+                    }
+                }
+                !saw_return || !uncertain
+            })
         };
-        diagnostic.pagination_next_non_reciprocal = non_reciprocal(next[source_index], true);
-        diagnostic.pagination_prev_non_reciprocal = non_reciprocal(prev[source_index], false);
+        diagnostic.pagination_next_non_reciprocal = non_reciprocal(&next[source_index], true);
+        diagnostic.pagination_prev_non_reciprocal = non_reciprocal(&prev[source_index], false);
     }
     diagnostics
 }
@@ -8174,6 +8247,57 @@ fn build_canonical_diagnostics(
         diagnostic.loop_detected = loops;
     }
     diagnostics
+}
+
+fn pagination_paths_entering_cycles(edges: &[Vec<usize>], branching: &[bool]) -> Vec<bool> {
+    // A page can occur in several independent sequences. Traverse only unambiguous
+    // continuations after the source's selected declaration; a branching intermediate page
+    // cannot prove that two edges belong to the same sequence.
+    let single = edges
+        .iter()
+        .zip(branching)
+        .map(
+            |(targets, branching)| match (targets.as_slice(), branching) {
+                ([target], false) => Some(*target),
+                _ => None,
+            },
+        )
+        .collect::<Vec<_>>();
+    let proven = paths_entering_cycles(&single);
+    let mut terminal = vec![None; edges.len()];
+    for start in 0..edges.len() {
+        if proven[start] || terminal[start].is_some() {
+            continue;
+        }
+        let mut path = Vec::new();
+        let mut cursor = start;
+        loop {
+            let root = if let Some(root) = terminal[cursor] {
+                root
+            } else if let Some(next) = single[cursor] {
+                path.push(cursor);
+                cursor = next;
+                continue;
+            } else {
+                cursor
+            };
+            terminal[root] = Some(root);
+            for index in path {
+                terminal[index] = Some(root);
+            }
+            break;
+        }
+    }
+    edges
+        .iter()
+        .enumerate()
+        .map(|(source, targets)| {
+            proven[source]
+                || targets.iter().any(|&target| {
+                    target == source || proven[target] || terminal[target] == Some(source)
+                })
+        })
+        .collect()
 }
 
 // Each node has at most one edge. Memoize whether its path enters a cycle in linear time,

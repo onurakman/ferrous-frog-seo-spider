@@ -226,6 +226,201 @@ fn multiple_target_inventory_keeps_list_occurrences_and_ignores_unmeasured_sourc
 }
 
 #[test]
+fn pagination_diagnostics_check_every_measured_target_without_combining_sequences() {
+    let mut error_next = source("error-next", Some("healthy"), None);
+    error_next.rel_next_targets = Some(vec![url("healthy"), url("failed")]);
+    let mut error_prev = source("error-prev", None, Some("healthy"));
+    error_prev.rel_prev_targets = Some(vec![url("healthy"), url("failed")]);
+    let mut loop_next = source("loop-next", Some("healthy"), None);
+    loop_next.rel_next_targets = Some(vec![url("healthy"), url("cycle-a")]);
+    let mut loop_prev = source("loop-prev", None, Some("healthy"));
+    loop_prev.rel_prev_targets = Some(vec![url("healthy"), url("prev-cycle-a")]);
+    let mut reciprocal = source("reciprocal", Some("return-multiple"), None);
+    reciprocal.rel_next_targets = Some(vec![url("return-multiple"), url("return-second")]);
+    let mut return_multiple = source("return-multiple", None, Some("other"));
+    return_multiple.rel_prev_targets = Some(vec![url("other"), url("reciprocal#fragment")]);
+    let mut mixed = source("mixed", Some("return-multiple"), None);
+    mixed.rel_next_targets = Some(vec![url("return-multiple"), url("missing-return")]);
+    let mut unknown = source("unknown", Some("unknown-return"), None);
+    unknown.rel_next_targets = Some(vec![url("unknown-return"), url("unknown-second")]);
+    let mut unknown_return = source("unknown-return", None, Some("other"));
+    unknown_return.rel_prev_targets = Some(vec![url("other"), url("pending")]);
+    let mut prev_reciprocal = source("prev-reciprocal", None, Some("prev-return-multiple"));
+    prev_reciprocal.rel_prev_targets =
+        Some(vec![url("prev-return-multiple"), url("prev-return-second")]);
+    let mut prev_return_multiple = source("prev-return-multiple", Some("other"), None);
+    prev_return_multiple.rel_next_targets =
+        Some(vec![url("other"), url("prev-reciprocal#fragment")]);
+    let mut prev_mixed = source("prev-mixed", None, Some("prev-return-multiple"));
+    prev_mixed.rel_prev_targets = Some(vec![
+        url("prev-return-multiple"),
+        url("prev-missing-return"),
+    ]);
+    let mut branch_enter = source("branch-enter", Some("branch-mid"), None);
+    branch_enter.rel_next_targets = Some(vec![url("branch-mid")]);
+    let mut branch_mid = source("branch-mid", Some("branch-back"), None);
+    branch_mid.rel_next_targets = Some(vec![url("branch-back"), url("branch-exit")]);
+    let mut branch_back = source("branch-back", Some("branch-enter"), None);
+    branch_back.rel_next_targets = Some(vec![url("branch-enter")]);
+    let mut unknown_branch = source("unknown-branch", Some("unknown-back"), None);
+    unknown_branch.rel_next_targets = Some(vec![url("unknown-back"), url("pending")]);
+    let mut source_branch = source("source-branch", Some("branch-return"), None);
+    source_branch.rel_next_targets = Some(vec![url("branch-return"), url("branch-exit")]);
+    let mut branch_return = source("branch-return", Some("source-branch"), None);
+    branch_return.rel_next_targets = Some(vec![url("source-branch")]);
+    let rows = [
+        error_next,
+        error_prev,
+        loop_next,
+        loop_prev,
+        reciprocal,
+        return_multiple,
+        source("return-second", None, Some("reciprocal")),
+        mixed,
+        unknown,
+        unknown_return,
+        source("unknown-second", None, Some("unknown")),
+        prev_reciprocal,
+        prev_return_multiple,
+        source("prev-return-second", Some("prev-reciprocal"), None),
+        prev_mixed,
+        page("prev-missing-return"),
+        branch_enter,
+        branch_mid,
+        branch_back,
+        source("unknown-enter", Some("unknown-branch"), None),
+        unknown_branch,
+        source("unknown-back", Some("unknown-enter"), None),
+        source_branch,
+        branch_return,
+        page("healthy"),
+        failed("failed", Some(404)),
+        source("cycle-a", Some("cycle-b"), None),
+        source("cycle-b", Some("cycle-a"), None),
+        source("prev-cycle-a", None, Some("prev-cycle-b")),
+        source("prev-cycle-b", None, Some("prev-cycle-a")),
+        page("missing-return"),
+        page("other"),
+        CrawlRecord::pending(url("pending"), 0),
+        page("branch-exit"),
+    ];
+    let memory = MemoryStore::new();
+    let sqlite = SqliteStore::in_memory().unwrap();
+    for row in rows {
+        memory.upsert(row.clone());
+        sqlite.try_upsert(row).unwrap();
+    }
+    for (view, included, excluded) in [
+        (NEXT, vec!["error-next"], vec!["error-prev"]),
+        (PREV, vec!["error-prev"], vec!["error-next"]),
+        (
+            NEXT_LOOP,
+            vec!["loop-next", "source-branch"],
+            vec![
+                "branch-enter",
+                "branch-back",
+                "unknown-enter",
+                "unknown-back",
+            ],
+        ),
+        (PREV_LOOP, vec!["loop-prev"], vec!["branch-enter"]),
+        (
+            NEXT_NON_RECIPROCAL,
+            vec!["mixed"],
+            vec!["reciprocal", "unknown"],
+        ),
+        (
+            PREV_NON_RECIPROCAL,
+            vec!["prev-mixed"],
+            vec!["prev-reciprocal"],
+        ),
+    ] {
+        let left = memory.query(query(view));
+        let right = sqlite.try_query(query(view)).unwrap();
+        assert_eq!(keys(&left), keys(&right), "{view}");
+        for path in included {
+            assert!(
+                left.rows.iter().any(|row| row.url == url(path)),
+                "{view} missing {path}"
+            );
+        }
+        for path in excluded {
+            assert!(
+                !left.rows.iter().any(|row| row.url == url(path)),
+                "{view} wrongly has {path}"
+            );
+        }
+        assert_eq!(left.total, right.total, "{view}");
+    }
+}
+
+#[test]
+fn pagination_later_target_keeps_redirect_aliases_and_list_occurrence_identity() {
+    let mut watched = occurrence(source("watched", Some("missing"), None), 2);
+    watched.rel_next_targets = Some(vec![url("missing"), url("target-hop")]);
+    let mut another = occurrence(source("watched", Some("missing"), None), 3);
+    another.rel_next_targets = Some(vec![url("missing"), url("failed")]);
+    let mut target = redirect(
+        source("target-route", None, Some("watched#return")),
+        "target-final",
+        &["target-hop"],
+    );
+    target.rel_prev_targets = Some(vec![url("unseen"), url("watched#return")]);
+    let rows = [
+        occurrence(failed("watched", Some(404)), 1),
+        watched.clone(),
+        another.clone(),
+        source("missing", None, Some("watched")),
+        target,
+        failed("failed", Some(404)),
+    ];
+    for store in [
+        ActiveStore::memory(),
+        ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+    ] {
+        for row in &rows {
+            store.upsert(row.clone());
+        }
+        let response = store.query(query(NEXT_NON_RECIPROCAL));
+        assert_eq!(response.total, 0);
+        let errors = store.query(query(NEXT));
+        assert_eq!(errors.total, 1);
+        assert_eq!(keys(&errors), vec![another.storage_key.as_str()]);
+    }
+}
+
+#[test]
+fn measured_empty_pagination_arrays_override_stale_first_targets() {
+    let mut stale_source = source("source", Some("failed"), Some("failed"));
+    stale_source.rel_next_targets = Some(vec![]);
+    stale_source.rel_prev_targets = Some(vec![]);
+    let mut return_source = source("return-source", Some("return-target"), None);
+    return_source.rel_next_targets = Some(vec![url("return-target")]);
+    let mut return_target = source("return-target", None, Some("return-source"));
+    return_target.rel_prev_targets = Some(vec![]);
+    let rows = [
+        stale_source,
+        return_source,
+        return_target,
+        failed("failed", Some(404)),
+    ];
+    for store in [
+        ActiveStore::memory(),
+        ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+    ] {
+        for row in &rows {
+            store.upsert(row.clone());
+        }
+        for view in [NEXT, PREV, NEXT_LOOP, PREV_LOOP] {
+            assert_eq!(store.query(query(view)).total, 0, "{view}");
+        }
+        let warning = store.query(query(NEXT_NON_RECIPROCAL));
+        assert_eq!(warning.total, 1);
+        assert_eq!(warning.rows[0].url, url("return-source"));
+    }
+}
+
+#[test]
 fn pagination_reciprocity_reports_missing_and_observed_mismatched_returns_per_source() {
     let mut blank = page("blank-target");
     blank.rel_prev = Some(" \t ".into());

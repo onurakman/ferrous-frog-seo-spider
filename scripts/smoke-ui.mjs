@@ -1315,6 +1315,7 @@ try {
   assert.ok(await evaluate("document.querySelector('.data-table thead').textContent.includes('Next Targets') && document.querySelector('.data-table tbody').textContent.includes('205')"), "Multiple target inventory must show the measured count");
   await evaluate("document.querySelector('.data-table tbody tr:not(.virtual-spacer)').click()");
   await click('#detail-tab-links');
+  assert.ok(await evaluate("document.querySelector('#detail-panel-links')?.textContent.includes('Pagination audits check every captured target')"), "The inspector must explain that first-target columns do not limit pagination diagnostics");
   await until("document.querySelector('.pagination-targets.next')?.textContent.includes('https://example.test/other-next') && document.querySelectorAll('.pagination-targets.next li').length === 100", "The inspector must show a bounded first page of captured pagination targets");
   await click('.pagination-targets.next [aria-label="Last page"]');
   await until("document.querySelectorAll('.pagination-targets.next li').length === 5 && document.querySelector('.pagination-targets.next')?.textContent.includes('https://example.test/extra-next-202')", "The final pagination target must remain inspectable without rendering every target at once");

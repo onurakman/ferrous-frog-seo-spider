@@ -6843,6 +6843,7 @@ export default function App() {
                     <dt>Pagination</dt>
                     <dd>
                       Next: {selected.relNext || "None"}; Prev: {selected.relPrev || "None"}
+                      <div>Pagination audits check every captured target. Next and Prev above show the first declaration.</div>
                       <PaginationTargetList key={`${selectedSessionId}:${selected.storageKey}:${selected.id}:next`} direction="next" targets={selected.relNextTargets} />
                       <PaginationTargetList key={`${selectedSessionId}:${selected.storageKey}:${selected.id}:prev`} direction="prev" targets={selected.relPrevTargets} />
                     </dd>
