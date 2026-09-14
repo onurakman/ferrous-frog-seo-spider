@@ -1043,7 +1043,24 @@ pub struct CrawlFrontierState {
     pub crawled: usize,
 }
 
+/// Recovery metadata without allocating the pending queue or seen URLs.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CrawlFrontierSummary {
+    pub queued: usize,
+    pub seen: usize,
+    pub crawled: usize,
+}
+
 impl CrawlFrontierState {
+    fn summary(&self) -> CrawlFrontierSummary {
+        CrawlFrontierSummary {
+            queued: self.queued.len(),
+            seen: self.seen.len(),
+            crawled: self.crawled,
+        }
+    }
+
     fn update(
         &mut self,
         completed_storage_key: &str,
@@ -1309,6 +1326,10 @@ pub trait CrawlStore: Clone + Send + Sync + 'static {
         self.save_frontier_state(state);
     }
     fn load_frontier_state(&self) -> Option<CrawlFrontierState>;
+    /// Backends can override this to avoid hydrating a complete resume checkpoint.
+    fn frontier_summary(&self) -> Option<CrawlFrontierSummary> {
+        self.load_frontier_state().map(|state| state.summary())
+    }
     fn clear_frontier_state(&self);
 
     fn sitemap_validation(&self, query: SitemapValidationQuery) -> SitemapValidationResponse {
@@ -1913,6 +1934,14 @@ impl MemoryStore {
         inner.frontier_state.clone()
     }
 
+    pub fn frontier_summary(&self) -> Option<CrawlFrontierSummary> {
+        let inner = self.inner.read().expect("memory store lock poisoned");
+        inner
+            .frontier_state
+            .as_ref()
+            .map(CrawlFrontierState::summary)
+    }
+
     pub fn clear_frontier_state(&self) {
         let mut inner = self.inner.write().expect("memory store lock poisoned");
         inner.frontier_state = None;
@@ -2023,6 +2052,10 @@ impl CrawlStore for MemoryStore {
 
     fn load_frontier_state(&self) -> Option<CrawlFrontierState> {
         Self::load_frontier_state(self)
+    }
+
+    fn frontier_summary(&self) -> Option<CrawlFrontierSummary> {
+        Self::frontier_summary(self)
     }
 
     fn clear_frontier_state(&self) {
@@ -3427,6 +3460,32 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn try_frontier_summary(&self) -> Result<Option<CrawlFrontierSummary>, StorageError> {
+        // One statement keeps the counts and completed metadata in the same read snapshot.
+        Ok(self.connection()?.query_row(
+            "SELECT (SELECT COUNT(*) FROM crawl_frontier_queue),
+                    (SELECT COUNT(*) FROM crawl_frontier_seen),
+                    (SELECT value FROM crawl_frontier_meta WHERE key='crawled')",
+            [],
+            |row| {
+                let queued = row.get::<_, i64>(0)? as usize;
+                let seen = row.get::<_, i64>(1)? as usize;
+                if queued == 0 && seen == 0 {
+                    return Ok(None);
+                }
+                let crawled = row
+                    .get::<_, Option<String>>(2)?
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0);
+                Ok(Some(CrawlFrontierSummary {
+                    queued,
+                    seen,
+                    crawled,
+                }))
+            },
+        )?)
+    }
+
     pub fn try_load_frontier_state(&self) -> Result<Option<CrawlFrontierState>, StorageError> {
         let conn = self.connection()?;
         let mut queue_stmt = conn.prepare(
@@ -4303,6 +4362,11 @@ impl CrawlStore for SqliteStore {
             .expect("sqlite frontier load failed")
     }
 
+    fn frontier_summary(&self) -> Option<CrawlFrontierSummary> {
+        self.try_frontier_summary()
+            .expect("sqlite frontier summary failed")
+    }
+
     fn clear_frontier_state(&self) {
         self.try_clear_frontier_state()
             .expect("sqlite frontier clear failed");
@@ -4330,6 +4394,13 @@ pub enum ActiveStore {
 }
 
 impl ActiveStore {
+    pub fn try_frontier_summary(&self) -> Result<Option<CrawlFrontierSummary>, StorageError> {
+        match self {
+            Self::Memory(store) => Ok(store.frontier_summary()),
+            Self::Sqlite(store) => store.try_frontier_summary(),
+        }
+    }
+
     pub fn try_page_references(
         &self,
         query: PageReferenceQuery,
@@ -4540,6 +4611,13 @@ impl CrawlStore for ActiveStore {
         match self {
             ActiveStore::Memory(store) => store.load_frontier_state(),
             ActiveStore::Sqlite(store) => store.load_frontier_state(),
+        }
+    }
+
+    fn frontier_summary(&self) -> Option<CrawlFrontierSummary> {
+        match self {
+            ActiveStore::Memory(store) => store.frontier_summary(),
+            ActiveStore::Sqlite(store) => store.frontier_summary(),
         }
     }
 

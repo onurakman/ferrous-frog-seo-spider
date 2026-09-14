@@ -46,6 +46,51 @@ fn evidence(report: &AuditReportStore, finding: &str, offset: usize) -> AuditEvi
         .unwrap()
 }
 #[test]
+fn evidence_status_filter_combines_search_sort_pages_and_validates_http_range() {
+    for source in stores() {
+        for (index, status) in [404, 403, 404, 410].into_iter().enumerate() {
+            let mut row = page(&format!("https://example.test/{index}"));
+            row.status_code = Some(status);
+            source.upsert(row);
+        }
+        let report_path = path();
+        let report = AuditReportStore::prepare(&report_path, &source, request()).unwrap();
+        let query = AuditEvidenceQuery {
+            finding_id: "response.clientError".into(),
+            status_code: Some(404),
+            sort_by: AuditEvidenceSort::OriginalUrl,
+            sort_dir: SortDirection::Desc,
+            offset: 1,
+            limit: 1,
+            ..Default::default()
+        };
+        let filtered = report.query_evidence(query.clone()).unwrap();
+        assert_eq!(filtered.total, 2);
+        assert_eq!(filtered.rows[0].original_url, "https://example.test/0");
+        let searched = report
+            .query_evidence(AuditEvidenceQuery {
+                search: Some("/2".into()),
+                offset: 0,
+                ..query.clone()
+            })
+            .unwrap();
+        assert_eq!(searched.total, 1);
+        assert_eq!(searched.rows[0].observed.status_code, Some(404));
+        for status in [99, 600] {
+            assert!(
+                report
+                    .query_evidence(AuditEvidenceQuery {
+                        status_code: Some(status),
+                        ..query.clone()
+                    })
+                    .is_err()
+            );
+        }
+        drop(report);
+        std::fs::remove_file(report_path).unwrap();
+    }
+}
+#[test]
 fn report_preserves_all_1205_records_identity_paging_and_survives_source_deletion() {
     for source in stores() {
         let mut keys = Vec::new();

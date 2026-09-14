@@ -20,6 +20,7 @@ pub enum AuditReportLanguage {
 #[serde(rename_all = "camelCase")]
 pub enum AuditSourceStatus {
     Completed,
+    Imported,
     Stopped,
     Failed,
     Running,
@@ -166,6 +167,7 @@ pub enum AuditEvidenceSort {
 pub struct AuditEvidenceQuery {
     pub finding_id: String,
     pub search: Option<String>,
+    pub status_code: Option<u16>,
     pub sort_by: AuditEvidenceSort,
     pub sort_dir: SortDirection,
     pub offset: usize,
@@ -177,6 +179,7 @@ impl Default for AuditEvidenceQuery {
         Self {
             finding_id: String::new(),
             search: None,
+            status_code: None,
             sort_by: AuditEvidenceSort::Id,
             sort_dir: SortDirection::Asc,
             offset: 0,
@@ -524,6 +527,14 @@ impl AuditReportStore {
         query: AuditEvidenceQuery,
     ) -> Result<AuditEvidenceResponse, AuditReportError> {
         validate_page(query.offset, query.limit, query.search.as_deref())?;
+        if query
+            .status_code
+            .is_some_and(|code| !(100..=599).contains(&code))
+        {
+            return Err(AuditReportError::Invalid(
+                "HTTP status must be between 100 and 599".into(),
+            ));
+        }
         let conn = self.connection()?;
         if !conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM audit_rules WHERE id=?1)",
@@ -533,9 +544,9 @@ impl AuditReportStore {
             return Err(AuditReportError::Invalid("unknown finding ID".into()));
         }
         let search = query.search.unwrap_or_default().to_lowercase();
-        let filter = " WHERE finding_id=?1 AND (?2='' OR instr(search_text,?2)>0)";
-        let args = params![query.finding_id, search];
-        let total = if search.is_empty() {
+        let filter = " WHERE finding_id=?1 AND (?2='' OR instr(search_text,?2)>0) AND (?3 IS NULL OR json_extract(payload,'$.observed.statusCode')=?3)";
+        let args = params![query.finding_id, search, query.status_code];
+        let total = if search.is_empty() && query.status_code.is_none() {
             // Findings and evidence are frozen together. Avoid recounting a million link rows
             // for every unfiltered UI window while retaining live counts for searched windows.
             conn.query_row(
