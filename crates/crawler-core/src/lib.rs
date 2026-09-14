@@ -2961,6 +2961,8 @@ async fn fetch_one(
             record.meta_keywords = signals.meta_keywords;
             record.rel_next = signals.rel_next;
             record.rel_prev = signals.rel_prev;
+            record.rel_next_targets = Some(signals.rel_next_targets);
+            record.rel_prev_targets = Some(signals.rel_prev_targets);
             record.hreflang_count = signals.hreflang_count;
             record.hreflang_invalid_count = signals.hreflang_invalid_count;
             record.hreflang_missing_self_reference = signals.hreflang_missing_self_reference;
@@ -4067,6 +4069,8 @@ fn status_record(
         amphtml: None,
         rel_next: None,
         rel_prev: None,
+        rel_next_targets: None,
+        rel_prev_targets: None,
         hreflang_count: 0,
         hreflang_invalid_count: 0,
         hreflang_missing_self_reference: false,
@@ -4192,6 +4196,8 @@ fn error_record(
         amphtml: None,
         rel_next: None,
         rel_prev: None,
+        rel_next_targets: None,
+        rel_prev_targets: None,
         hreflang_count: 0,
         hreflang_invalid_count: 0,
         hreflang_missing_self_reference: false,
@@ -4308,6 +4314,8 @@ fn blocked_record(url: &Url, depth: usize, root_url: &Url) -> CrawlRecord {
         amphtml: None,
         rel_next: None,
         rel_prev: None,
+        rel_next_targets: None,
+        rel_prev_targets: None,
         hreflang_count: 0,
         hreflang_invalid_count: 0,
         hreflang_missing_self_reference: false,
@@ -5655,6 +5663,14 @@ mod tests {
             assert_eq!(root.hreflang_invalid_count, 1);
             assert!(root.rel_next.as_deref().unwrap().ends_with("/next"));
             assert!(root.rel_prev.as_deref().unwrap().ends_with("/previous"));
+            assert_eq!(
+                root.rel_next_targets.as_ref().unwrap(),
+                &[root.rel_next.clone().unwrap()]
+            );
+            assert_eq!(
+                root.rel_prev_targets.as_ref().unwrap(),
+                &[root.rel_prev.clone().unwrap()]
+            );
             assert!(root.amphtml.as_deref().unwrap().ends_with("/amp-page"));
             let references = store.page_references(ferrous_frog_storage::PageReferenceQuery {
                 source_storage_key: Some(root.storage_key.clone()),
@@ -5800,6 +5816,11 @@ mod tests {
                         assert_eq!(row.canonical_count, 2);
                         assert_eq!(row.hreflang_count, 1);
                         assert!(row.rel_next.as_deref().unwrap().ends_with("/next"));
+                        assert_eq!(
+                            row.rel_next_targets.as_ref().unwrap(),
+                            &[row.rel_next.clone().unwrap()]
+                        );
+                        assert_eq!(row.rel_prev_targets.as_ref().unwrap(), &[] as &[String]);
                         assert!(row.amphtml.as_deref().unwrap().ends_with("/amp"));
                         assert_eq!(row.indexability_status, "Canonicalized");
                         assert_eq!(row.outlink_count, 1);

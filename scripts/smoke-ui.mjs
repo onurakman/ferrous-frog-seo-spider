@@ -21,7 +21,7 @@ function setupFixture(mockIPC, emit) {
     metaDuplicate metaMultiple h1Missing h1Duplicate h2Missing h2Duplicate canonicalMissing canonicalMultiple noindex
     canonicalUncrawled canonicalToRedirect canonicalToError canonicalNonIndexable canonicalChain canonicalLoop
     paginationNextToError paginationPrevToError paginationNextLoop paginationPrevLoop
-    paginationNextNonReciprocal paginationPrevNonReciprocal ampToError ampNonReciprocal
+    paginationNextNonReciprocal paginationPrevNonReciprocal paginationMultipleTargets ampToError ampNonReciprocal
     imagesMissingAlt imagesAltTooLong mixedContent insecureForms hreflangInvalid structuredDataInvalid
     structuredDataWarnings deprecatedHtmlTags duplicateIds renderedDomChanged missingViewport missingHsts
     sitemapOrphans`.split(/\s+/).map((key) => [key, 0]));
@@ -44,6 +44,9 @@ function setupFixture(mockIPC, emit) {
   records[0].relNext = "https://example.test/missing-next";
   records[0].relPrev = "https://example.test/missing-previous";
   records[1].relNext = "https://example.test/unavailable-next";
+  records[0].relNextTargets = ["https://example.test/missing-next", "https://example.test/other-next", "https://example.test/missing-next",
+    ...Array.from({ length: 202 }, (_, index) => `https://example.test/extra-next-${index + 1}`)];
+  records[0].relPrevTargets = ["https://example.test/missing-previous"];
   records[0].amphtml = "https://example.test/missing-amp";
   window.testQueries = [];
   window.testLinkQueries = [];
@@ -92,6 +95,7 @@ function setupFixture(mockIPC, emit) {
     return saveItem.call(this, key, value);
   };
   window.testEmit = (payload) => emit("crawl-event", payload);
+  window.testSetSummary = (patch) => Object.assign(summary, patch);
   window.testEmitProgress = (queued) => emit("crawl-event", { kind: "progress", progress: {
     status: "running", crawled: 1205, queued, discovered: 1205 + queued, elapsedMs: 1000, pagesPerSecond: 10, summary,
   } });
@@ -162,6 +166,7 @@ function setupFixture(mockIPC, emit) {
       if (query.view === "paginationNextNonReciprocal" || query.view === "paginationPrevNonReciprocal") matching = window.testPaginationReturns
         ? records.slice(0, query.view === "paginationNextNonReciprocal" ? 2 : 1).map((row) => ({ ...row,
           relNext: 'https://example.test/next-without-return', relPrev: 'https://example.test/prev-without-return' })) : [];
+      if (query.view === "paginationMultipleTargets") matching = window.testPaginationMultiple ? records.slice(0, 1) : [];
       if (query.view === "ampToError") matching = window.testAmpError ? records.slice(0, 1) : [];
       if (query.view === "ampNonReciprocal") matching = window.testAmpReturns
         ? records.slice(0, 1).map((row) => ({ ...row, amphtml: 'https://example.test/amp-without-return' })) : [];
@@ -183,6 +188,7 @@ function setupFixture(mockIPC, emit) {
           paginationNextToError: window.testPaginationErrors ? 2 : 0, paginationPrevToError: window.testPaginationErrors ? 1 : 0,
           paginationNextLoop: window.testPaginationLoops ? 2 : 0, paginationPrevLoop: window.testPaginationLoops ? 1 : 0,
           paginationNextNonReciprocal: window.testPaginationReturns ? 2 : 0, paginationPrevNonReciprocal: window.testPaginationReturns ? 1 : 0,
+          paginationMultipleTargets: window.testPaginationMultiple ? 1 : 0,
           ampToError: window.testAmpError ? 1 : 0, ampNonReciprocal: window.testAmpReturns ? 1 : 0,
           titleMultiple: window.testMultipleMetadata ? 1 : 0, metaMultiple: window.testMultipleMetadata ? 1 : 0 } };
       await new Promise((resolve) => setTimeout(resolve, window.testSearchDelays[query.globalSearch] ?? 15));
@@ -1303,6 +1309,21 @@ try {
     assert.equal(await evaluate(`document.querySelector('[data-view="${view}"] .issue-count').textContent`), count, 'Progress must preserve query-owned pagination return-link counts');
   }
   await evaluate("window.testPaginationReturns = false");
+  await evaluate("window.testPaginationMultiple = true");
+  await click('[data-view="paginationMultipleTargets"]');
+  await until("testQueries.at(-1).view === 'paginationMultipleTargets' && document.querySelector('[data-view=\"paginationMultipleTargets\"] .issue-count')?.textContent === '1'", "Multiple pagination declarations must query storage and count source pages");
+  assert.ok(await evaluate("document.querySelector('.data-table thead').textContent.includes('Next Targets') && document.querySelector('.data-table tbody').textContent.includes('205')"), "Multiple target inventory must show the measured count");
+  await evaluate("document.querySelector('.data-table tbody tr:not(.virtual-spacer)').click()");
+  await click('#detail-tab-links');
+  await until("document.querySelector('.pagination-targets.next')?.textContent.includes('https://example.test/other-next') && document.querySelectorAll('.pagination-targets.next li').length === 100", "The inspector must show a bounded first page of captured pagination targets");
+  await click('.pagination-targets.next [aria-label="Last page"]');
+  await until("document.querySelectorAll('.pagination-targets.next li').length === 5 && document.querySelector('.pagination-targets.next')?.textContent.includes('https://example.test/extra-next-202')", "The final pagination target must remain inspectable without rendering every target at once");
+  await evaluate("testSetSummary({ paginationMultipleTargets: 1 }); testEmitProgress(0)");
+  assert.equal(await evaluate("document.querySelector('[data-view=\"paginationMultipleTargets\"] .issue-count').textContent"), "1", "Progress must include measured pagination declaration counts");
+  await evaluate("testSetSummary({ paginationMultipleTargets: 0 }); testEmitProgress(0)");
+  await until("document.querySelector('[data-view=\"paginationMultipleTargets\"] .issue-count')?.textContent === '0'", "Live progress must replace stale pagination declaration counts");
+  await click('#detail-tab-page');
+  await evaluate("window.testPaginationMultiple = false");
   await evaluate("window.testAmpError = true");
   await click('[data-view="ampToError"]');
   await until("testQueries.at(-1).view === 'ampToError' && document.querySelector('[data-view=\"ampToError\"] .issue-count')?.textContent === '1'", "AMP target errors must query storage and count source rows");

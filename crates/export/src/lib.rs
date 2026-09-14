@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod workbook_tests;
 
-const HEADERS: [&str; 111] = [
+const HEADERS: [&str; 113] = [
     "id",
     "url",
     "final_url",
@@ -142,6 +142,8 @@ const HEADERS: [&str; 111] = [
     "backlinks",
     "referring_domains",
     "backlink_authority",
+    "rel_next_targets",
+    "rel_prev_targets",
 ];
 
 fn optional_number(value: Option<f64>) -> String {
@@ -544,6 +546,18 @@ pub fn records_to_csv<W: Write>(records: &[CrawlRecord], writer: W) -> csv::Resu
             ]
             .into_iter()
             .chain(performance_columns(record))
+            .chain([
+                record
+                    .rel_next_targets
+                    .as_ref()
+                    .map(|targets| serde_json::to_string(targets).unwrap_or_default())
+                    .unwrap_or_default(),
+                record
+                    .rel_prev_targets
+                    .as_ref()
+                    .map(|targets| serde_json::to_string(targets).unwrap_or_default())
+                    .unwrap_or_default(),
+            ])
             .collect::<Vec<String>>(),
         )?;
     }
@@ -930,6 +944,12 @@ fn write_xlsx_record(
                 Err(_) => worksheet.write_string(row, column, &value)?,
             };
         }
+    }
+    if let Some(targets) = &record.rel_next_targets {
+        worksheet.write_string(row, 111, serde_json::to_string(targets).unwrap_or_default())?;
+    }
+    if let Some(targets) = &record.rel_prev_targets {
+        worksheet.write_string(row, 112, serde_json::to_string(targets).unwrap_or_default())?;
     }
     Ok(())
 }

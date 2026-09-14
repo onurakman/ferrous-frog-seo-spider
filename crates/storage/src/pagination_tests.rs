@@ -6,6 +6,7 @@ const NEXT_LOOP: &str = "paginationNextLoop";
 const PREV_LOOP: &str = "paginationPrevLoop";
 const NEXT_NON_RECIPROCAL: &str = "paginationNextNonReciprocal";
 const PREV_NON_RECIPROCAL: &str = "paginationPrevNonReciprocal";
+const MULTIPLE_TARGETS: &str = "paginationMultipleTargets";
 
 fn url(path: &str) -> String {
     format!("https://example.test/{path}")
@@ -73,6 +74,155 @@ fn keys(response: &GridResponse) -> Vec<&str> {
         .iter()
         .map(|row| row.storage_key.as_str())
         .collect()
+}
+
+#[test]
+fn multiple_pagination_targets_are_measured_persisted_and_queryable_with_store_parity() {
+    let memory = MemoryStore::new();
+    let sqlite = SqliteStore::in_memory().unwrap();
+    let mut multiple = source("multiple", Some("first"), Some("before"));
+    multiple.rel_next_targets = Some(vec![url("first"), url("second"), url("first")]);
+    multiple.rel_prev_targets = Some(vec![url("before")]);
+    let mut repeated_prev = source("prev-repeated", None, Some("before"));
+    repeated_prev.rel_next_targets = Some(vec![]);
+    repeated_prev.rel_prev_targets = Some(vec![url("before"), url("before")]);
+    let mut unknown = source("old", Some("first"), None);
+    unknown.rel_next_targets = None;
+    unknown.rel_prev_targets = None;
+    let mut incomplete = multiple.clone();
+    incomplete.url = url("incomplete");
+    incomplete.storage_key = incomplete.url.clone();
+    incomplete.indexability_status = "Response body incomplete".into();
+    let mut image = multiple.clone();
+    image.url = url("image");
+    image.storage_key = image.url.clone();
+    image.content_type = Some("image/png".into());
+    for row in [multiple, repeated_prev, unknown, incomplete, image] {
+        memory.upsert(row.clone());
+        sqlite.try_upsert(row).unwrap();
+    }
+    for response in [
+        memory.query(query(MULTIPLE_TARGETS)),
+        sqlite.try_query(query(MULTIPLE_TARGETS)).unwrap(),
+    ] {
+        assert_eq!(response.total, 2);
+        assert_eq!(response.summary.pagination_multiple_targets, 2);
+        assert_eq!(
+            response
+                .rows
+                .iter()
+                .map(|row| row.url.clone())
+                .collect::<Vec<_>>(),
+            [url("multiple"), url("prev-repeated")]
+        );
+        assert_eq!(
+            response.rows[0].rel_next_targets.as_ref().unwrap(),
+            &[url("first"), url("second"), url("first")]
+        );
+        assert_eq!(
+            response.rows[1].rel_prev_targets.as_ref().unwrap(),
+            &[url("before"), url("before")]
+        );
+    }
+    let page_query = GridQuery {
+        offset: 1,
+        limit: 1,
+        ..query(MULTIPLE_TARGETS)
+    };
+    let search_query = GridQuery {
+        global_search: Some("second".into()),
+        ..query(MULTIPLE_TARGETS)
+    };
+    for (page, search) in [
+        (
+            memory.query(page_query.clone()),
+            memory.query(search_query.clone()),
+        ),
+        (
+            sqlite.try_query(page_query).unwrap(),
+            sqlite.try_query(search_query).unwrap(),
+        ),
+    ] {
+        assert_eq!(page.total, 2);
+        assert_eq!(page.rows[0].url, url("prev-repeated"));
+        assert_eq!(search.total, 1);
+        assert_eq!(search.rows[0].url, url("multiple"));
+    }
+    for term in ["[", "\"", "\\"] {
+        let search = GridQuery {
+            global_search: Some(term.into()),
+            ..query(MULTIPLE_TARGETS)
+        };
+        assert_eq!(memory.query(search.clone()).total, 0, "{term}");
+        assert_eq!(sqlite.try_query(search).unwrap().total, 0, "{term}");
+    }
+}
+
+#[test]
+fn pagination_target_arrays_keep_legacy_archive_unknown_distinct_from_measured_empty() {
+    let mut archived = serde_json::to_value(page("archive")).unwrap();
+    archived.as_object_mut().unwrap().remove("relNextTargets");
+    archived.as_object_mut().unwrap().remove("relPrevTargets");
+    let old: CrawlRecord = serde_json::from_value(archived).unwrap();
+    assert_eq!(old.rel_next_targets, None);
+    assert_eq!(old.rel_prev_targets, None);
+    let mut measured = old;
+    measured.rel_next_targets = Some(vec![]);
+    measured.rel_prev_targets = Some(vec![url("previous")]);
+    let restored: CrawlRecord =
+        serde_json::from_value(serde_json::to_value(measured).unwrap()).unwrap();
+    assert_eq!(restored.rel_next_targets, Some(vec![]));
+    assert_eq!(restored.rel_prev_targets, Some(vec![url("previous")]));
+}
+
+#[test]
+fn multiple_target_inventory_keeps_list_occurrences_and_ignores_unmeasured_sources() {
+    let memory = MemoryStore::new();
+    let sqlite = SqliteStore::in_memory().unwrap();
+    let mut alias = source("requested", Some("first"), None);
+    alias.final_url = url("redirected-final");
+    alias.rel_next_targets = Some(vec![url("first"), url("second")]);
+    alias.rel_prev_targets = Some(vec![]);
+    let list_one = occurrence(alias.clone(), 1);
+    let mut list_two = occurrence(alias, 2);
+    list_two.rel_next_targets = Some(vec![url("first"), url("third")]);
+    let mut blocked = CrawlRecord::pending(url("blocked"), 0);
+    blocked.status_text = "Blocked by robots.txt".into();
+    blocked.error = Some("Blocked by robots.txt".into());
+    blocked.rel_next_targets = Some(vec![url("first"), url("second")]);
+    let mut no_response = CrawlRecord::pending(url("no-response"), 0);
+    no_response.status_text = "No response".into();
+    no_response.error = Some("Connection failed".into());
+    no_response.rel_prev_targets = Some(vec![url("first"), url("second")]);
+    for row in [list_one, list_two, blocked, no_response] {
+        memory.upsert(row.clone());
+        sqlite.try_upsert(row).unwrap();
+    }
+    for response in [
+        memory.query(query(MULTIPLE_TARGETS)),
+        sqlite.try_query(query(MULTIPLE_TARGETS)).unwrap(),
+    ] {
+        assert_eq!(response.total, 2);
+        assert_eq!(response.summary.pagination_multiple_targets, 2);
+        assert_eq!(
+            response
+                .rows
+                .iter()
+                .map(|row| row.list_position)
+                .collect::<Vec<_>>(),
+            [Some(1), Some(2)]
+        );
+        assert!(
+            response
+                .rows
+                .iter()
+                .all(|row| row.final_url == url("redirected-final"))
+        );
+        assert_ne!(
+            response.rows[0].rel_next_targets,
+            response.rows[1].rel_next_targets
+        );
+    }
 }
 
 #[test]
@@ -475,6 +625,7 @@ fn pagination_reciprocity_reuses_bounded_evidence_and_observes_external_commits(
     for name in [
         NEXT_NON_RECIPROCAL,
         PREV_NON_RECIPROCAL,
+        MULTIPLE_TARGETS,
         NEXT_LOOP,
         "canonicalLoop",
     ] {
@@ -1124,6 +1275,7 @@ fn pagination_summary_fields_default_for_older_saved_summaries() {
     assert_eq!(value[PREV_LOOP], 0);
     assert_eq!(value[NEXT_NON_RECIPROCAL], 0);
     assert_eq!(value[PREV_NON_RECIPROCAL], 0);
+    assert_eq!(value[MULTIPLE_TARGETS], 0);
 }
 
 #[test]

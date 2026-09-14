@@ -162,6 +162,14 @@ async fn crawl_archive_round_trips_order_unicode_frontier_and_import_seed() {
             row.meta_description_count = Some(3);
             row.content_hash = Some(format!("captured-text-{position}"));
             row.content_hash_context = Some("text-v1:http:fixture".into());
+            if position == 20 {
+                row.rel_next_targets = Some(vec![
+                    "https://example.test/page-2".into(),
+                    "https://example.test/page-3".into(),
+                    "https://example.test/page-2".into(),
+                ]);
+                row.rel_prev_targets = Some(vec![]);
+            }
             store.upsert(row);
             let key = format!("list:{position}");
             store.add_page_references(&key, vec![archive_reference(&key, position as usize)]);
@@ -242,6 +250,22 @@ async fn crawl_archive_round_trips_order_unicode_frontier_and_import_seed() {
         );
         let active = state.store.lock().unwrap().clone();
         assert_eq!(active.records().len(), 2);
+        let imported_record = active
+            .records()
+            .into_iter()
+            .find(|row| row.list_position == Some(20))
+            .unwrap();
+        assert_eq!(imported_record.rel_next_targets.as_ref().unwrap().len(), 3);
+        assert_eq!(imported_record.rel_prev_targets, Some(vec![]));
+        assert!(
+            active
+                .records()
+                .into_iter()
+                .find(|row| row.list_position == Some(1))
+                .unwrap()
+                .rel_next_targets
+                .is_none()
+        );
         for reference in &expected.page_references {
             let result = query_store_page_references(
                 &active,

@@ -78,6 +78,40 @@ fn page(path: &str, title: &str, description: &str) -> CrawlRecord {
 }
 
 #[test]
+fn raw_exports_preserve_ordered_pagination_targets_and_unknown_cells() {
+    let mut measured = page("measured", "Measured page", "Measured description");
+    measured.rel_next_targets = Some(vec![
+        "https://example.test/first".into(),
+        "https://example.test/second".into(),
+        "https://example.test/first".into(),
+    ]);
+    measured.rel_prev_targets = Some(vec![]);
+    let legacy = page("legacy", "Legacy page", "Legacy description");
+    let records = [measured, legacy];
+    let csv = records_to_csv_string(&records).unwrap();
+    let mut reader = csv::Reader::from_reader(csv.as_bytes());
+    let headers = reader.headers().unwrap().clone();
+    let rows = reader.records().collect::<Result<Vec<_>, _>>().unwrap();
+    let xlsx = inspect_workbook(&records_to_xlsx_bytes(&records).unwrap());
+    for (name, expected) in [
+        (
+            "rel_next_targets",
+            "[\"https://example.test/first\",\"https://example.test/second\",\"https://example.test/first\"]",
+        ),
+        ("rel_prev_targets", "[]"),
+    ] {
+        let column = headers.iter().position(|header| header == name).unwrap();
+        assert_eq!(&rows[0][column], expected);
+        assert_eq!(xlsx[0].1[1][column], expected);
+        assert_eq!(&rows[1][column], "");
+        assert_eq!(
+            xlsx[0].1[2].get(column).map(String::as_str).unwrap_or(""),
+            ""
+        );
+    }
+}
+
+#[test]
 fn metadata_counts_keep_unknown_cells_empty_and_export_multiple_tag_evidence() {
     let mut measured = page("measured", "Measured page", "Measured description");
     measured.title_count = Some(3);
@@ -703,7 +737,7 @@ fn filtered_xlsx_stream_matches_legacy_columns_and_preserves_filters_and_order()
         assert_eq!(sheets.len(), 1);
         assert_eq!(sheets[0].0, "Crawl Results");
         let rows = &sheets[0].1;
-        assert_eq!(rows[0].len(), 111);
+        assert_eq!(rows[0].len(), 113);
         assert_eq!(
             &rows[0][89..93],
             [
@@ -716,6 +750,7 @@ fn filtered_xlsx_stream_matches_legacy_columns_and_preserves_filters_and_order()
         assert_eq!(rows[0][103], "field_cls_p75");
         assert_eq!(rows[0][107], "analytics_revenue");
         assert_eq!(rows[0][110], "backlink_authority");
+        assert_eq!(&rows[0][111..113], ["rel_next_targets", "rel_prev_targets"]);
         assert_eq!(
             &rows[0][..5],
             ["id", "url", "final_url", "classification", "status_code"]

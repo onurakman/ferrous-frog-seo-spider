@@ -145,6 +145,7 @@ type IssueView =
   | "paginationPrevLoop"
   | "paginationNextNonReciprocal"
   | "paginationPrevNonReciprocal"
+  | "paginationMultipleTargets"
   | "ampToError"
   | "ampNonReciprocal"
   | "directivesNoindex"
@@ -250,6 +251,8 @@ export type CrawlRecord = {
   metaKeywords?: string | null;
   relNext?: string | null;
   relPrev?: string | null;
+  relNextTargets?: string[] | null;
+  relPrevTargets?: string[] | null;
   hreflangCount: number;
   hreflangInvalidCount: number;
   hreflangMissingSelfReference: boolean;
@@ -359,6 +362,7 @@ type CrawlSummary = {
   paginationPrevLoop: number;
   paginationNextNonReciprocal: number;
   paginationPrevNonReciprocal: number;
+  paginationMultipleTargets: number;
   ampToError: number;
   ampNonReciprocal: number;
   noindex: number;
@@ -1000,6 +1004,7 @@ const emptySummary: CrawlSummary = {
   paginationPrevLoop: 0,
   paginationNextNonReciprocal: 0,
   paginationPrevNonReciprocal: 0,
+  paginationMultipleTargets: 0,
   ampToError: 0,
   ampNonReciprocal: 0,
   noindex: 0,
@@ -1332,6 +1337,7 @@ const views: Array<{ id: IssueView; label: string }> = [
   { id: "paginationPrevLoop", label: "Previous URL Loops" },
   { id: "paginationNextNonReciprocal", label: "Next URL Non-Reciprocal" },
   { id: "paginationPrevNonReciprocal", label: "Previous URL Non-Reciprocal" },
+  { id: "paginationMultipleTargets", label: "Multiple Pagination Declarations" },
   { id: "ampToError", label: "AMP URL to Error" },
   { id: "ampNonReciprocal", label: "AMP Canonical Return Missing" },
   { id: "directivesNoindex", label: "Noindex" },
@@ -1369,7 +1375,7 @@ const issueGroups: Array<{ label: string; tabLabel?: string; views: IssueView[];
   { label: "Headings", views: ["h1Missing", "h1Duplicate", "h1TooLong", "h2Missing", "h2Duplicate", "h2TooLong"], columns: ["h1", "h1Count", "h2", "h2Count", "indexability"] },
   { label: "Canonicals & directives", tabLabel: "Indexing", views: ["canonicalMissing", "canonicalMultiple", "canonicalUncrawled", "canonicalToRedirect", "canonicalToError", "canonicalNonIndexable", "canonicalChain", "canonicalLoop", "directivesNoindex"], columns: ["canonical", "canonicalCount", "metaRobots", "xRobotsTag", "indexability", "indexabilityStatus"] },
   { label: "Images", views: ["imagesMissingAlt", "imagesAltTooLong"], columns: ["imageCount", "imagesMissingAlt", "imagesAltTooLong", "outlinkCount"] },
-  { label: "Pagination", views: ["paginationNextToError", "paginationPrevToError", "paginationNextLoop", "paginationPrevLoop", "paginationNextNonReciprocal", "paginationPrevNonReciprocal"], columns: ["finalUrl", "relNext", "relPrev", "indexability"] },
+  { label: "Pagination", views: ["paginationNextToError", "paginationPrevToError", "paginationNextLoop", "paginationPrevLoop", "paginationNextNonReciprocal", "paginationPrevNonReciprocal", "paginationMultipleTargets"], columns: ["finalUrl", "relNext", "relPrev", "relNextTargets", "relPrevTargets", "indexability"] },
   { label: "AMP", views: ["ampToError", "ampNonReciprocal"], columns: ["finalUrl", "amphtml", "indexability"] },
   { label: "Security", views: ["securityMixedContent", "securityInsecureForms", "securityMissingHsts", "securityMissingCsp", "securityMissingXFrameOptions", "securityMissingContentTypeOptions"], columns: ["mixedContentCount", "insecureFormCount", "hstsHeader", "contentSecurityPolicyHeader", "xFrameOptionsHeader", "xContentTypeOptionsHeader"] },
   { label: "International", tabLabel: "Hreflang", views: ["hreflangInvalid", "hreflangMissingSelfReference", "hreflangMissingReturnLink", "hreflangNonCanonicalTarget"], columns: ["hreflangCount", "hreflangInvalidCount", "canonical", "indexability"] },
@@ -1385,6 +1391,7 @@ const viewSummaryKeys: Partial<Record<IssueView, keyof CrawlSummary>> = {
   paginationNextToError: "paginationNextToError", paginationPrevToError: "paginationPrevToError",
   paginationNextLoop: "paginationNextLoop", paginationPrevLoop: "paginationPrevLoop",
   paginationNextNonReciprocal: "paginationNextNonReciprocal", paginationPrevNonReciprocal: "paginationPrevNonReciprocal",
+  paginationMultipleTargets: "paginationMultipleTargets",
   ampToError: "ampToError",
   ampNonReciprocal: "ampNonReciprocal",
   all: "total", internal: "internal", external: "external", status2xx: "success", status3xx: "redirects",
@@ -1432,6 +1439,8 @@ const nativeColumns: GridColumn[] = [
   { kind: "native", key: "url", label: "URL", width: 360, sortable: true },
   { kind: "native", key: "relNext", label: "Next URL", width: 300, sortable: true },
   { kind: "native", key: "relPrev", label: "Previous URL", width: 300, sortable: true },
+  { kind: "native", key: "relNextTargets", label: "Next Targets", width: 125, sortable: false },
+  { kind: "native", key: "relPrevTargets", label: "Previous Targets", width: 140, sortable: false },
   { kind: "native", key: "amphtml", label: "AMP URL", width: 300, sortable: true },
   {
     kind: "native",
@@ -6834,6 +6843,8 @@ export default function App() {
                     <dt>Pagination</dt>
                     <dd>
                       Next: {selected.relNext || "None"}; Prev: {selected.relPrev || "None"}
+                      <PaginationTargetList key={`${selectedSessionId}:${selected.storageKey}:${selected.id}:next`} direction="next" targets={selected.relNextTargets} />
+                      <PaginationTargetList key={`${selectedSessionId}:${selected.storageKey}:${selected.id}:prev`} direction="prev" targets={selected.relPrevTargets} />
                     </dd>
                     <dt>AMP</dt>
                     <dd>{selected.amphtml || "None"}</dd>
@@ -7107,6 +7118,24 @@ function handleTabKeys(event: KeyboardEvent<HTMLElement>) {
     : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
   tabs[next]?.focus();
   tabs[next]?.click();
+}
+
+function PaginationTargetList({ direction, targets }: { direction: "next" | "prev"; targets?: string[] | null }) {
+  const [page, setPage] = useState(0);
+  const pageSize = 100;
+  const total = targets?.length ?? 0;
+  const lastPage = Math.max(0, Math.ceil(total / pageSize) - 1);
+  const currentPage = Math.min(page, lastPage);
+  const visible = targets?.slice(currentPage * pageSize, (currentPage + 1) * pageSize) ?? [];
+  const label = direction === "next" ? "Next" : "Previous";
+  return <section className={`pagination-targets ${direction}`} aria-label={`${label} pagination targets`}>
+    <div>{label} targets: {targets == null ? "Not captured" : total.toLocaleString()}</div>
+    {visible.length > 0 ? <ol className="detail-mini-list" start={currentPage * pageSize + 1}>
+      {visible.map((target, index) => <li key={currentPage * pageSize + index}>{target}</li>)}
+    </ol> : null}
+    {total > pageSize ? <ResultPagination pageIndex={currentPage} pageSize={pageSize} total={total}
+      visible={visible.length} loading={false} onPageChange={setPage} /> : null}
+  </section>;
 }
 
 function ResultPagination({ pageIndex, total, visible, loading, onPageChange, pageSize = resultsPageSize }: {
@@ -8185,6 +8214,7 @@ function OverviewPanel({
     { label: "Previous URL loops", value: summary.paginationPrevLoop, tone: "danger", view: "paginationPrevLoop" },
     { label: "Next URL non-reciprocal", value: summary.paginationNextNonReciprocal, tone: "warning", view: "paginationNextNonReciprocal" },
     { label: "Previous URL non-reciprocal", value: summary.paginationPrevNonReciprocal, tone: "warning", view: "paginationPrevNonReciprocal" },
+    { label: "Multiple pagination declarations", value: summary.paginationMultipleTargets, tone: "muted", view: "paginationMultipleTargets" },
     { label: "Invalid hreflang", value: summary.hreflangInvalid, tone: "warning" as const, view: "hreflangInvalid" },
     {
       label: "Structured data errors",
@@ -8621,6 +8651,9 @@ function formatCell(row: CrawlRecord, column: GridColumn) {
   const value = row[column.key];
   if (column.key === "firstInlinkSourceUrl") {
     return foundFromCell(row);
+  }
+  if (column.key === "relNextTargets" || column.key === "relPrevTargets") {
+    return Array.isArray(value) ? value.length.toLocaleString() : "Unknown";
   }
   if (column.key === "textToCodeRatio") {
     return typeof value === "number" ? `${(value * 100).toFixed(1)}%` : " ";

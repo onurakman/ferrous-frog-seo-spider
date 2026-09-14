@@ -119,6 +119,8 @@ pub struct PageSignals {
     pub amphtml: Option<String>,
     pub rel_next: Option<String>,
     pub rel_prev: Option<String>,
+    pub rel_next_targets: Vec<String>,
+    pub rel_prev_targets: Vec<String>,
     pub hreflang_count: u32,
     pub hreflang_invalid_count: u32,
     pub hreflang_missing_self_reference: bool,
@@ -260,8 +262,10 @@ pub fn parse_html_with_content(
     let canonical = canonical_href(&document, base_url);
     let canonical_count = canonical_count(&document);
     let amphtml = link_href_by_rel(&document, base_url, "amphtml");
-    let rel_next = link_href_by_rel(&document, base_url, "next");
-    let rel_prev = link_href_by_rel(&document, base_url, "prev");
+    let rel_next_targets = link_hrefs_by_rel(&document, base_url, "next");
+    let rel_prev_targets = link_hrefs_by_rel(&document, base_url, "prev");
+    let rel_next = rel_next_targets.first().cloned();
+    let rel_prev = rel_prev_targets.first().cloned();
     let hreflang_stats = hreflang_stats(&document, base_url);
     let json_ld_stats = json_ld_stats(&document);
     let ContentPreview {
@@ -351,6 +355,8 @@ pub fn parse_html_with_content(
         amphtml,
         rel_next,
         rel_prev,
+        rel_next_targets,
+        rel_prev_targets,
         hreflang_count: hreflang_stats.count,
         hreflang_invalid_count: hreflang_stats.invalid_count,
         hreflang_missing_self_reference: hreflang_stats.missing_self_reference,
@@ -1878,6 +1884,43 @@ mod tests {
             assert_eq!(signals.visible_text, "Selected text");
             assert!(signals.links.is_empty());
         }
+    }
+
+    #[test]
+    fn pagination_targets_preserve_each_valid_active_declaration_in_order() {
+        let signals = scoped_signals(
+            "<head>
+                <template><link rel='next' href='/inert'></template>
+                <svg><link rel='previous' href='/foreign'/></svg>
+                <link rel='NEXT previous' href='/shared#fragment'>
+                <link rel='next' href='/second'>
+                <link rel='next' href='/shared'>
+                <link rel='prev' href='javascript:alert(1)'>
+                <link rel='PREVIOUS' href='/before'>
+            </head>",
+            &[],
+            &[],
+        );
+        assert_eq!(
+            signals.rel_next_targets,
+            [
+                "https://example.test/shared",
+                "https://example.test/second",
+                "https://example.test/shared"
+            ]
+        );
+        assert_eq!(
+            signals.rel_prev_targets,
+            ["https://example.test/shared", "https://example.test/before"]
+        );
+        assert_eq!(
+            signals.rel_next.as_deref(),
+            Some("https://example.test/shared")
+        );
+        assert_eq!(
+            signals.rel_prev.as_deref(),
+            Some("https://example.test/shared")
+        );
     }
 
     #[test]

@@ -51,6 +51,33 @@ pub fn analyze_records(records: &[CrawlRecord], thresholds: &AuditThresholds) ->
         h2_issues(record, &h2_counts, thresholds, &mut issues);
         canonical_issues(record, references.canonical, &mut issues);
         reference_target_issues(record, references, &mut issues);
+        if record
+            .rel_next_targets
+            .as_ref()
+            .is_some_and(|targets| targets.len() > 1)
+            || record
+                .rel_prev_targets
+                .as_ref()
+                .is_some_and(|targets| targets.len() > 1)
+        {
+            issues.push(issue(
+                "pagination.multiple_targets",
+                IssueView::PaginationMultipleTargets,
+                Severity::Info,
+                record,
+                format!(
+                    "Multiple captured pagination declarations: {} next, {} previous",
+                    record.rel_next_targets.as_ref().map_or_else(
+                        || "unknown".to_string(),
+                        |targets| targets.len().to_string(),
+                    ),
+                    record.rel_prev_targets.as_ref().map_or_else(
+                        || "unknown".to_string(),
+                        |targets| targets.len().to_string(),
+                    ),
+                ),
+            ));
+        }
         image_issues(record, &mut issues);
         content_issues(record, thresholds, &mut issues);
         mobile_issues(record, &mut issues);
@@ -911,6 +938,48 @@ mod tests {
         target.status_code = Some(404);
         target.canonical = None;
         assert!(warnings(target).is_empty());
+    }
+
+    #[test]
+    fn multiple_pagination_targets_emit_information_only_for_measured_eligible_pages() {
+        let mut measured = CrawlRecord::pending("https://example.test/measured".into(), 0);
+        measured.status_code = Some(200);
+        measured.content_type = Some("text/html".into());
+        measured.rel_next_targets = Some(vec![
+            "https://example.test/a".into(),
+            "https://example.test/a".into(),
+        ]);
+        measured.rel_prev_targets = Some(vec![]);
+        let mut legacy = measured.clone();
+        legacy.url = "https://example.test/legacy".into();
+        legacy.rel_next_targets = None;
+        let mut incomplete = measured.clone();
+        incomplete.url = "https://example.test/incomplete".into();
+        incomplete.indexability_status = "Response body incomplete".into();
+        let issues = analyze_records(&[measured, legacy, incomplete], &AuditThresholds::default());
+        let inventory: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.rule_id == "pagination.multiple_targets")
+            .collect();
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].severity, Severity::Info);
+        assert_eq!(inventory[0].view, IssueView::PaginationMultipleTargets);
+        assert!(inventory[0].message.contains("2 next, 0 previous"));
+        let mut unknown_direction =
+            CrawlRecord::pending("https://example.test/unknown-prev".into(), 0);
+        unknown_direction.status_code = Some(200);
+        unknown_direction.content_type = Some("text/html".into());
+        unknown_direction.rel_next_targets = Some(vec![
+            "https://example.test/a".into(),
+            "https://example.test/b".into(),
+        ]);
+        let issues = analyze_records(&[unknown_direction], &AuditThresholds::default());
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.rule_id == "pagination.multiple_targets"
+                    && issue.message.contains("2 next, unknown previous"))
+        );
     }
 
     #[test]

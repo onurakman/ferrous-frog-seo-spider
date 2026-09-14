@@ -131,6 +131,7 @@ pub enum IssueView {
     PaginationPrevLoop,
     PaginationNextNonReciprocal,
     PaginationPrevNonReciprocal,
+    PaginationMultipleTargets,
     AmpToError,
     AmpNonReciprocal,
     DirectivesNoindex,
@@ -386,6 +387,10 @@ pub struct CrawlRecord {
     pub amphtml: Option<String>,
     pub rel_next: Option<String>,
     pub rel_prev: Option<String>,
+    #[serde(default)]
+    pub rel_next_targets: Option<Vec<String>>,
+    #[serde(default)]
+    pub rel_prev_targets: Option<Vec<String>>,
     pub hreflang_count: u32,
     pub hreflang_invalid_count: u32,
     pub hreflang_missing_self_reference: bool,
@@ -519,6 +524,8 @@ impl CrawlRecord {
             amphtml: None,
             rel_next: None,
             rel_prev: None,
+            rel_next_targets: None,
+            rel_prev_targets: None,
             hreflang_count: 0,
             hreflang_invalid_count: 0,
             hreflang_missing_self_reference: false,
@@ -661,6 +668,8 @@ pub struct CrawlSummary {
     pub pagination_next_non_reciprocal: usize,
     #[serde(default)]
     pub pagination_prev_non_reciprocal: usize,
+    #[serde(default)]
+    pub pagination_multiple_targets: usize,
     #[serde(default)]
     pub amp_to_error: usize,
     #[serde(default)]
@@ -2254,6 +2263,16 @@ impl SqliteStore {
         record.inlink_count =
             sqlite_inlink_count_for_record(&conn, &record)?.unwrap_or(record.inlink_count);
         let redirect_chain = serde_json::to_string(&record.redirect_chain)?;
+        let rel_next_targets = record
+            .rel_next_targets
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let rel_prev_targets = record
+            .rel_prev_targets
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let hreflang_links = serde_json::to_string(&record.hreflang_links)?;
         let structured_data_issues = serde_json::to_string(&record.structured_data_issues)?;
         let custom_extractions = serde_json::to_string(&record.custom_extractions)?;
@@ -2391,7 +2410,9 @@ impl SqliteStore {
                     referring_domain_count = ?101,
                     backlink_authority = ?102,
                     content_hash = ?103,
-                    content_hash_context = ?104
+                    content_hash_context = ?104,
+                    rel_next_targets = ?105,
+                    rel_prev_targets = ?106
                  WHERE id = ?92",
                 params![
                     record.url,
@@ -2501,7 +2522,9 @@ impl SqliteStore {
                         .map(|value| value.min(i64::MAX as u64) as i64),
                     record.backlink_authority,
                     record.content_hash,
-                    record.content_hash_context
+                    record.content_hash_context,
+                    rel_next_targets,
+                    rel_prev_targets
                 ],
             )?;
             update_sqlite_edge_statuses(&conn, &record)?;
@@ -2612,7 +2635,9 @@ impl SqliteStore {
                     referring_domain_count,
                     backlink_authority,
                     content_hash,
-                    content_hash_context
+                    content_hash_context,
+                    rel_next_targets,
+                    rel_prev_targets
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
@@ -2622,7 +2647,8 @@ impl SqliteStore {
                     ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65, ?66, ?67, ?68, ?69,
                     ?70, ?71, ?72, ?73, ?74, ?75, ?76, ?77, ?78, ?79, ?80,
                     ?81, ?82, ?83, ?84, ?85, ?86, ?87, ?88, ?89, ?90, ?91, ?92, ?93,
-                    ?94, ?95, ?96, ?97, ?98, ?99, ?100, ?101, ?102, ?103
+                    ?94, ?95, ?96, ?97, ?98, ?99, ?100, ?101, ?102, ?103,
+                    ?104, ?105
                  )",
                 params![
                     record.url,
@@ -2731,7 +2757,9 @@ impl SqliteStore {
                         .map(|value| value.min(i64::MAX as u64) as i64),
                     record.backlink_authority,
                     record.content_hash,
-                    record.content_hash_context
+                    record.content_hash_context,
+                    rel_next_targets,
+                    rel_prev_targets
                 ],
             )?;
             record.id = conn.last_insert_rowid() as u64;
@@ -3941,6 +3969,8 @@ impl SqliteStore {
                 amphtml TEXT,
                 rel_next TEXT,
                 rel_prev TEXT,
+                rel_next_targets TEXT,
+                rel_prev_targets TEXT,
                 hreflang_count INTEGER NOT NULL DEFAULT 0,
                 hreflang_invalid_count INTEGER NOT NULL DEFAULT 0,
                 hreflang_missing_self_reference INTEGER NOT NULL DEFAULT 0,
@@ -4161,6 +4191,8 @@ impl SqliteStore {
         add_column_if_missing(&conn, "backlink_authority", "REAL")?;
         add_column_if_missing(&conn, "rel_next", "TEXT")?;
         add_column_if_missing(&conn, "rel_prev", "TEXT")?;
+        add_column_if_missing(&conn, "rel_next_targets", "TEXT")?;
+        add_column_if_missing(&conn, "rel_prev_targets", "TEXT")?;
         add_column_if_missing(&conn, "hreflang_count", "INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(
             &conn,
@@ -4793,6 +4825,17 @@ fn summarize_without_canonicals(records: &[CrawlRecord]) -> CrawlSummary {
         if !is_success_html_record(record) {
             continue;
         }
+
+        summary.pagination_multiple_targets += usize::from(
+            record
+                .rel_next_targets
+                .as_ref()
+                .is_some_and(|targets| targets.len() > 1)
+                || record
+                    .rel_prev_targets
+                    .as_ref()
+                    .is_some_and(|targets| targets.len() > 1),
+        );
 
         summary.title_multiple += usize::from(record.title_count.is_some_and(|count| count > 1));
         summary.meta_multiple +=
@@ -6017,6 +6060,8 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CrawlRecord> {
         meta_keywords: row.get("meta_keywords")?,
         rel_next: row.get("rel_next")?,
         rel_prev: row.get("rel_prev")?,
+        rel_next_targets: json_column(row, "rel_next_targets")?,
+        rel_prev_targets: json_column(row, "rel_prev_targets")?,
         hreflang_count: row.get("hreflang_count")?,
         hreflang_invalid_count: row.get("hreflang_invalid_count")?,
         hreflang_missing_self_reference: row.get("hreflang_missing_self_reference")?,
@@ -6477,6 +6522,8 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             amphtml TEXT,
             rel_next TEXT,
             rel_prev TEXT,
+            rel_next_targets TEXT,
+            rel_prev_targets TEXT,
             hreflang_count INTEGER NOT NULL DEFAULT 0,
             hreflang_invalid_count INTEGER NOT NULL DEFAULT 0,
             hreflang_missing_self_reference INTEGER NOT NULL DEFAULT 0,
@@ -6582,6 +6629,8 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             amphtml,
             rel_next,
             rel_prev,
+            rel_next_targets,
+            rel_prev_targets,
             hreflang_count,
             hreflang_invalid_count,
             hreflang_missing_self_reference,
@@ -6675,6 +6724,8 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             amphtml,
             rel_next,
             rel_prev,
+            rel_next_targets,
+            rel_prev_targets,
             hreflang_count,
             hreflang_invalid_count,
             hreflang_missing_self_reference,
@@ -7114,6 +7165,7 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
         ),
         IssueView::CanonicalMissing => clauses.push("(canonical IS NULL OR ff_trim(canonical) = '')".to_string()),
         IssueView::CanonicalMultiple => clauses.push("canonical_count > 1".to_string()),
+        IssueView::PaginationMultipleTargets => clauses.push("(COALESCE(json_array_length(rel_next_targets), 0) > 1 OR COALESCE(json_array_length(rel_prev_targets), 0) > 1)".to_string()),
         IssueView::CanonicalUncrawled | IssueView::CanonicalToRedirect | IssueView::CanonicalToError
         | IssueView::CanonicalNonIndexable | IssueView::CanonicalChain | IssueView::CanonicalLoop
         | IssueView::PaginationNextToError | IssueView::PaginationPrevToError
@@ -7228,6 +7280,12 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
         .into_iter()
         .map(|column| format!("ff_contains({column}, {parameter})"))
         .collect::<Vec<_>>();
+        predicates.push(format!(
+            "EXISTS (SELECT 1 FROM json_each(rel_next_targets) target WHERE ff_contains(target.value, {parameter}))"
+        ));
+        predicates.push(format!(
+            "EXISTS (SELECT 1 FROM json_each(rel_prev_targets) target WHERE ff_contains(target.value, {parameter}))"
+        ));
         predicates.push(format!("ff_custom_contains(custom_extractions, custom_searches, structured_data_issues, {parameter})"));
         predicates.push(sqlite_first_inlink_expression(&format!(
             "ff_contains(source_url, {parameter}) OR ff_contains(anchor_text, {parameter}) OR ff_contains(source_position, {parameter})"
@@ -7571,6 +7629,7 @@ fn sqlite_progress_counts(conn: &Connection) -> Result<CrawlSummary, StorageErro
         h2_missing: view_filter(IssueView::H2Missing),
         canonical_missing: view_filter(IssueView::CanonicalMissing),
         canonical_multiple: view_filter(IssueView::CanonicalMultiple),
+        pagination_multiple_targets: view_filter(IssueView::PaginationMultipleTargets),
         noindex: view_filter(IssueView::DirectivesNoindex),
         images_missing_alt: view_filter(IssueView::ImagesMissingAlt),
         images_alt_too_long: view_filter(IssueView::ImagesAltTooLong),
@@ -8420,6 +8479,15 @@ fn matches_view(
         IssueView::PaginationPrevLoop => references.pagination_prev_loop,
         IssueView::PaginationNextNonReciprocal => references.pagination_next_non_reciprocal,
         IssueView::PaginationPrevNonReciprocal => references.pagination_prev_non_reciprocal,
+        IssueView::PaginationMultipleTargets => {
+            row.rel_next_targets
+                .as_ref()
+                .is_some_and(|targets| targets.len() > 1)
+                || row
+                    .rel_prev_targets
+                    .as_ref()
+                    .is_some_and(|targets| targets.len() > 1)
+        }
         IssueView::AmpToError => references.amp_to_error,
         IssueView::AmpNonReciprocal => references.amp_non_reciprocal,
         IssueView::DirectivesNoindex => row.indexability_status.to_lowercase().contains("noindex"),
@@ -8515,6 +8583,7 @@ fn is_html_audit_view(view: &IssueView) -> bool {
             | IssueView::PaginationPrevLoop
             | IssueView::PaginationNextNonReciprocal
             | IssueView::PaginationPrevNonReciprocal
+            | IssueView::PaginationMultipleTargets
             | IssueView::AmpToError
             | IssueView::AmpNonReciprocal
             | IssueView::ImagesMissingAlt
@@ -8692,6 +8761,16 @@ fn row_matches_search(row: &CrawlRecord, search: &str) -> bool {
             .unwrap_or("")
             .to_lowercase()
             .contains(search)
+        || row.rel_next_targets.as_ref().is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|target| target.to_lowercase().contains(search))
+        })
+        || row.rel_prev_targets.as_ref().is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|target| target.to_lowercase().contains(search))
+        })
         || row
             .response_hash
             .as_deref()
