@@ -15,7 +15,7 @@ Ferrous Frog development roadmap and implementation tracker.
 - [ ] (Partial) Phase 2 scale/reporting work is underway: SQLite, sessions, resumable frontier state, exports, overview, graph, and many audits exist, but full audit coverage, fully streaming exports, and large-scale benchmarks are not complete.
 - [x] Phase 3 advanced extraction baseline is implemented: custom extraction, raw/rendered HTML custom search, near duplicates, sitemap export, robots tooling, resource toggles, rendered/raw DOM diff, and an optional Chrome CDP rendering backend exist.
 - [x] Phase 4 visualization and external data work: graph storage, graph UI, directory tree, URL segments, path helpers, archive-based crawl comparison, integration provider contracts, Google Search Console metric merge, and manual PageSpeed measurements saved with individual crawl rows exist. GA4, bulk PageSpeed, Chrome UX Report field data and a generic backlink endpoint are integrated; vendor-specific backlink adapters remain.
-- [ ] (Partial) Phase 5 automation and AI assist: CLI, automation, scheduling, authentication flows and per-URL AI assistance exist; extreme-scale hardening remains.
+- [ ] (Partial) Phase 5 automation and AI assist: CLI, automation, scheduling, authentication flows and per-URL AI assistance exist; sitewide AI audit reporting with complete evidence access and extreme-scale hardening remain.
 
 ## Immediate Next Work
 
@@ -45,6 +45,7 @@ Ferrous Frog development roadmap and implementation tracker.
 - [x] Skip redundant dispatch-only frontier checkpoints while retaining waiting/in-flight recovery, List metadata and completed records. Verify task-abort/reopen/resume in Memory/SQLite and measure the existing 1,000-page crawler on tmpfs and physical NVMe; SQLite NVMe medians fall 14–15% in the [matched local workload](docs/BENCHMARKS.md#avoiding-dispatch-only-checkpoints).
 - [x] Persist ordinary crawl completions incrementally: remove completed keys, append discoveries/seen keys and update sitemap flags/counters in one SQLite transaction; mutate Memory frontiers in place. Verify List identity, rollback, late sitemap provenance and abort/reopen/resume. The [storage workload](docs/BENCHMARKS.md#incremental-frontier-checkpoints) writes four changed rows instead of up to 201,015; the local NVMe crawler improves a further 16–17% over dispatch-only checkpoint removal.
 - [ ] Improve active large-crawl query/frontier performance using measured benchmarks; incremental summaries, startup/Stop snapshot hydration, larger mixed edge/frontier loads, concurrent UI queries and broader physical-disk runs remain open.
+- [ ] Deliver the [AI audit reporting plan](docs/superpowers/plans/2026-09-14-ai-audit-reporting.md): polished single-crawl and follow-up reports, grounded AI explanations, complete affected-URL inspection and portable HTML evidence exports. Begin with deterministic report evidence and bounded queries; progress is tracked by AI-R01–AI-R06 below.
 - [x] Add manual PageSpeed measurement for the selected URL, optional OS-keyring credentials in Settings and latest-result persistence. Preserve device/date/URL attribution, exact List occurrences, cancellation and previous results on failures.
 - [x] Extend PageSpeed with bounded bulk measurement (up to 500 selected rows, one request at a time, cancellable, progress events), Lighthouse category choices, quota-aware retry (429/503 backoff) and resume (rows already measured with the same device are skipped), plus PageSpeed/field-data grid columns and CSV/XLSX fields.
 
@@ -94,7 +95,7 @@ Goal: keep a buildable project skeleton with clear crate boundaries.
 - [x] Workspace tests and frontend build pass.
 - [x] GitHub CI and Release Please workflows, synchronized workspace/npm/Tauri versions, and desktop installer configuration.
 - [x] Verify the first hosted six-target installer matrix: v0.2.0 published 12 Windows, macOS and Linux packages with verified SHA256SUMS.
-- [ ] Verify native installation/startup/quit on Windows, macOS and Linux. A local Linux WebDriver harness, isolated display/driver preflight and desktop build are available. The first built-app attempt opened the library but failed at URL-input selection before crawling; fixing that harness and completing platform installation checks remain pending. See [native testing](docs/NATIVE_TESTING.md).
+- [ ] Verify native installation/startup/quit on Windows, macOS and Linux. The Linux embedded-assets debug app passes a real WebDriver crawl, robots/crawl-delay checks, planted 404, saved SQLite reopen without requests and cancel/confirm quit with process exit. Installer validation and Windows/macOS checks remain pending. See [native testing](docs/NATIVE_TESTING.md).
 - [ ] Developer ID signing/notarization and Windows code signing before trusted signed distribution.
 
 ## Phase 1 - Make The Frog Crawl
@@ -418,6 +419,17 @@ Status: parked for now. Do not prioritize these items until Phase 2, Phase 3, an
 - [x] Spelling and grammar analysis: model-reported issues with suggestions and detected language, saved per row.
 - [ ] Extreme-scale performance hardening and documented benchmarks.
 
+### AI Audit Reporting
+
+Planned from the supplied initial/follow-up HTML examples. The [design and delivery plan](docs/superpowers/plans/2026-09-14-ai-audit-reporting.md) preserves concise summaries and readable finding cards while making every affected URL and evidence occurrence accessible. Reuse the built-in AI provider/keyring configuration; this does not require a general plugin framework. Existing per-URL AI and the sampled HTML report do not complete these items.
+
+- [x] **AI-R01 — Complete report evidence:** consistent saved-crawl snapshots, versioned rules and frozen thresholds, exact finding/unique-URL/record/reference counts, explicit coverage and bounded Memory/SQLite queries. Sixteen page rules and broken-link evidence share existing storage predicates and global duplicate/reference context. Frozen source identities and eligibility survive source deletion; unsupported checks and legacy edge attribution remain explicit. Fixtures cover 1,205 records, duplicate List occurrences, 600 links to one target, scope parity, cancellation and source changes. Large-scale measurements remain AI-R06.
+- [ ] **AI-R02 — Report workspace:** saved report lifecycle, title/language/scope selection, measured summary cards, executive summary, severity/category/team filters and problem/evidence/fix sections. Provide a full evidence area with server-side search/sort, virtualized pages, full URL/value inspection and complete matching exports; support both themes, keyboard and narrow windows.
+- [ ] **AI-R03 — Optional AI explanations:** reuse provider settings and OS credentials; send bounded finding summaries and labelled evidence samples with an explicit data/request budget. Validate structured evidence references; provide progress, cancellation, usage and resumable annotations. AI-off/failure states retain the complete deterministic report; no automatic website refetch or invented measurements.
+- [ ] **AI-R04 — Complete portable HTML report:** a polished offline index, linked paged evidence and full per-finding CSV with a count/coverage manifest. Stream all matching evidence to an atomically published folder; no silent 50-row or one-million-edge cap, remote assets or full-site frontend array. Printed/standalone summaries must not be labelled complete evidence exports.
+- [ ] **AI-R05 — Follow-up report:** compare stable rule/request/occurrence identities and show before/after evidence, new/resolved/improved/unchanged/worsened/mixed states and complete affected sets. Missing, blocked, removed or incompatible observations remain explicit rather than automatically resolved; AI only explains computed changes.
+- [ ] **AI-R06 — Verification and scale:** test last-row reachability beyond previews/pages, exact count/export parity, incomplete captures, hostile content, provider failures/cancellation and source/configuration changes. Measure at least 100,000 affected evidence rows and over one million link occurrences; verify offline report navigation and the native desktop workflow before completion.
+
 ## Testing Tracker
 
 - [x] Parser fixture tests for titles, metadata, headings, canonicals, links, directives, hreflang, JSON-LD, and resources.
@@ -429,7 +441,8 @@ Status: parked for now. Do not prioritize these items until Phase 2, Phase 3, an
 - [x] Property tests for frontier/dedup logic: a dependency-free generated-URL test checks query normalization idempotence, fragment removal, strip/limit/sort invariants and single seen-set keys across variants.
 - [ ] (Partial) Load test against a large synthetic site. The one-million-record storage benchmark and a 1,000-page local HTTP crawler fixture are documented. The crawler verifies cycles, deduplication, errors, robots, concurrency and stop/reopen/resume in Memory/SQLite, with an initial physical NVMe checkpoint comparison; larger mixed sites, active UI queries and broader disk runs remain pending.
 - [x] Headless Chrome UI smoke checks for full result/report paging, stale responses, live duplicates, errors, details, graph exclusions, themes and small-screen layouts (`make test-ui`). Optional screenshots use `UI_SCREENSHOT`.
-- [ ] Native desktop end-to-end crawl checks beyond IPC-fixture browser coverage.
+- [x] Linux native desktop end-to-end crawl check beyond IPC fixtures: embedded-assets debug app, isolated Xvfb/D-Bus/WebKit WebDriver, robots/crawl delay, 404, SQLite persistence/reopen without requests and cancel/confirm quit with native process exit (`make test-native`).
+- [ ] Extend native desktop end-to-end checks to Windows/macOS and installer builds; verify the new audit-report workflow after implementation.
 
 ## Definition Of Done
 

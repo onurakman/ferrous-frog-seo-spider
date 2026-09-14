@@ -8,6 +8,17 @@ use std::sync::{Arc, RwLock};
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
+#[cfg(test)]
+mod audit_report_comparison_tests;
+#[cfg(test)]
+mod audit_reports_tests;
+
+pub mod audit_report_comparison;
+pub use audit_report_comparison::*;
+
+pub mod audit_reports;
+pub use audit_reports::*;
+
 mod native_exports;
 mod page_captures;
 pub use page_captures::{
