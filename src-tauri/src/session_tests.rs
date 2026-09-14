@@ -1072,3 +1072,48 @@ fn queued_only_list_archives_restore_targets_and_can_resume() {
     assert_eq!(opened.start_url, "https://example.test/queued");
     assert_eq!(opened.crawled, Some(0));
 }
+
+#[test]
+fn archive_import_late_failure_preserves_active_session_and_library() {
+    let dir = TestDirectory::new();
+    let state = idle_state();
+    let (first, store, _, index) =
+        prepare_crawl_session(&state, &dir.0, CrawlConfig::default(), false).unwrap();
+    store.upsert(record("original"));
+    let input = br#"{"schemaVersion":1,"exportedAtMs":0,"records":[],"linkEdges":[],"imageAssets":[]} false"#;
+    assert!(import_archive_reader_into_session(&state, &dir.0, &input[..]).is_err());
+    assert_eq!(
+        state.current_session_id.lock().unwrap().as_deref(),
+        Some(first.id.as_str())
+    );
+    assert_eq!(query_sessions(&index, None).unwrap().len(), 1);
+    assert_eq!(store.query(GridQuery::default()).total, 1);
+    assert_eq!(
+        fs::read_dir(dir.0.join("sessions"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".archive-import-"))
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn archive_import_publication_failure_removes_new_database() {
+    let dir = TestDirectory::new();
+    let input =
+        br#"{"schemaVersion":1,"exportedAtMs":0,"records":[],"linkEdges":[],"imageAssets":[]}"#;
+    let staged = archive_import::stage_archive_reader(&input[..], &dir.0).unwrap();
+    let index = sessions::index_connection(&dir.0).unwrap();
+    index.execute_batch("CREATE TRIGGER reject_import BEFORE INSERT ON crawl_sessions BEGIN SELECT RAISE(ABORT,'injected index failure'); END;").unwrap();
+    assert!(
+        sessions::publish_imported_session(&index, &dir.0, &staged.path, "", CrawlMode::Spider, 0)
+            .is_err()
+    );
+    assert_eq!(query_sessions(&index, None).unwrap().len(), 0);
+    assert_eq!(fs::read_dir(dir.0.join("sessions")).unwrap().count(), 0);
+    assert!(staged.path.is_file());
+}

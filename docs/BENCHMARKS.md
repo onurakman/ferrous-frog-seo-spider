@@ -409,7 +409,7 @@ This removes edge-count-dependent report input buffers and the HTML/whole-link C
 FERROUS_CRAWLER_PAGES=2000 FERROUS_CRAWLER_QUERIES=1 cargo test --release --locked -p ferrous-frog-crawler-core synthetic_local_site_crawler_load -- --ignored --nocapture
 ```
 
-Measured on 2026-09-14 with the optimized crawler test executable. The existing local HTTP fixture now accepts a page count (100 to 100,000, in multiples of 100; default 1,000) and optional concurrent storage queries. Each run still exercises Memory and file-backed SQLite, both uninterrupted and stopped/reopened/resumed. Set `TMPDIR` to a private directory on the desired filesystem for the SQLite files. The fixture removes its databases after a successful run.
+Measured on 2026-09-14 with the optimized crawler test executable at the checkpoint recorded by `64cf05a`, before the later per-target pagination diagnostics. The existing local HTTP fixture now accepts a page count (100 to 100,000, in multiples of 100; default 1,000) and optional concurrent storage queries. Each run still exercises Memory and file-backed SQLite, both uninterrupted and stopped/reopened/resumed. Set `TMPDIR` to a private directory on the desired filesystem for the SQLite files. The fixture removes its databases after a successful run.
 
 With `FERROUS_CRAWLER_QUERIES=1`, a separate thread queries a sorted 50-row grid window, a searched 50-edge window and recovery counts, then waits 1.5 seconds like the workbench refresh. Offsets rotate through ten windows. Each poll checks bounded response sizes and frontier consistency. The worker stops and releases its store before reopening SQLite, and wakes immediately at shutdown. Reported poll latency includes storage-lock waits and all three queries; it excludes IPC, React rendering and window interaction.
 
@@ -460,4 +460,40 @@ This matched baseline isolates whole-array allocation. It is **not** a timing of
 
 Focused tests prove a record reaches SQLite while later JSON remains unread; preserve original IDs including zero and SQLite's upper boundary, List ordering and full typed payloads; retain comparison's intentional skipping of unused non-record sections; and remove private staging on duplicate identities, unsupported/missing/duplicate metadata, malformed/trailing JSON, read errors or late storage errors. The current crawl and saved source files remain unchanged. Existing comparison-source tests also retain WAL-aware read-only copying, private legacy migrations and source-deletion independence.
 
-The archive workspace now holds one decoded record at a time, so a single unusually large field/record can still require substantial memory. Current Memory and in-memory SQLite sources still hydrate one complete record snapshot before staging; saved SQLite sources use SQL copying. Full archive import and the legacy `compare_crawl_archive` command remain buffered. This checkpoint changes archive-baseline preparation for the paged comparison workspace, not every archive operation.
+The archive workspace now holds one decoded record at a time, so a single unusually large field/record can still require substantial memory. Current Memory and in-memory SQLite sources still hydrate one complete record snapshot before staging; saved SQLite sources use SQL copying. At this checkpoint, full archive import and the legacy `compare_crawl_archive` command remained buffered. The full-import follow-up below removes the former input buffer; the legacy comparison command remains unchanged.
+
+## Complete Schema-1 Archive Import: 50,000 Records and 1,000,001 Links
+
+The native importer now decodes the complete archive with Serde into a private SQLite database on a blocking worker. Records reuse the comparison identity stager; images, references and frontier rows use bounded append transactions. Captures decode individually with the existing size/ownership validation. Links first enter a temporary SQLite table and are replayed after records, preserving captured status/depth even when the JSON puts links first. Consumed staging rows are deleted during replay so SQLite can reuse their pages; ordinary DELETE/DROP does not shrink the file, and some final freelist space may remain. Only a validated, checkpointed and closed database is published as a completed saved session.
+
+Run the opt-in workload separately from browser/crawler tests:
+
+```bash
+cargo test --locked --release -p ferrous-frog-app archive_import::tests::archive_import_full_stream_workload --no-run
+TMPDIR="$HOME/.cache" FF_IMPORT_RECORDS=50000 FF_IMPORT_EDGES=1000001 /usr/bin/time -f 'peak_rss_kib=%M elapsed_seconds=%e' target/release/deps/ferrous_frog-<hash> --ignored --exact archive_import::tests::archive_import_full_stream_workload --nocapture
+```
+
+The local run on 2026-09-14 used an optimized build from the working tree based on `9573ec8`, including the full-import implementation, raw archive restore helpers and the then-uncommitted pagination diagnostic changes subsequently committed as `79a0edf`. It ran alone after the frontend Chrome smoke completed, using a private directory under `$HOME/.cache` on `/dev/nvme0n1p2` (ext4). Import behavior was unchanged between this run and the final checks; later changes only addressed lint, added negative test assertions and updated documentation.
+
+| Archive collection | Verified rows |
+| --- | ---: |
+| Records | 50,000 |
+| Link edges | 1,000,001 |
+| Images | 50,000 |
+| Page references | 50,000 |
+| Page captures | 50,000 |
+| Queued frontier items | 50,000 |
+| Seen frontier keys | 100,000 |
+
+| Measurement | Result |
+| --- | ---: |
+| Input JSON bytes | 496,945,043 |
+| Decode, private staging and completed-session publication | 45,124.384 ms |
+| Peak process RSS | 17,236 KiB (16.832 MiB) |
+| Entire test process | 45.88 s |
+
+The workload generates its input item by item before starting the import timer. Records contain reversed sparse IDs, List occurrence keys/positions, Unicode metadata and a captured inlink count deliberately independent of edge counts. Links carry captured status/depth values that disagree with matching records. Images, references, retained page bodies, queued order and seen keys populate every schema-1 collection. After timed session publication, SQL checks all seven complete counts, the final link ID/status/Unicode anchor and an endpoint record's preserved inlink count. A smaller 100-record/1,205-link fixture passed before the large run.
+
+This is one local observation, not a median, latency guarantee or before/after speedup comparison. The timer excludes fixture generation, compilation and result assertions; it includes opening the session index and final database publication/opening, but does not drive the Tauri IPC or frontend session activation. Peak RSS covers the entire test process, including input generation, SQLite allocations and verification; it excludes filesystem page-cache memory. The input file, SQLite dataset and private staging still require disk space.
+
+Import memory is bounded by individual records/captures and batches of at most 256 evidence/frontier rows, rather than by the total array sizes. Individual fields can still be large; capture limits remain the existing 1 MiB per body/text value and 512 headers / 64 KiB. Older optional reference/capture fields remain optional. Duplicate record/evidence identities or normalized record keys now fail instead of being silently renumbered or overwritten. Stored record inlink counts and captured link metadata survive; image size/oversized and first-inlink annotations retain their existing query-derived behavior. Archive export frontier hydration, Memory export/query snapshots and the legacy immediate archive comparison buffer remain separate limitations.

@@ -876,6 +876,55 @@ pub(crate) fn refresh_legacy_metadata(
     Ok(())
 }
 
+/// Publish only a fully validated, closed import database. The staged file must be on
+/// the sessions filesystem and have no live SQLite connections or pending WAL frames.
+pub(crate) fn publish_imported_session(
+    conn: &Connection,
+    dir: &Path,
+    staged_path: &Path,
+    start_url: &str,
+    mode: CrawlMode,
+    records: usize,
+) -> Result<(CrawlSession, SqliteStore), String> {
+    let sessions_dir = dir.join("sessions");
+    fs::create_dir_all(&sessions_dir).map_err(|error| error.to_string())?;
+    let suffix: String = conn
+        .query_row("SELECT lower(hex(randomblob(8)))", [], |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    let now = now_ms();
+    let id = format!("session-{now}-{suffix}");
+    let path = sessions_dir.join(format!("{id}.sqlite3"));
+    // Hard-link publication cannot overwrite an existing session and does not copy the dataset.
+    fs::hard_link(staged_path, &path)
+        .map_err(|error| format!("failed to publish imported crawl: {error}"))?;
+    let publish = || -> Result<(CrawlSession, SqliteStore), String> {
+        let store = open_existing_database(&path)?;
+        let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        tx.execute(
+            "INSERT INTO crawl_sessions
+             (id,name,start_url,database_path,created_at_ms,updated_at_ms,mode,status,crawled,config_json)
+             VALUES (?1,'Imported crawl',?2,?3,?4,?4,?5,'imported',?6,NULL)",
+            params![id, start_url, path.to_string_lossy().as_ref(), now, mode_name(mode), records as i64],
+        ).map_err(|error| error.to_string())?;
+        let session = get_session(&tx, &id, Some(&id))?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok((session, store))
+    };
+    match publish() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            // The transaction and destination connection have already been dropped.
+            for suffix in ["", "-wal", "-shm"] {
+                let mut file = path.as_os_str().to_os_string();
+                file.push(suffix);
+                let _ = fs::remove_file(file);
+            }
+            Err(format!("failed to import crawl archive: {error}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod comparison_scaling_tests {
     use super::*;

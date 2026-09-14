@@ -19,6 +19,7 @@ pub use audit_report_comparison::*;
 pub mod audit_reports;
 pub use audit_reports::*;
 
+mod archive_restore;
 mod native_exports;
 mod page_captures;
 pub use page_captures::{
@@ -1250,6 +1251,8 @@ fn default_true() -> bool {
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("invalid crawl archive: {0}")]
+    InvalidArchive(String),
     #[error("invalid page capture: {0}")]
     InvalidPageCapture(String),
     #[error("crawl record {0} was not found")]

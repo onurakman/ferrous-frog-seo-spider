@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod ai;
+mod archive_import;
+mod archive_staging;
 mod audit_report_ai;
 mod audit_report_comparison;
 mod audit_report_export;
@@ -57,7 +59,7 @@ use keyring::{Entry, Error as KeyringError};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sessions::{CrawlSession, get_session, query_sessions};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -2579,46 +2581,37 @@ async fn import_crawl_archive(
 ) -> Result<CrawlArchiveImportResult, String> {
     let task = state.crawl_task.lock().await;
     ensure_idle(&state, &task)?;
-    let bytes = fs::read(request.path.trim())
-        .map_err(|error| format!("failed to read crawl archive: {error}"))?;
-    let archive: CrawlArchive = serde_json::from_slice(&bytes)
-        .map_err(|error| format!("invalid crawl archive: {error}"))?;
+    let dir = app_data_dir(&app)?;
     let _ = request.storage_mode; // Older clients still send this preference.
-    import_archive_into_session(&state, &app_data_dir(&app)?, archive)
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let file = fs::File::open(request.path.trim())
+            .map_err(|error| format!("failed to read crawl archive: {error}"))?;
+        let state = app.state::<AppState>();
+        import_archive_reader_into_session(&state, &dir, std::io::BufReader::new(file))
+    })
+    .await
+    .map_err(|error| format!("archive import worker failed: {error}"))?;
+    drop(task);
+    result
 }
 
-fn import_archive_into_session(
+fn import_archive_reader_into_session(
     state: &AppState,
     dir: &Path,
-    archive: CrawlArchive,
+    reader: impl std::io::Read,
 ) -> Result<CrawlArchiveImportResult, String> {
-    if archive.schema_version != CRAWL_ARCHIVE_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported crawl archive schema version {}",
-            archive.schema_version
-        ));
-    }
-    let record_keys = archive
-        .records
-        .iter()
-        .map(|record| {
-            if record.storage_key.trim().is_empty() {
-                record.final_url.as_str()
-            } else {
-                record.storage_key.as_str()
+    let sessions_dir = dir.join("sessions");
+    let created_directory = !sessions_dir.exists();
+    let staged = match archive_import::stage_archive_reader(reader, &sessions_dir) {
+        Ok(staged) => staged,
+        Err(error) => {
+            if created_directory {
+                // Remove only an empty directory created for this failed import.
+                let _ = fs::remove_dir(&sessions_dir);
             }
-        })
-        .collect::<HashSet<_>>();
-    let mut capture_keys = HashSet::new();
-    for capture in &archive.page_captures {
-        capture.validate().map_err(|error| error.to_string())?;
-        if !record_keys.contains(capture.source_storage_key.as_str()) {
-            return Err("crawl archive capture has no matching record occurrence".into());
+            return Err(error);
         }
-        if !capture_keys.insert(capture.source_storage_key.as_str()) {
-            return Err("crawl archive contains duplicate page captures for one occurrence".into());
-        }
-    }
+    };
     let mut active_store = state
         .store
         .lock()
@@ -2627,113 +2620,39 @@ fn import_archive_into_session(
         .current_session_id
         .lock()
         .map_err(|_| "session lock poisoned".to_string())?;
+    if state.exit_confirmed.load(Ordering::SeqCst) {
+        return Err("the application is closing".into());
+    }
     let conn = sessions::index_connection(dir)?;
-    let start_url = archive
-        .records
-        .first()
-        .map(|record| record.url.as_str())
-        .or_else(|| {
-            archive
-                .frontier_state
-                .as_ref()?
-                .queued
-                .first()
-                .map(|item| item.url.as_str())
-        })
-        .unwrap_or_default();
-    let mode = if archive
-        .records
-        .iter()
-        .any(|record| record.list_position.is_some())
-        || archive.frontier_state.as_ref().is_some_and(|frontier| {
-            frontier
-                .queued
-                .iter()
-                .any(|item| item.list_position.is_some())
-        }) {
-        "list"
-    } else {
-        "spider"
-    };
-    let (session, store) =
-        sessions::create_session(&conn, dir, "Imported crawl", start_url, None, "importing")?;
-    let mut result = CrawlArchiveImportResult {
+    let (session, store) = sessions::publish_imported_session(
+        &conn,
+        dir,
+        &staged.path,
+        &staged.start_url,
+        staged.mode,
+        staged.records,
+    )?;
+    let result = CrawlArchiveImportResult {
         session: session.clone(),
-        records: archive.records.len(),
-        link_edges: archive.link_edges.len(),
-        image_assets: archive.image_assets.len(),
-        frontier_items: archive
-            .frontier_state
-            .as_ref()
-            .map(|state| state.queued.len())
-            .unwrap_or(0),
+        records: staged.records,
+        link_edges: staged.link_edges,
+        image_assets: staged.image_assets,
+        frontier_items: staged.frontier_items,
     };
-    let import = || -> Result<(), String> {
-        for record in archive.records {
-            store
-                .try_upsert(record)
-                .map_err(|error| error.to_string())?;
-        }
-        for edge in archive.link_edges {
-            store
-                .try_add_link_edge(edge)
-                .map_err(|error| error.to_string())?;
-        }
-        let mut images_by_page = HashMap::<String, Vec<ImageAsset>>::new();
-        for image in archive.image_assets {
-            images_by_page
-                .entry(image.page_url.clone())
-                .or_default()
-                .push(image);
-        }
-        for (page_url, images) in images_by_page {
-            store
-                .try_add_image_assets(&page_url, images)
-                .map_err(|error| error.to_string())?;
-        }
-        let mut references_by_source = HashMap::<String, Vec<PageReference>>::new();
-        for reference in archive.page_references {
-            references_by_source
-                .entry(reference.source_storage_key.clone())
-                .or_default()
-                .push(reference);
-        }
-        for (source_storage_key, references) in references_by_source {
-            store
-                .try_add_page_references(&source_storage_key, references)
-                .map_err(|error| error.to_string())?;
-        }
-        for capture in archive.page_captures {
-            let key = capture.source_storage_key.clone();
-            store
-                .try_replace_page_capture(&key, Some(capture))
-                .map_err(|error| error.to_string())?;
-        }
-        if let Some(frontier) = archive.frontier_state {
-            store
-                .try_save_frontier_state(frontier)
-                .map_err(|error| error.to_string())?;
-        }
-        conn.execute(
-            "UPDATE crawl_sessions SET mode = ?1 WHERE id = ?2",
-            params![mode, session.id],
-        )
-        .map_err(|error| error.to_string())?;
-        sessions::save_progress(&conn, &session.id, "imported", result.records)
-    };
-    let session = match import().and_then(|()| get_session(&conn, &session.id, Some(&session.id))) {
-        Ok(session) => session,
-        Err(error) => {
-            drop(store);
-            let _ = conn.execute("DELETE FROM crawl_sessions WHERE id = ?1", [&session.id]);
-            let _ = fs::remove_file(&session.database_path);
-            return Err(format!("failed to import crawl archive: {error}"));
-        }
-    };
-    result.session = session.clone();
     *active_store = ActiveStore::Sqlite(store);
     *current = Some(session.id);
     Ok(result)
+}
+
+#[cfg(test)]
+fn import_archive_into_session(
+    state: &AppState,
+    dir: &Path,
+    archive: CrawlArchive,
+) -> Result<CrawlArchiveImportResult, String> {
+    // Existing small roundtrip fixtures exercise the same decoder as the native command.
+    let bytes = serde_json::to_vec(&archive).map_err(|error| error.to_string())?;
+    import_archive_reader_into_session(state, dir, bytes.as_slice())
 }
 
 async fn prepare_crawl_comparison(
