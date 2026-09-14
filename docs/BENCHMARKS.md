@@ -434,3 +434,30 @@ The 1,000-page polling cases produced only 3–6 samples each, with medians of 1
 The larger fixture verified 2,060 unique stored URLs, 14,220 edges, 20 planted HTTP failures, 20 robots-blocked URLs and 20 redirects. It made 2,061 uninterrupted or 2,069 interrupted HTTP requests, never requested excluded/robots paths or stripped tracking queries, and retained all completed IDs after stopping at 500 records. The smaller case retained the original 1,030 URLs, 7,110 edges and request-count invariants. No external website was crawled.
 
 Progress summaries and other whole-record operations still grow with the dataset. More than 2,000 live pages, denser reference/resource graphs, repeated physical-disk trials, rendering and actual desktop frame/input responsiveness remain open scale work.
+
+## Archive Comparison Record Staging: 50,000 Records
+
+The comparison workspace now decodes an archive's `records` array one row at a time with Serde into its existing private SQLite snapshot. A private SQL table validates unique IDs/storage keys and maps allocated IDs back to the original sparse or shuffled IDs. Finalization restores IDs transactionally and drops that table. No complete archive-record vector, identity HashSets, or ID-mapping vector is retained. The saved-database read-only SQL copy path is unchanged.
+
+Reproduce after compiling the native test executable:
+
+```sh
+cargo test --locked --release -p ferrous-frog-app comparison_sources::tests::archive_record_stream_workload --no-run
+TMPDIR="$HOME/.cache" FF_ARCHIVE_MODE=snapshot /usr/bin/time -f 'peak_rss_kib=%M' target/release/deps/ferrous_frog-<hash> --ignored --exact comparison_sources::tests::archive_record_stream_workload --nocapture
+TMPDIR="$HOME/.cache" FF_ARCHIVE_MODE=stream /usr/bin/time -f 'peak_rss_kib=%M' target/release/deps/ferrous_frog-<hash> --ignored --exact comparison_sources::tests::archive_record_stream_workload --nocapture
+```
+
+Use the executable path printed by compilation and an existing temporary-file parent on the intended filesystem. `FF_ARCHIVE_RECORDS` optionally changes the default 50,000 rows. The measured runs used separate processes and a private temporary parent under the user's cache directory on NVMe/ext4, with crawler, browser and packaging workloads stopped. Generated files were removed after each run.
+
+Each process writes a 127,596,336-byte (121.685 MiB) archive incrementally before timing. Its records have distinct List storage keys/positions, reversed sparse IDs, metadata, exact-content fingerprints, typed tag counts, metrics and Unicode custom-extraction values. Timing includes record decoding, SQLite insertion, identity validation/restoration and finalization. It excludes fixture generation, compilation, current-source copying, comparison-result materialization and result assertions. Verification queries the exact row count and selected endpoint IDs/List positions/payloads without hydrating the complete output.
+
+| Archive input decoding | Staging elapsed, one run | Process peak RSS |
+| --- | ---: | ---: |
+| Complete `Vec<CrawlRecord>` followed by shared SQL staging | 16,445.803 ms | 144.270 MiB |
+| Incremental record decoding into the same SQL staging | 17,331.341 ms | 13.508 MiB |
+
+This matched baseline isolates whole-array allocation. It is **not** a timing of the historical HashSet/ID-vector implementation: both modes use the new SQL identity checks, which add writes. The result demonstrates lower peak process memory, not a latency improvement. Process RSS includes fixture generation and SQLite C allocations, but not filesystem page-cache memory. These are single-run observations, not medians or a general throughput guarantee.
+
+Focused tests prove a record reaches SQLite while later JSON remains unread; preserve original IDs including zero and SQLite's upper boundary, List ordering and full typed payloads; retain comparison's intentional skipping of unused non-record sections; and remove private staging on duplicate identities, unsupported/missing/duplicate metadata, malformed/trailing JSON, read errors or late storage errors. The current crawl and saved source files remain unchanged. Existing comparison-source tests also retain WAL-aware read-only copying, private legacy migrations and source-deletion independence.
+
+The archive workspace now holds one decoded record at a time, so a single unusually large field/record can still require substantial memory. Current Memory and in-memory SQLite sources still hydrate one complete record snapshot before staging; saved SQLite sources use SQL copying. Full archive import and the legacy `compare_crawl_archive` command remain buffered. This checkpoint changes archive-baseline preparation for the paged comparison workspace, not every archive operation.

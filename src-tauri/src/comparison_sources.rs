@@ -1,9 +1,8 @@
 use ferrous_frog_storage::{ActiveStore, CrawlRecord, SqliteStore};
 use rusqlite::{Connection, params};
-use serde::Deserialize;
-use std::collections::HashSet;
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::Path;
 
 pub(super) struct ComparisonSources {
@@ -26,28 +25,22 @@ impl ComparisonSources {
     }
 
     pub fn archive(archive_path: &Path, current: &ActiveStore) -> Result<Self, String> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct ArchiveRecords {
-            schema_version: u32,
-            records: Vec<CrawlRecord>,
-        }
         let file = File::open(archive_path)
             .map_err(|error| format!("failed to read crawl archive: {error}"))?;
-        let archive: ArchiveRecords = serde_json::from_reader(BufReader::new(file))
-            .map_err(|error| format!("invalid crawl archive: {error}"))?;
-        if archive.schema_version != crate::CRAWL_ARCHIVE_SCHEMA_VERSION {
-            return Err(format!(
-                "unsupported crawl archive schema version {}",
-                archive.schema_version
-            ));
-        }
         let directory = tempfile::tempdir()
             .map_err(|error| format!("failed to create comparison directory: {error}"))?;
-        let baseline = stage_records(archive.records, &directory.path().join("baseline.sqlite3"))?;
+        Self::archive_reader(BufReader::new(file), current, directory)
+    }
+
+    fn archive_reader(
+        reader: impl Read,
+        current: &ActiveStore,
+        directory: tempfile::TempDir,
+    ) -> Result<Self, String> {
+        let baseline = read_archive_records(reader, &directory.path().join("baseline.sqlite3"))?;
         let current_path = directory.path().join("current.sqlite3");
-        // ponytail: archives and memory sources hydrate records once; use a streaming
-        // archive reader if those headless inputs grow beyond available memory.
+        // ponytail: Memory and in-memory SQLite current sources still hydrate records once;
+        // add a stable record visitor if these headless comparison inputs need bounded staging.
         let current = match current {
             ActiveStore::Memory(store) => stage_records(store.records(), &current_path)?,
             ActiveStore::Sqlite(store) => match store
@@ -116,66 +109,190 @@ fn copy_records(source: &Path, destination: &Path) -> Result<SqliteStore, String
         .map_err(|error| format!("failed to initialize comparison records: {error}"))
 }
 
-fn stage_records(mut records: Vec<CrawlRecord>, path: &Path) -> Result<SqliteStore, String> {
-    let mut ids = HashSet::new();
-    let mut keys = HashSet::new();
-    for record in &records {
-        if i64::try_from(record.id).is_err() {
-            return Err(format!("record ID {} exceeds SQLite's range", record.id));
-        }
-        if !ids.insert(record.id) {
-            return Err(format!(
-                "duplicate record ID {} in comparison source",
-                record.id
-            ));
-        }
+fn stage_records(records: Vec<CrawlRecord>, path: &Path) -> Result<SqliteStore, String> {
+    let mut stage = RecordStage::new(path)?;
+    for record in records {
+        stage.insert(record)?;
+    }
+    stage.finish()
+}
+
+// Keep identity validation and remapping on disk. Upsert's existing column mapping
+// preserves complete record payloads as the crawl schema grows.
+struct RecordStage {
+    identities: Connection,
+    store: SqliteStore,
+}
+
+impl RecordStage {
+    fn new(path: &Path) -> Result<Self, String> {
+        let store = SqliteStore::open(path).map_err(|error| error.to_string())?;
+        let identities = Connection::open(path).map_err(|error| error.to_string())?;
+        identities
+            .execute_batch(
+                "PRAGMA synchronous = NORMAL;
+             CREATE TABLE comparison_record_ids (
+                 saved_id INTEGER PRIMARY KEY,
+                 storage_key TEXT NOT NULL UNIQUE,
+                 inserted_id INTEGER UNIQUE
+             );",
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(Self { identities, store })
+    }
+
+    fn insert(&mut self, record: CrawlRecord) -> Result<(), String> {
+        let saved = i64::try_from(record.id)
+            .map_err(|_| format!("record ID {} exceeds SQLite's range", record.id))?;
         let key = if record.storage_key.trim().is_empty() {
             record.final_url.as_str()
         } else {
             record.storage_key.as_str()
         };
-        if !keys.insert(key) {
-            return Err(format!(
-                "duplicate record storage key {key} in comparison source"
-            ));
+        if let Err(error) = self.identities.execute(
+            "INSERT INTO comparison_record_ids (saved_id, storage_key) VALUES (?1, ?2)",
+            params![saved, key],
+        ) {
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                let duplicate_id: bool = self
+                    .identities
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM comparison_record_ids WHERE saved_id = ?1)",
+                        [saved],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                return Err(if duplicate_id {
+                    format!("duplicate record ID {saved} in comparison source")
+                } else {
+                    format!("duplicate record storage key {key} in comparison source")
+                });
+            }
+            return Err(error.to_string());
         }
-    }
-    records.sort_by_key(|record| {
-        (
-            record.list_position.map(u64::from).unwrap_or(record.id),
-            record.id,
-        )
-    });
-    let store = SqliteStore::open(path).map_err(|error| error.to_string())?;
-    let mut identities = Vec::with_capacity(records.len());
-    for record in records {
-        let saved_id = record.id as i64;
-        let inserted = store
+        let inserted = self
+            .store
             .try_upsert(record)
             .map_err(|error| error.to_string())?;
-        identities.push((inserted.id as i64, saved_id));
-    }
-    // Upsert allocates IDs. Move those private IDs out of the way before restoring
-    // originals, so shuffled IDs cannot collide or change List representatives.
-    let mut connection = Connection::open(path).map_err(|error| error.to_string())?;
-    let transaction = connection
-        .transaction()
-        .map_err(|error| error.to_string())?;
-    transaction
-        .execute("UPDATE crawl_records SET id = -id", [])
-        .map_err(|error| error.to_string())?;
-    {
-        let mut update = transaction
-            .prepare("UPDATE crawl_records SET id = ?1 WHERE id = ?2")
+        self.identities
+            .execute(
+                "UPDATE comparison_record_ids SET inserted_id = ?1 WHERE saved_id = ?2",
+                params![inserted.id as i64, saved],
+            )
             .map_err(|error| error.to_string())?;
-        for (inserted, saved) in identities {
-            update
-                .execute(params![saved, -inserted])
-                .map_err(|error| error.to_string())?;
-        }
+        Ok(())
     }
-    transaction.commit().map_err(|error| error.to_string())?;
-    Ok(store)
+
+    fn finish(mut self) -> Result<SqliteStore, String> {
+        // Private IDs must move out of the way before restoring shuffled originals.
+        let transaction = self
+            .identities
+            .transaction()
+            .map_err(|error| error.to_string())?;
+        transaction
+            .execute_batch(
+                "UPDATE crawl_records SET id = -id;
+             UPDATE crawl_records SET id = (
+                 SELECT saved_id FROM comparison_record_ids WHERE inserted_id = -crawl_records.id
+             );
+             DROP TABLE comparison_record_ids;",
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(self.store)
+    }
+}
+
+fn read_archive_records(reader: impl Read, path: &Path) -> Result<SqliteStore, String> {
+    let mut stage = RecordStage::new(path)?;
+    let mut decoder = serde_json::Deserializer::from_reader(reader);
+    ArchiveRecordsSeed(&mut stage)
+        .deserialize(&mut decoder)
+        .map_err(|error| format!("invalid crawl archive: {error}"))?;
+    decoder
+        .end()
+        .map_err(|error| format!("invalid crawl archive: {error}"))?;
+    stage.finish()
+}
+
+struct ArchiveRecordsSeed<'a>(&'a mut RecordStage);
+
+impl<'de> DeserializeSeed<'de> for ArchiveRecordsSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: de::Deserializer<'de>>(self, decoder: D) -> Result<(), D::Error> {
+        decoder.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for ArchiveRecordsSeed<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a crawl archive object")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+        let mut version = None;
+        let mut records_seen = false;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "schemaVersion" => {
+                    if version.is_some() {
+                        return Err(de::Error::duplicate_field("schemaVersion"));
+                    }
+                    version = Some(map.next_value::<u32>()?);
+                }
+                "records" => {
+                    if records_seen {
+                        return Err(de::Error::duplicate_field("records"));
+                    }
+                    records_seen = true;
+                    map.next_value_seed(RecordSequenceSeed(self.0))?;
+                }
+                // Comparison has always ignored other archive sections, even when their
+                // values do not match the full-import schema. Skip without retaining them.
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let version = version.ok_or_else(|| de::Error::missing_field("schemaVersion"))?;
+        if !records_seen {
+            return Err(de::Error::missing_field("records"));
+        }
+        if version != crate::CRAWL_ARCHIVE_SCHEMA_VERSION {
+            return Err(de::Error::custom(format!(
+                "unsupported crawl archive schema version {version}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+struct RecordSequenceSeed<'a>(&'a mut RecordStage);
+
+impl<'de> DeserializeSeed<'de> for RecordSequenceSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: de::Deserializer<'de>>(self, decoder: D) -> Result<(), D::Error> {
+        decoder.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for RecordSequenceSeed<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an array of crawl records")
+    }
+
+    fn visit_seq<S: SeqAccess<'de>>(self, mut sequence: S) -> Result<(), S::Error> {
+        while let Some(record) = sequence.next_element::<CrawlRecord>()? {
+            self.0.insert(record).map_err(de::Error::custom)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +342,241 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn archive_records_reach_sqlite_before_eof_and_accept_metadata_after_rows() {
+        use std::io::Read;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct TinyReader {
+            bytes: std::io::Cursor<Vec<u8>>,
+            probe_after: u64,
+            database: std::path::PathBuf,
+            observed: Arc<AtomicBool>,
+        }
+        impl Read for TinyReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.bytes.position() >= self.probe_after
+                    && !self.observed.load(Ordering::Relaxed)
+                {
+                    let conn = Connection::open(&self.database).unwrap();
+                    let count: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM crawl_records", [], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(
+                        count, 1,
+                        "first row must be persisted while later JSON is unread"
+                    );
+                    assert!(self.bytes.position() < self.bytes.get_ref().len() as u64);
+                    self.observed.store(true, Ordering::Relaxed);
+                }
+                let size = buffer.len().min(7);
+                self.bytes.read(&mut buffer[..size])
+            }
+        }
+        let mut first = page(7);
+        first.id = 9;
+        let mut second = page(1);
+        second.id = 13;
+        let prefix = format!("{{\"records\":[{},", serde_json::to_string(&first).unwrap());
+        let bytes = format!(
+            "{prefix}{}],\"schemaVersion\":1,\"unused\":{{\"nested\":[1,2,3]}}}}",
+            serde_json::to_string(&second).unwrap()
+        )
+        .into_bytes();
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("baseline.sqlite3");
+        let observed = Arc::new(AtomicBool::new(false));
+        let store = read_archive_records(
+            TinyReader {
+                bytes: std::io::Cursor::new(bytes),
+                probe_after: prefix.len() as u64 + 40,
+                database: database.clone(),
+                observed: observed.clone(),
+            },
+            &database,
+        )
+        .unwrap();
+        assert!(observed.load(Ordering::Relaxed));
+        assert_eq!(
+            records(&store),
+            serde_json::to_value([second, first]).unwrap()
+        );
+        let connection = Connection::open(database).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'comparison_record_ids'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn late_archive_failures_remove_private_stage_and_leave_current_unchanged() {
+        let current = ActiveStore::memory();
+        current.upsert(page(8));
+        let before = serde_json::to_value(current.records()).unwrap();
+        let mut first = page(1);
+        first.id = 99;
+        let record = serde_json::to_string(&first).unwrap();
+        for document in [
+            format!("{{\"schemaVersion\":1,\"records\":[{record},"),
+            format!("{{\"schemaVersion\":1,\"records\":[{record}]}} trailing"),
+            format!("{{\"schemaVersion\":2,\"records\":[{record}]}}"),
+            format!("{{\"schemaVersion\":1,\"records\":[{record}],\"records\":[]}}"),
+            format!("{{\"schemaVersion\":1,\"records\":[{record}],\"schemaVersion\":1}}"),
+            format!("{{\"records\":[{record}]}}"),
+            "{\"schemaVersion\":1}".into(),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().to_path_buf();
+            assert!(
+                ComparisonSources::archive_reader(document.as_bytes(), &current, directory)
+                    .is_err()
+            );
+            assert!(!path.exists(), "failed private stage must be removed");
+            assert_eq!(serde_json::to_value(current.records()).unwrap(), before);
+        }
+        struct FailedReader<R>(R);
+        impl<R: Read> Read for FailedReader<R> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.read(buffer)? {
+                    0 => Err(std::io::Error::other("archive input failed before EOF")),
+                    count => Ok(count),
+                }
+            }
+        }
+        let document = format!("{{\"schemaVersion\":1,\"records\":[{record}]}}");
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_path_buf();
+        let error = ComparisonSources::archive_reader(
+            FailedReader(document.as_bytes()),
+            &current,
+            directory,
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("archive input failed before EOF"), "{error}");
+        assert!(!path.exists());
+        assert_eq!(serde_json::to_value(current.records()).unwrap(), before);
+    }
+
+    #[test]
+    fn archive_identity_extremes_and_late_storage_failure_keep_private_staging_safe() {
+        let current = ActiveStore::memory();
+        current.upsert(page(8));
+        let original = serde_json::to_value(current.records()).unwrap();
+        let mut first = page(7);
+        first.id = i64::MAX as u64;
+        let mut second = page(1);
+        second.id = 0;
+        let json = serde_json::to_vec(
+            &serde_json::json!({"schemaVersion": 1, "records": [first.clone(), second.clone()]}),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let sources =
+            ComparisonSources::archive_reader(json.as_slice(), &current, directory).unwrap();
+        assert_eq!(
+            records(&sources.baseline),
+            serde_json::to_value([second, first]).unwrap()
+        );
+        drop(sources);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_path_buf();
+        fs::write(path.join("current.sqlite3"), "not a database").unwrap();
+        assert!(ComparisonSources::archive_reader(json.as_slice(), &current, directory).is_err());
+        assert!(
+            !path.exists(),
+            "late current-store failure must remove the completed baseline too"
+        );
+        assert_eq!(serde_json::to_value(current.records()).unwrap(), original);
+        let mut overflow = page(1);
+        overflow.id = u64::MAX;
+        let json =
+            serde_json::to_vec(&serde_json::json!({"schemaVersion": 1, "records": [overflow]}))
+                .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_path_buf();
+        let error = ComparisonSources::archive_reader(json.as_slice(), &current, directory)
+            .err()
+            .unwrap();
+        assert!(error.contains("exceeds SQLite's range"), "{error}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    #[ignore = "isolated archive-staging RSS workload; run optimized outside browser/crawler benchmarks"]
+    fn archive_record_stream_workload() {
+        use serde::Deserialize;
+        use std::io::Write;
+        use std::time::Instant;
+        let count: usize = std::env::var("FF_ARCHIVE_RECORDS")
+            .ok()
+            .map(|value| value.parse().unwrap())
+            .unwrap_or(50_000);
+        assert!(count > 0 && count < u32::MAX as usize);
+        let mode = std::env::var("FF_ARCHIVE_MODE").unwrap_or_else(|_| "stream".into());
+        assert!(matches!(mode.as_str(), "snapshot" | "stream"));
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("source.ffcrawl.json");
+        let mut output = std::io::BufWriter::new(File::create(&archive).unwrap());
+        output
+            .write_all(b"{\"schemaVersion\":1,\"records\":[")
+            .unwrap();
+        for index in 0..count {
+            if index > 0 {
+                output.write_all(b",").unwrap();
+            }
+            let mut record = page(index as u32);
+            record.id = ((count - index) * 3) as u64;
+            serde_json::to_writer(&mut output, &record).unwrap();
+        }
+        output.write_all(b"]}").unwrap();
+        output.flush().unwrap();
+        drop(output);
+        let bytes = fs::metadata(&archive).unwrap().len();
+        let database = directory.path().join("baseline.sqlite3");
+        let started = Instant::now();
+        let reader = BufReader::new(File::open(&archive).unwrap());
+        let store = if mode == "snapshot" {
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ArchiveRecords {
+                schema_version: u32,
+                records: Vec<CrawlRecord>,
+            }
+            let decoded: ArchiveRecords = serde_json::from_reader(reader).unwrap();
+            assert_eq!(decoded.schema_version, 1);
+            // Matched baseline isolates whole-array hydration; identity staging is shared.
+            stage_records(decoded.records, &database).unwrap()
+        } else {
+            read_archive_records(reader, &database).unwrap()
+        };
+        let elapsed = started.elapsed();
+        let connection = Connection::open(&database).unwrap();
+        let actual: i64 = connection
+            .query_row("SELECT COUNT(*) FROM crawl_records", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(actual, count as i64);
+        let selected = ActiveStore::Sqlite(store)
+            .try_records_by_ids(&[3, (count * 3) as u64])
+            .unwrap();
+        assert_eq!(selected.len(), if count == 1 { 1 } else { 2 });
+        assert_eq!(selected[0].list_position, Some((count - 1) as u32));
+        assert_eq!(selected.last().unwrap().list_position, Some(0));
+        assert_eq!(selected[0].custom_extractions, page(0).custom_extractions);
+        eprintln!(
+            "archive_records mode={mode} rows={count} archive_bytes={bytes} stage_ms={:.3}",
+            elapsed.as_secs_f64() * 1000.0
+        );
     }
 
     #[test]
