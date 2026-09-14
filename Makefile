@@ -91,6 +91,14 @@ NATIVE_APP ?= target/release/ferrous-frog
 test-native: ## Run the Linux native desktop smoke (built app and WebDriver tools required).
 	node scripts/smoke-native.mjs --app "$(NATIVE_APP)"
 
+.PHONY: test-audit-reports
+test-audit-reports: ## Verify complete report and comparison packages directly from disk in Chrome.
+	@set -eu; report_check_dir=$$(mktemp -d); trap 'rm -rf "$$report_check_dir"' EXIT; \
+	FF_AUDIT_OFFLINE_FIXTURE_DIR="$$report_check_dir/report" cargo test -p ferrous-frog-export --locked portable_report_exports_every; \
+	node scripts/check-offline-audit-report.mjs "$$report_check_dir/report"; \
+	FF_AUDIT_COMPARISON_OFFLINE_FIXTURE_DIR="$$report_check_dir/comparison" cargo test -p ferrous-frog-export --locked comparison_package_streams_1205; \
+	node scripts/check-offline-audit-report.mjs "$$report_check_dir/comparison"
+
 BENCH_URLS ?= 1000000
 
 .PHONY: bench-synthetic
@@ -107,7 +115,7 @@ fmt-check: ## Check Rust formatting.
 
 .PHONY: verify ci
 verify: ci ## Run the same checks as GitHub Actions (Chrome required).
-ci: check-versions test-release fmt-check lint test build-web test-ui test-rendering ## Run all CI checks.
+ci: check-versions test-release fmt-check lint test build-web test-ui test-audit-reports test-rendering ## Run all CI checks.
 
 .PHONY: clean
 clean: ## Remove generated build outputs.

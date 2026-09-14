@@ -1,3 +1,19 @@
+pub mod audit_report;
+pub mod audit_report_comparison;
+pub use audit_report::{
+    AuditReportExportProgress, AuditReportManifest, AuditReportManifestFinding,
+    write_audit_report_evidence_csv, write_audit_report_package,
+    write_audit_report_package_with_annotations,
+};
+pub use audit_report_comparison::{
+    AuditComparisonManifest, AuditComparisonManifestFinding, write_audit_report_comparison_package,
+};
+
+#[cfg(test)]
+mod audit_report_comparison_tests;
+#[cfg(test)]
+mod audit_report_tests;
+
 use csv::Writer;
 use ferrous_frog_storage::{
     AuditThresholds, CrawlRecord, CrawlStore, CrawlSummary, GraphNode, GridQuery, GridResponse,
