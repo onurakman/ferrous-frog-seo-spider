@@ -1064,6 +1064,12 @@ pub enum IntegrationError {
     NotConfigured(String),
     #[error("provider request failed: {0}")]
     RequestFailed(String),
+    #[error("AI provider returned retryable HTTP {status}")]
+    Retryable {
+        status: u16,
+        /// Preserve the provider's requested delay; callers must not retry sooner.
+        retry_after_secs: Option<u64>,
+    },
     #[error("provider returned invalid data: {0}")]
     InvalidData(String),
 }
@@ -1233,6 +1239,7 @@ fn lighthouse_audit_numeric_value(lighthouse: &LighthouseResult, key: &str) -> O
 }
 
 pub mod llm;
+pub mod report_ai;
 
 #[cfg(test)]
 mod field_vitals_tests;

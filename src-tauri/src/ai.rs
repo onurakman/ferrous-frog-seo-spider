@@ -110,7 +110,7 @@ fn validate_settings(settings: &AiSettings) -> Result<AiSettings, String> {
     })
 }
 
-fn load_settings(app: &AppHandle) -> Result<AiSettings, String> {
+pub(super) fn load_settings(app: &AppHandle) -> Result<AiSettings, String> {
     let defaults = AiSettings::default();
     let provider = match get_integration_setting(app, PROVIDER_SETTING)?.as_deref() {
         Some("openAiCompatible") => LlmProvider::OpenAiCompatible,
@@ -150,6 +150,25 @@ fn store_settings(app: &AppHandle, settings: &AiSettings) -> Result<(), String> 
 
 fn keyring_entry() -> Result<Entry, KeyringError> {
     Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+}
+
+pub(super) fn load_api_key() -> Result<String, String> {
+    match keyring_entry().and_then(|entry| entry.get_password()) {
+        Ok(key) => validate_key(&key).map(str::to_string),
+        Err(KeyringError::NoEntry) => {
+            Err("Save an API key for the AI provider in Settings > AI".into())
+        }
+        Err(_) => Err("The OS credential store is unavailable. Unlock it and try again".into()),
+    }
+}
+
+impl AiState {
+    pub(super) fn admit_request(&self, limit: u32) -> Result<(), u64> {
+        let Ok(mut recent) = self.recent.lock() else {
+            return Err(60);
+        };
+        admit(&mut recent, limit, Instant::now())
+    }
 }
 
 fn validate_key(value: &str) -> Result<&str, String> {
@@ -335,11 +354,7 @@ where
         return Err("Stop or complete the active crawl before running AI tasks".into());
     }
     {
-        let mut recent = ai
-            .recent
-            .lock()
-            .map_err(|_| "AI rate limiter lock poisoned")?;
-        if let Err(wait) = admit(&mut recent, settings.requests_per_minute, Instant::now()) {
+        if let Err(wait) = ai.admit_request(settings.requests_per_minute) {
             return Err(format!(
                 "AI rate limit reached ({} per minute); wait {wait} s",
                 settings.requests_per_minute
@@ -438,18 +453,8 @@ pub async fn run_ai_task(
     let settings_app = app.clone();
     let (settings, api_key) = tauri::async_runtime::spawn_blocking(move || {
         let settings = load_settings(&settings_app)?;
-        let api_key = match keyring_entry().and_then(|entry| entry.get_password()) {
-            Ok(key) => validate_key(&key).map(str::to_string)?,
-            Err(KeyringError::NoEntry) => {
-                return Err("Save an API key for the AI provider in Settings > AI".to_string());
-            }
-            Err(_) => {
-                return Err(
-                    "The OS credential store is unavailable. Unlock it and try again".to_string(),
-                );
-            }
-        };
-        Ok((settings, api_key))
+        let api_key = load_api_key()?;
+        Ok::<_, String>((settings, api_key))
     })
     .await
     .map_err(|_| "AI settings worker failed")??;
@@ -575,8 +580,8 @@ mod tests {
                 Ok(LlmCompletion {
                     text: r#"{"intent":"informational","confidence":0.8,"rationale":"How-to content."}"#.into(),
                     model: "claude-opus-5".into(),
-                    input_tokens: 10,
-                    output_tokens: 5,
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
                 })
             },
         )
@@ -603,8 +608,8 @@ mod tests {
                     text: r#"{"draft":"Learn how it works in five minutes.","alternatives":[]}"#
                         .into(),
                     model: String::new(),
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    input_tokens: None,
+                    output_tokens: None,
                 })
             },
         )

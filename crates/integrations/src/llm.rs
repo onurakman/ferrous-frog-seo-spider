@@ -2,8 +2,9 @@
 //! provider; any OpenAI-compatible chat-completions endpoint can be selected instead.
 
 use crate::IntegrationError;
+use reqwest::header::RETRY_AFTER;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-5";
 pub const ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
@@ -35,8 +36,8 @@ pub struct LlmConfig {
 pub struct LlmCompletion {
     pub text: String,
     pub model: String,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 pub struct LlmClient {
@@ -127,11 +128,21 @@ impl LlmClient {
             ),
         };
         let _ = url;
-        let response = request
+        let mut response = request
             .send()
             .await
             .map_err(|error| IntegrationError::RequestFailed(error.without_url().to_string()))?;
         let status = response.status();
+        if status.as_u16() == 429 || status.is_server_error() {
+            return Err(IntegrationError::Retryable {
+                status: status.as_u16(),
+                retry_after_secs: response
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(retry_after_secs),
+            });
+        }
         if response
             .content_length()
             .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
@@ -140,14 +151,18 @@ impl LlmClient {
                 "AI response exceeds the 4 MiB limit".to_string(),
             ));
         }
-        let bytes = response
-            .bytes()
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|error| IntegrationError::InvalidData(error.without_url().to_string()))?;
-        if bytes.len() > MAX_RESPONSE_BYTES {
-            return Err(IntegrationError::InvalidData(
-                "AI response exceeds the 4 MiB limit".to_string(),
-            ));
+            .map_err(|error| IntegrationError::InvalidData(error.without_url().to_string()))?
+        {
+            if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+                return Err(IntegrationError::InvalidData(
+                    "AI response exceeds the 4 MiB limit".to_string(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
         }
         let payload: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
             IntegrationError::InvalidData(format!(
@@ -173,6 +188,11 @@ impl LlmClient {
 }
 
 fn parse_anthropic(payload: &serde_json::Value) -> Result<LlmCompletion, IntegrationError> {
+    if payload["stop_reason"].as_str() == Some("max_tokens") {
+        return Err(IntegrationError::InvalidData(
+            "The AI reply was truncated by its output token limit".into(),
+        ));
+    }
     if payload["stop_reason"].as_str() == Some("refusal") {
         let category = payload["stop_details"]["category"]
             .as_str()
@@ -197,12 +217,17 @@ fn parse_anthropic(payload: &serde_json::Value) -> Result<LlmCompletion, Integra
     Ok(LlmCompletion {
         text,
         model: payload["model"].as_str().unwrap_or_default().to_string(),
-        input_tokens: payload["usage"]["input_tokens"].as_u64().unwrap_or(0),
-        output_tokens: payload["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        input_tokens: payload["usage"]["input_tokens"].as_u64(),
+        output_tokens: payload["usage"]["output_tokens"].as_u64(),
     })
 }
 
 fn parse_openai(payload: &serde_json::Value) -> Result<LlmCompletion, IntegrationError> {
+    if payload["choices"][0]["finish_reason"].as_str() == Some("length") {
+        return Err(IntegrationError::InvalidData(
+            "The AI reply was truncated by its output token limit".into(),
+        ));
+    }
     let text = payload["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or_default()
@@ -215,9 +240,22 @@ fn parse_openai(payload: &serde_json::Value) -> Result<LlmCompletion, Integratio
     Ok(LlmCompletion {
         text,
         model: payload["model"].as_str().unwrap_or_default().to_string(),
-        input_tokens: payload["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
-        output_tokens: payload["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+        input_tokens: payload["usage"]["prompt_tokens"].as_u64(),
+        output_tokens: payload["usage"]["completion_tokens"].as_u64(),
     })
+}
+
+fn retry_after_secs(value: &str) -> Option<u64> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(seconds);
+    }
+    let when = httpdate::parse_http_date(value.trim()).ok()?;
+    let remaining = when.duration_since(SystemTime::now()).unwrap_or_default();
+    Some(
+        remaining
+            .as_secs()
+            .saturating_add(u64::from(remaining.subsec_nanos() != 0)),
+    )
 }
 
 /// Page evidence handed to prompts; `text` is already bounded by the caller.
@@ -427,6 +465,14 @@ mod tests {
         status: &'static str,
         body: &'static str,
     ) -> (String, tokio::task::JoinHandle<String>) {
+        serve_response(status, body.to_string(), String::new()).await
+    }
+
+    async fn serve_response(
+        status: &'static str,
+        body: String,
+        headers: String,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
@@ -449,7 +495,7 @@ mod tests {
                 }
             }
             let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes()).await;
@@ -493,7 +539,8 @@ mod tests {
         assert_eq!(body["system"], "system");
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["max_tokens"], 1024);
-        assert_eq!(completion.input_tokens, 120);
+        assert_eq!(completion.input_tokens, Some(120));
+        assert_eq!(completion.output_tokens, Some(30));
         assert_eq!(
             parse_intent(&completion.text).unwrap().intent,
             "informational"
@@ -528,13 +575,15 @@ mod tests {
             .unwrap()
             .complete("s", "u")
             .await
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
         server.await.unwrap();
-        assert!(
-            error.contains("HTTP 429") && error.contains("slow down"),
-            "{error}"
-        );
+        assert!(matches!(
+            error,
+            IntegrationError::Retryable {
+                status: 429,
+                retry_after_secs: None
+            }
+        ));
 
         let (base, server) = serve_json(
             "200 OK",
@@ -556,6 +605,8 @@ mod tests {
         let draft = parse_meta_description(&completion.text).unwrap();
         assert_eq!(draft.draft, "A concise description.");
         assert_eq!(draft.alternatives, vec!["Alt one"]);
+        assert_eq!(completion.input_tokens, Some(10));
+        assert_eq!(completion.output_tokens, Some(5));
         assert!(
             LlmClient::new(LlmConfig {
                 base_url: None,
@@ -570,6 +621,115 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn retryable_statuses_keep_provider_delays_without_parsing_or_echoing_error_bodies() {
+        for (status, expected_status, header, expected_delay) in [
+            ("429 Too Many Requests", 429, "Retry-After: 7\r\n", Some(7)),
+            (
+                "503 Service Unavailable",
+                503,
+                "Retry-After: 180\r\n",
+                Some(180),
+            ),
+            ("500 Internal Server Error", 500, "", None),
+        ] {
+            let (base, server) = serve_response(
+                status,
+                "not JSON; private provider detail".into(),
+                header.into(),
+            )
+            .await;
+            let error = LlmClient::new(config(LlmProvider::Anthropic, &base))
+                .unwrap()
+                .complete("s", "u")
+                .await
+                .unwrap_err();
+            server.await.unwrap();
+            assert!(
+                matches!(&error, IntegrationError::Retryable { status: code, retry_after_secs } if *code == expected_status && *retry_after_secs == expected_delay),
+                "{error}"
+            );
+            assert!(!error.to_string().contains("private provider detail"));
+        }
+
+        let date = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(20));
+        assert!((18..=20).contains(&retry_after_secs(&date).unwrap()));
+        assert_eq!(retry_after_secs("999999"), Some(999999));
+        assert_eq!(retry_after_secs("invalid"), None);
+
+        let (base, server) = serve_json("200 OK", "malformed JSON").await;
+        let error = LlmClient::new(config(LlmProvider::Anthropic, &base))
+            .unwrap()
+            .complete("s", "u")
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, IntegrationError::InvalidData(_)));
+    }
+
+    #[test]
+    fn unavailable_usage_is_distinct_from_a_measured_zero() {
+        let missing = serde_json::json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]
+        });
+        let completion = parse_openai(&missing).unwrap();
+        assert_eq!(
+            (completion.input_tokens, completion.output_tokens),
+            (None, None)
+        );
+        let measured = serde_json::json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "{}"}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0}
+        });
+        let completion = parse_openai(&measured).unwrap();
+        assert_eq!(
+            (completion.input_tokens, completion.output_tokens),
+            (Some(0), Some(0))
+        );
+    }
+
+    #[test]
+    fn truncated_completions_cannot_be_saved_as_successful_results() {
+        let anthropic = serde_json::json!({
+            "stop_reason": "max_tokens", "content": [{"type": "text", "text": "{}"}]
+        });
+        assert!(parse_anthropic(&anthropic).is_err());
+        let compatible = serde_json::json!({
+            "choices": [{"finish_reason": "length", "message": {"content": "{}"}}]
+        });
+        assert!(parse_openai(&compatible).is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_length_responses_stop_reading_at_the_byte_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            let _ = stream.read(&mut request).await;
+            let body = vec![b'x'; MAX_RESPONSE_BYTES + 1];
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+            let _ = stream.write_all(b"\r\n").await;
+            // A size rejection must not wait for the provider to finish its response.
+            let _ = wait.await;
+        });
+        let client = LlmClient::new(config(LlmProvider::Anthropic, &base)).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), client.complete("s", "u")).await;
+        let _ = release.send(());
+        server.await.unwrap();
+        let error = result
+            .expect("must reject before the response ends")
+            .unwrap_err();
+        assert!(error.to_string().contains("4 MiB"), "{error}");
     }
 
     #[test]
