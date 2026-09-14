@@ -1022,13 +1022,13 @@ where
     if control.is_cancelled() {
         let saved = config
             .resume_from_state
-            .then(|| store.load_frontier_state())
+            .then(|| store.frontier_summary())
             .flatten();
         let stopped = progress(
             "stopped",
             saved.as_ref().map_or(0, |state| state.crawled),
-            saved.as_ref().map_or(0, |state| state.queued.len()),
-            saved.as_ref().map_or(0, |state| state.seen.len()),
+            saved.as_ref().map_or(0, |state| state.queued),
+            saved.as_ref().map_or(0, |state| state.seen),
             started_at,
             &store,
         );
@@ -1084,6 +1084,7 @@ where
     let mut active_items = HashMap::<String, QueueItem>::new();
     let mut content_fingerprints = Vec::new();
     save_frontier_state(&store, &queue, &active_items, &seen, crawled);
+    let mut frontier_needs_checkpoint = false;
 
     on_event(CrawlerEvent::started(progress(
         "running",
@@ -1163,8 +1164,8 @@ where
                 Err(error) => {
                     if !control.is_cancelled() {
                         active_items.remove(&item_key);
+                        store.update_frontier_state(&item_key, Vec::new(), &[], crawled);
                     }
-                    save_frontier_state(&store, &queue, &active_items, &seen, crawled);
                     if control.is_cancelled() && error.to_string() == CRAWL_CANCELLED_MESSAGE {
                         continue;
                     }
@@ -1175,6 +1176,8 @@ where
 
             let previous_queue_len = queue.len();
             let mut frontier_sitemap_urls = Vec::new();
+            // Stop during linked sitemap discovery can leave uncommitted additions.
+            frontier_needs_checkpoint = true;
             let mut record = output.record;
             record.classification = if Url::parse(&record.final_url)
                 .is_ok_and(|url| host_is_internal(&url, &root_url, &config))
@@ -1399,6 +1402,7 @@ where
                 &frontier_sitemap_urls,
                 crawled,
             );
+            frontier_needs_checkpoint = false;
             on_event(CrawlerEvent::record(
                 record,
                 progress(
@@ -1420,7 +1424,7 @@ where
     };
     if status == "finished" && queue.is_empty() && active_items.is_empty() {
         store.clear_frontier_state();
-    } else {
+    } else if frontier_needs_checkpoint {
         save_frontier_state(&store, &queue, &active_items, &seen, crawled);
     }
     let final_progress = progress(status, crawled, queue.len(), seen.len(), started_at, &store);
@@ -11886,6 +11890,259 @@ mod tests {
             Some("Completed after resume")
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_reuses_the_last_durable_frontier_without_another_database_write() {
+        use ferrous_frog_storage::SqliteStore;
+
+        for stop_event in ["started", "record"] {
+            let (base_url, _, server) = spawn_recording_site(|_| {
+                response(200, "OK", "text/html", "<a href='/pending'>Next page</a>")
+            })
+            .await;
+            let directory = std::env::temp_dir().join(format!(
+                "ferrous-frog-stop-checkpoint-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let database = directory.join("crawl.sqlite3");
+            let store = SqliteStore::open(&database).unwrap();
+            let observer = Arc::new(std::sync::Mutex::new(
+                rusqlite::Connection::open(&database).unwrap(),
+            ));
+            let before_stop = Arc::new(std::sync::Mutex::new(None));
+            let callback_observer = observer.clone();
+            let callback_state = before_stop.clone();
+            let callback_store = store.clone();
+            let control = CrawlControl::default();
+            let callback_control = control.clone();
+            let config = CrawlConfig {
+                start_url: base_url,
+                concurrency: 1,
+                requests_per_second: 0,
+                request_delay_ms: 0,
+                respect_robots: false,
+                sitemap: SitemapConfig {
+                    enabled: false,
+                    ..SitemapConfig::default()
+                },
+                ..CrawlConfig::default()
+            };
+            let stopped = crawl(config.clone(), store.clone(), control, move |event| {
+                if event.kind == stop_event {
+                    let version: i64 = callback_observer
+                        .lock()
+                        .unwrap()
+                        .query_row("PRAGMA data_version", [], |row| row.get(0))
+                        .unwrap();
+                    *callback_state.lock().unwrap() = Some((
+                        version,
+                        callback_store.try_load_frontier_state().unwrap().unwrap(),
+                    ));
+                    callback_control.cancel();
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(stopped.status, "stopped");
+            let (before_version, saved) = before_stop.lock().unwrap().take().unwrap();
+            let after_version: i64 = observer
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA data_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                before_version, after_version,
+                "Stop must reuse the durable checkpoint after {stop_event}"
+            );
+            drop(store);
+            let reopened = SqliteStore::open(&database).unwrap();
+            assert_eq!(reopened.try_load_frontier_state().unwrap(), Some(saved));
+            let resumed = crawl(
+                CrawlConfig {
+                    resume_from_state: true,
+                    ..config
+                },
+                reopened.clone(),
+                CrawlControl::default(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(resumed.status, "finished");
+            assert_eq!(resumed.crawled, 2);
+            assert!(reopened.try_load_frontier_state().unwrap().is_none());
+            drop(reopened);
+            drop(observer);
+            server.abort();
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_during_linked_sitemaps_preserves_partial_discoveries_for_resume() {
+        use ferrous_frog_storage::{ActiveStore, SqliteStore};
+
+        for store in [
+            ActiveStore::memory(),
+            ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+        ] {
+            let control = CrawlControl::default();
+            let server_control = control.clone();
+            let (base_url, _, server) = spawn_recording_site(move |path| match path {
+                "/" => response(
+                    200,
+                    "OK",
+                    "text/html",
+                    "<link rel='sitemap' href='/first.xml'><link rel='sitemap' href='/second.xml'>",
+                ),
+                "/first.xml" => response(
+                    200,
+                    "OK",
+                    "application/xml",
+                    "<urlset><url><loc>/pending</loc></url></urlset>",
+                ),
+                "/second.xml" => {
+                    server_control.cancel();
+                    response(200, "OK", "application/xml", "<urlset/>")
+                }
+                _ => response(200, "OK", "text/html", "<title>Resumed page</title>"),
+            })
+            .await;
+            let config = CrawlConfig {
+                start_url: base_url.clone(),
+                concurrency: 1,
+                requests_per_second: 0,
+                request_delay_ms: 0,
+                respect_robots: false,
+                sitemap: SitemapConfig {
+                    enabled: true,
+                    discover_from_robots: false,
+                    probe_default: false,
+                    follow_linked: true,
+                    ..SitemapConfig::default()
+                },
+                ..CrawlConfig::default()
+            };
+            let stopped = crawl(config.clone(), store.clone(), control, |_| {})
+                .await
+                .unwrap();
+            assert_eq!(stopped.status, "stopped");
+            assert_eq!(stopped.crawled, 0);
+            let saved = store.load_frontier_state().unwrap();
+            assert_eq!(saved.queued.len(), 2);
+            assert_eq!(saved.seen.len(), 2);
+            assert!(saved.queued.iter().any(|item| item.url == base_url));
+            assert!(
+                saved
+                    .queued
+                    .iter()
+                    .any(|item| item.url == format!("{base_url}pending") && item.from_sitemap)
+            );
+            let resumed = crawl(
+                CrawlConfig {
+                    resume_from_state: true,
+                    ..config
+                },
+                store.clone(),
+                CrawlControl::default(),
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(resumed.crawled, 2);
+            assert!(store.load_frontier_state().is_none());
+            assert!(
+                store
+                    .records()
+                    .iter()
+                    .any(|record| record.url == format!("{base_url}pending") && record.in_sitemap)
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "measures Stop with a synthetic 100,000-seen frontier and no HTTP requests"]
+    async fn large_frontier_stop_workload() {
+        use ferrous_frog_storage::{ActiveStore, SqliteStore};
+
+        let seen_count = std::env::var("FERROUS_STOP_SEEN")
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(100_000);
+        assert!(seen_count >= 500);
+        let state = CrawlFrontierState {
+            queued: (0..500)
+                .map(|index| {
+                    let url = format!("https://example.invalid/page/{index:07}");
+                    CrawlFrontierItem {
+                        storage_key: url.clone(),
+                        url,
+                        depth: 1,
+                        from_sitemap: index % 2 == 0,
+                        list_position: None,
+                        list_duplicate_index: 0,
+                    }
+                })
+                .collect(),
+            seen: (0..seen_count)
+                .map(|index| format!("https://example.invalid/page/{index:07}"))
+                .collect(),
+            crawled: seen_count - 500,
+        };
+        for (name, store) in [
+            ("memory", ActiveStore::memory()),
+            (
+                "sqlite",
+                ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+            ),
+        ] {
+            let mut milliseconds = Vec::new();
+            for _ in 0..7 {
+                store.save_frontier_state(state.clone());
+                let control = CrawlControl::default();
+                let callback_control = control.clone();
+                let stopped_at = Arc::new(std::sync::Mutex::new(None));
+                let callback_time = stopped_at.clone();
+                let stopped = crawl(
+                    CrawlConfig {
+                        start_url: state.queued[0].url.clone(),
+                        resume_from_state: true,
+                        max_urls: seen_count + 1,
+                        respect_robots: false,
+                        sitemap: SitemapConfig {
+                            enabled: false,
+                            ..SitemapConfig::default()
+                        },
+                        ..CrawlConfig::default()
+                    },
+                    store.clone(),
+                    control,
+                    move |event| {
+                        if event.kind == "started" {
+                            *callback_time.lock().unwrap() = Some(Instant::now());
+                            callback_control.cancel();
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+                let elapsed = stopped_at.lock().unwrap().unwrap().elapsed();
+                milliseconds.push(elapsed.as_secs_f64() * 1000.0);
+                assert_eq!(stopped.status, "stopped");
+                assert_eq!(store.load_frontier_state(), Some(state.clone()));
+            }
+            milliseconds.sort_by(f64::total_cmp);
+            eprintln!(
+                "frontier_stop backend={name} seen={seen_count} queued=500 median_ms={:.3} range_ms={:.3}..{:.3}",
+                milliseconds[3], milliseconds[0], milliseconds[6]
+            );
+        }
     }
 
     #[tokio::test]

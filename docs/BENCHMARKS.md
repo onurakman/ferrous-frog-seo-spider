@@ -211,7 +211,7 @@ This comparison predates the incremental completion updates below; at this stage
 cargo test --release --locked -p ferrous-frog-storage sqlite_incremental_frontier_workload -- --ignored --nocapture
 ```
 
-Measured on 2026-09-14. Ordinary crawler completions now delete the completed storage key, append newly discovered queue entries and seen keys, update affected sitemap flags, and save the completed count in one SQLite transaction. Pending order and separate List identities remain intact. Startup, Stop and worker-error checkpoints retain full replacement. Memory mutates its saved state in place, but still scans the queue and sorts seen keys when discoveries are added.
+Measured on 2026-09-14. Ordinary crawler completions now delete the completed storage key, append newly discovered queue entries and seen keys, update affected sitemap flags, and save the completed count in one SQLite transaction. Pending order and separate List identities remain intact. At this measurement, startup, Stop and worker-error checkpoints retained full replacement; the later [Stop workload](#stopping-without-replacing-the-durable-frontier) covers removal of ordinary Stop and worker-error snapshots. Memory mutates its saved state in place, but still scans the queue and sorts seen keys when discoveries are added.
 
 The ignored storage workload compares the full-save and update APIs in the same optimized build. Each in-memory SQLite case warms a frontier, then times seven one-completion/one-discovery checkpoints; preparation, full snapshot cloning and verification are excluded. Both paths finish with the same queue, seen set and counter. The full-save path includes the new URL index used for sitemap-flag updates.
 
@@ -234,7 +234,26 @@ The unchanged 1,000-page HTTP fixture was also measured in three serial before/a
 
 SQLite medians fell another 16–17% in this fixture. Every run verified 1,030 records, 7,110 edges, 1,031 uninterrupted or 1,039 interrupted HTTP requests, robots/scope exclusions and preservation of completed IDs. The task-abort regression also checks late linked-sitemap flags on an active sibling and newly queued work, including SQLite reopening without a final Stop snapshot.
 
-These measurements do not bound whole-crawl cost: progress summaries and other record/edge operations still grow with the dataset. Larger mixed sites, concurrent UI queries, initial/Stop snapshot hydration and broader disk/memory measurements remain open.
+These measurements do not bound whole-crawl cost: progress summaries and other record/edge operations still grow with the dataset. Larger mixed sites, concurrent UI queries, initial and interrupted-discovery snapshot hydration and broader disk/memory measurements remain open.
+
+## Stopping Without Replacing The Durable Frontier
+
+```bash
+cargo test --locked -p ferrous-frog-crawler-core large_frontier_stop_workload -- --ignored --nocapture
+```
+
+Measured on 2026-09-14 in the unoptimized test build. The scheduler already saves waiting and active entries at startup and updates the durable frontier after each completed item. Ordinary Stop now reuses that state. Worker errors remove their completed key incrementally; Stop during linked-sitemap discovery still writes a full checkpoint to preserve additions and sitemap flags collected before cancellation. Cancellation while loading initial sitemaps reads saved counts without hydrating the queue.
+
+The synthetic workload holds 500 pending URLs, 100,000 seen URLs and no crawl records or edges. It resumes and cancels synchronously at the `started` callback, before dispatching any HTTP request. Each backend runs seven trials. Timing starts at cancellation and ends after the crawl future returns, including scheduler cleanup; fixture construction, startup hydration/normalization/checkpointing and assertions are excluded. Both backends retain the identical complete frontier. SQLite is in memory. The before build differs only by retaining the full final checkpoint for Stop; the after build skips it.
+
+| Backend | Before median (range) | After median (range) |
+| --- | ---: | ---: |
+| Memory | 97.287 ms (87.917–107.809) | 8.580 ms (6.131–10.142) |
+| SQLite | 274.708 ms (265.670–304.188) | 9.233 ms (8.764–11.307) |
+
+These are one local before/after batch during development verification, not an isolated system-load experiment or optimized release/physical-disk latency guarantees. Dropping the scheduler's queue and seen set still costs time proportional to their size. Active network cancellation, populated-record progress summaries, concurrent UI queries and peak memory are outside this workload. Set `FERROUS_STOP_SEEN` to at least 500 to repeat at another size.
+
+The ordinary `stop_` regressions verify `PRAGMA data_version` remains unchanged after cancellation at startup or after a completed record, then reopen the SQLite file and resume to completion. A separate Memory/SQLite fixture cancels the second linked sitemap and verifies the first sitemap's pending URL and membership survive and complete on resume. Existing worker-completion races, request cancellation and List/reference recovery checks also pass.
 
 ## Recovery Counts Without Frontier Hydration
 
@@ -257,7 +276,7 @@ SQLite hydration ranges were 6.585–7.193 ms and 71.460–73.247 ms; counts-onl
 
 Run the focused correctness checks with `cargo test --locked -p ferrous-frog-storage frontier_summary`. They cover separate List occurrences, pending/seen-only/empty states, incremental changes, clear, external commits, rollback, reopening and existing completed-counter defaults. A deterministic guard puts invalid values in unused queue and seen fields: full hydration fails, while the summary and ActiveStore forwarding return correct counts. Missing storage tables still produce an error rather than an empty recovery state. Custom storage implementations retain a default method based on their existing snapshot API.
 
-This change does not alter scheduler startup, Stop or worker-error checkpoint persistence, resume normalization, record summaries or event frequency. SQLite counts still traverse database pages as needed. Physical-disk behavior, concurrent ingestion/UI queries, total Stop latency, memory peaks and broader frontier hardening remain unmeasured here.
+This counts-only change did not alter scheduler checkpoint persistence, resume normalization, record summaries or event frequency; subsequent Stop changes are measured separately above. SQLite counts still traverse database pages as needed. Physical-disk behavior, concurrent ingestion/UI queries, total Stop latency, memory peaks and broader frontier hardening remain unmeasured here.
 
 ## Paged Sitemap Validation
 
