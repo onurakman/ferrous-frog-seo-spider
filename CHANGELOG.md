@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/onurakman/ferrous-frog-seo-spider/compare/v0.5.0...v0.5.1) (2026-09-20)
+
+
+### Bug Fixes
+
+* **deps:** format digests without LowerHex after sha2/md-5 0.11 bump ([cb46e70](https://github.com/onurakman/ferrous-frog-seo-spider/commit/cb46e70094329436a01b19cea82e538bbf1629f3))
+
 ## [0.5.0](https://github.com/onurakman/ferrous-frog-seo-spider/compare/v0.4.0...v0.5.0) (2026-09-14)
 
 
