@@ -13,7 +13,10 @@ const MAX_OVERVIEW_BYTES: usize = 16 * 1024;
 /// Stable version/input identity; raw prompt text need not be persisted with annotations.
 pub fn report_input_digest(input: &str) -> String {
     use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(input.as_bytes()))
+    Sha256::digest(input.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -3342,7 +3342,10 @@ fn request_uri(url: &Url) -> String {
 
 fn md5_hex(input: &str) -> String {
     use md5::Digest as _;
-    format!("{:x}", md5::Md5::digest(input.as_bytes()))
+    md5::Md5::digest(input.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Parses `key=value` and `key="quoted"` pairs from a WWW-Authenticate challenge.
