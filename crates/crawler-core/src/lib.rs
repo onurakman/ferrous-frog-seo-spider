@@ -2903,6 +2903,8 @@ async fn fetch_one(
                 .map(|_| parse_html_with_content(&current_url, &raw_html, &content_selectors));
             let html = rendered_html.as_deref().unwrap_or(&raw_html);
             let signals = parse_html_with_content(&current_url, html, &content_selectors);
+            record.amp_document = Some(raw_signals.as_ref().unwrap_or(&signals).amp_document);
+            record.html_doctype = Some(raw_signals.as_ref().unwrap_or(&signals).html_doctype);
             if let Some(raw_signals) = raw_signals.as_ref() {
                 apply_rendered_dom_diff(&mut record, raw_signals, &signals);
             }
@@ -2958,6 +2960,7 @@ async fn fetch_one(
             record.insecure_form_count = signals.insecure_form_count;
             record.viewport = signals.viewport;
             record.amphtml = signals.amphtml;
+            record.amphtml_targets = Some(signals.amphtml_targets);
             record.meta_keywords = signals.meta_keywords;
             record.rel_next = signals.rel_next;
             record.rel_prev = signals.rel_prev;
@@ -4067,6 +4070,9 @@ fn status_record(
         x_content_type_options_header,
         viewport: false,
         amphtml: None,
+        amphtml_targets: None,
+        amp_document: None,
+        html_doctype: None,
         rel_next: None,
         rel_prev: None,
         rel_next_targets: None,
@@ -4194,6 +4200,9 @@ fn error_record(
         x_content_type_options_header: false,
         viewport: false,
         amphtml: None,
+        amphtml_targets: None,
+        amp_document: None,
+        html_doctype: None,
         rel_next: None,
         rel_prev: None,
         rel_next_targets: None,
@@ -4312,6 +4321,9 @@ fn blocked_record(url: &Url, depth: usize, root_url: &Url) -> CrawlRecord {
         x_content_type_options_header: false,
         viewport: false,
         amphtml: None,
+        amphtml_targets: None,
+        amp_document: None,
+        html_doctype: None,
         rel_next: None,
         rel_prev: None,
         rel_next_targets: None,
@@ -4466,7 +4478,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_metadata_counts_reach_records_only_when_html_was_parsed() {
         let (base_url, _, server) = spawn_recording_site(|path| match path {
-            "/multiple" => response(200, "OK", "text/html", "<title>First</title><title>Second</title><meta name=description content='First description'><meta name=description content='Second description'>"),
+            "/multiple" => response(200, "OK", "text/html", "<html amp><title>First</title><title>Second</title><meta name=description content='First description'><meta name=description content='Second description'>"),
             "/zero" => response(200, "OK", "text/html", "<p>No metadata</p>"),
             "/image" => response(200, "OK", "image/png", "image bytes"),
             _ => response(200, "OK", "text/html", &"a".repeat(2048)),
@@ -4507,6 +4519,15 @@ mod tests {
             let row = rows.iter().find(|row| row.url.ends_with(path)).unwrap();
             let value = serde_json::to_value(row).unwrap();
             assert_eq!(value["titleCount"], expected, "{path}");
+            assert_eq!(
+                value["ampDocument"],
+                match path {
+                    "multiple" => serde_json::json!(true),
+                    "zero" => serde_json::json!(false),
+                    _ => serde_json::Value::Null,
+                },
+                "{path}"
+            );
             assert_eq!(value["metaDescriptionCount"], expected, "{path}");
             if path == "multiple" {
                 assert_eq!(row.title.as_deref(), Some("First"));
@@ -5723,7 +5744,7 @@ mod tests {
         use ferrous_frog_storage::{ActiveStore, PageReferenceQuery};
 
         let (base_url, requests, server) = spawn_recording_site(|_| {
-            response(200, "OK", "text/html", "<head><meta name='robots' content='nofollow'><link rel='canonical' href='/canonical?keep=1'><link rel='alternate' hreflang='en' href='/english'><link rel='next' href='/next'><link rel='amphtml' href='/amp'><meta http-equiv='refresh' content='0; url=/refresh'></head><body><iframe src='/frame'></iframe><a href='/ordinary'>Ordinary</a></body>")
+            response(200, "OK", "text/html", "<head><meta name='robots' content='nofollow'><link rel='canonical' href='/canonical?keep=1'><link rel='alternate' hreflang='en' href='/english'><link rel='next' href='/next'><link rel='amphtml' href='/amp'><link rel='AMPHTML' href='/later-amp'><link rel='amphtml' href='/amp'><meta http-equiv='refresh' content='0; url=/refresh'></head><body><iframe src='/frame'></iframe><a href='/ordinary'>Ordinary</a></body>")
                 .replacen("Content-Type:", "Link: </header>; rel=canonical\r\nContent-Type:", 1)
         }).await;
         let kinds = [
@@ -5784,11 +5805,13 @@ mod tests {
                         && mode == CrawlMode::Spider
                         && folder_scope != FolderScope::ExactUrl;
                     let expected = if forced {
-                        7
+                        9
                     } else if selected == "none" {
                         0
                     } else if selected == "canonical" {
                         2
+                    } else if selected == "amp" {
+                        3
                     } else {
                         1
                     };
@@ -5822,6 +5845,14 @@ mod tests {
                         );
                         assert_eq!(row.rel_prev_targets.as_ref().unwrap(), &[] as &[String]);
                         assert!(row.amphtml.as_deref().unwrap().ends_with("/amp"));
+                        assert_eq!(
+                            serde_json::to_value(&row).unwrap()["amphtmlTargets"],
+                            serde_json::json!([
+                                format!("{base_url}amp"),
+                                format!("{base_url}later-amp"),
+                                format!("{base_url}amp")
+                            ])
+                        );
                         assert_eq!(row.indexability_status, "Canonicalized");
                         assert_eq!(row.outlink_count, 1);
                     }
@@ -8543,7 +8574,7 @@ mod tests {
             let (status, content_type, body, headers) = match path {
                 "/file.pdf" => (200, "application/pdf", "%PDF-fixture", "Link: </download>; rel=alternate, </canonical>; title=\"A, B\"; rel=canonical\r\n"),
                 "/html" => (200, "text/html", "<link rel='canonical' href='/html'>", "Link: </different>; rel=canonical\r\n"),
-                "/self" => (200, "text/html", "<title>Self</title>", "Link: </self>; rel=canonical\r\n"),
+                "/self" => (200, "text/html", "<!doctype html><title>Self</title>", "Link: </self>; rel=canonical\r\n"),
                 "/repeated" => (200, "application/pdf", "%PDF-fixture", "Link: </one>; rel=canonical\r\nLink: </two>; rel=canonical\r\n"),
                 _ => (404, "text/html", "Missing", "Link: </canonical>; rel=canonical\r\n"),
             };
@@ -8578,7 +8609,12 @@ mod tests {
             Some(format!("{base_url}canonical"))
         );
         assert_eq!(row("file.pdf").indexability_status, "Canonicalized");
+        assert_eq!(row("file.pdf").amphtml_targets, None);
+        assert_eq!(row("file.pdf").html_doctype, None);
         assert_eq!(row("html").canonical, Some(format!("{base_url}html")));
+        assert_eq!(row("html").amphtml_targets.as_deref(), Some(&[][..]));
+        assert_eq!(row("html").html_doctype, Some(false));
+        assert_eq!(row("self").html_doctype, Some(true));
         assert_eq!(row("html").canonical_count, 2);
         assert_eq!(row("self").indexability, "Indexable");
         assert_eq!(row("repeated").canonical_count, 2);
@@ -8592,6 +8628,7 @@ mod tests {
         let (base_url, _, server) = spawn_recording_site(|path| {
             if path == "/" {
                 response(200, "OK", "text/html", r#"<html><head><title>Raw</title></head><body><main>Selected content</main><script>
+                    document.documentElement.setAttribute('amp', '');
                     for (const [rel, href] of [['canonical', '/canonical'], ['alternate', '/language'], ['next', '/next'], ['amphtml', '/amp']]) {
                         const link = document.createElement('link'); link.rel = rel; link.href = href;
                         if (rel === 'alternate') link.hreflang = 'en';
@@ -8599,6 +8636,8 @@ mod tests {
                     }
                 </script></body></html>"#)
                     .replacen("Content-Type:", "Link: </http-canonical>; rel=canonical\r\nContent-Type:", 1)
+            } else if path == "/amp" {
+                response(200, "OK", "text/html", "<!doctype html><html amp><head><script>document.documentElement.removeAttribute('amp')</script></head><body><main>AMP target</main></body></html>")
             } else {
                 response(200, "OK", "text/plain", "Target")
             }
@@ -8636,6 +8675,27 @@ mod tests {
         }
         let root = records.iter().find(|row| row.url == base_url).unwrap();
         assert!(root.js_rendered);
+        assert_eq!(
+            root.amp_document,
+            Some(false),
+            "rendered additions are not authored AMP evidence"
+        );
+        let amp = records
+            .iter()
+            .find(|row| row.url == format!("{base_url}amp"))
+            .unwrap();
+        assert!(amp.js_rendered);
+        assert_eq!(root.html_doctype, Some(false));
+        assert_eq!(
+            amp.html_doctype,
+            Some(true),
+            "rendered outerHTML omits doctype; preserve HTTP evidence"
+        );
+        assert_eq!(
+            amp.amp_document,
+            Some(true),
+            "rendered removal cannot erase the HTTP marker"
+        );
         assert_eq!(root.word_count, 2);
         assert_eq!(root.canonical_count, 2);
         assert_eq!(root.hreflang_count, 1);

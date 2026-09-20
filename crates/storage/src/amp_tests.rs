@@ -12,6 +12,30 @@ fn page(path: &str, amp: Option<&str>) -> CrawlRecord {
     row
 }
 
+#[test]
+fn amp_document_marker_preserves_measured_true_false_and_legacy_unknown() {
+    for store in [
+        ActiveStore::memory(),
+        ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+    ] {
+        for marker in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::Value::Null,
+        ] {
+            let mut value = serde_json::to_value(page("marker", None)).unwrap();
+            value["ampDocument"] = marker.clone();
+            store.upsert(serde_json::from_value(value).unwrap());
+            let restored = serde_json::to_value(&store.records()[0]).unwrap();
+            assert_eq!(restored["ampDocument"], marker);
+        }
+        let mut legacy = serde_json::to_value(page("legacy-marker", None)).unwrap();
+        legacy.as_object_mut().unwrap().remove("ampDocument");
+        let restored: CrawlRecord = serde_json::from_value(legacy).unwrap();
+        assert!(serde_json::to_value(restored).unwrap()["ampDocument"].is_null());
+    }
+}
+
 fn query() -> GridQuery {
     GridQuery {
         view: serde_json::from_value(serde_json::json!("ampToError"))
@@ -28,6 +52,235 @@ fn reciprocity_query() -> GridQuery {
         sort_by: Some("url".into()),
         ..GridQuery::default()
     }
+}
+
+fn marker_query() -> GridQuery {
+    GridQuery {
+        view: serde_json::from_value(serde_json::json!("ampTargetMissingMarker"))
+            .expect("AMP target marker audit must be supported"),
+        sort_by: Some("url".into()),
+        ..GridQuery::default()
+    }
+}
+
+#[test]
+fn amp_target_missing_marker_requires_measured_complete_html_and_checks_every_declaration() {
+    for store in [
+        ActiveStore::memory(),
+        ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+    ] {
+        let mut missing = page("missing-marker", None);
+        missing.amp_document = Some(false);
+        let mut present = page("present-marker", None);
+        present.amp_document = Some(true);
+        let mut later = page("later-source", Some("present-marker"));
+        later.amphtml_targets = Some(vec![
+            url("present-marker"),
+            url("missing-marker#section"),
+            url("missing-marker"),
+        ]);
+        let mut repeated = later.clone();
+        repeated.storage_key = "list:9:later-source".into();
+        repeated.list_position = Some(9);
+        let mut empty = page("empty-source", Some("missing-marker"));
+        empty.amphtml_targets = Some(vec![]);
+        let mut redirect = page("redirect-target", None);
+        redirect.final_url = url("redirect-final");
+        redirect.amp_document = Some(false);
+        redirect.redirect_chain.push(RedirectHop {
+            url: url("redirect-target"),
+            status_code: 301,
+            location: Some(url("redirect-final")),
+            dns_lookup_time_ms: None,
+            tcp_connect_time_ms: None,
+            tls_handshake_time_ms: None,
+            ttfb_ms: None,
+            elapsed_ms: None,
+        });
+        for row in [
+            missing,
+            present,
+            page("unknown-marker", None),
+            later,
+            repeated,
+            empty,
+            page("legacy-source", Some("missing-marker")),
+            page("present-source", Some("present-marker")),
+            page("unknown-source", Some("unknown-marker")),
+            page("unseen-source", Some("not-crawled")),
+            redirect,
+            page("redirect-source", Some("redirect-target")),
+            page("final-source", Some("redirect-final")),
+        ] {
+            store.upsert(row);
+        }
+        // Ineligible sources and targets cannot turn missing/stale marker data into evidence.
+        for state in [
+            "pending",
+            "blocked",
+            "failed",
+            "incomplete",
+            "non-html",
+            "redirect-only",
+        ] {
+            let mut target = page(&format!("{state}-target"), None);
+            target.amp_document = Some(false);
+            let mut source = page(&format!("{state}-source"), Some("missing-marker"));
+            for row in [&mut target, &mut source] {
+                match state {
+                    "pending" => row.status_code = None,
+                    "blocked" => {
+                        row.status_code = None;
+                        row.error = Some("Blocked by robots.txt".into());
+                    }
+                    "failed" => row.status_code = Some(500),
+                    "incomplete" => row.indexability_status = "Response body incomplete".into(),
+                    "non-html" => row.content_type = Some("image/png".into()),
+                    "redirect-only" => row.status_code = Some(302),
+                    _ => unreachable!(),
+                }
+            }
+            store.upsert(page(
+                &format!("source-of-{state}"),
+                Some(&format!("{state}-target")),
+            ));
+            store.upsert(target);
+            store.upsert(source);
+        }
+        let response = store.query(marker_query());
+        assert_eq!(
+            response
+                .rows
+                .iter()
+                .map(|row| row.url.clone())
+                .collect::<Vec<_>>(),
+            [
+                "final-source",
+                "later-source",
+                "later-source",
+                "legacy-source",
+                "redirect-source"
+            ]
+            .map(url)
+        );
+        assert_eq!(response.total, 5);
+        assert_eq!(
+            serde_json::to_value(response.summary).unwrap()["ampTargetMissingMarker"],
+            5
+        );
+        assert_eq!(
+            serde_json::to_value(store.summary()).unwrap()["ampTargetMissingMarker"],
+            5
+        );
+        assert!(response.rows.iter().any(|row| row.list_position == Some(9)));
+        let filtered = store.query(GridQuery {
+            offset: 1,
+            limit: 1,
+            global_search: Some("later-source".into()),
+            ..marker_query()
+        });
+        assert_eq!(filtered.total, 2);
+        assert_eq!(filtered.rows[0].list_position, Some(9));
+        let mut corrected = page("missing-marker", None);
+        corrected.amp_document = Some(true);
+        store.upsert(corrected);
+        assert_eq!(
+            store.query(marker_query()).total,
+            2,
+            "marker changes must invalidate diagnostics"
+        );
+    }
+}
+
+#[test]
+fn amp_target_missing_marker_cache_is_bounded_and_observes_external_marker_updates() {
+    let path = std::env::temp_dir().join(format!(
+        "ferrous-frog-amp-marker-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = SqliteStore::open(&path).unwrap();
+    let writer = SqliteStore::open(&path).unwrap();
+    for source in ["a", "b"] {
+        writer.try_upsert(page(source, Some("target"))).unwrap();
+    }
+    let mut target = page("target", None);
+    target.amp_document = Some(false);
+    writer.try_upsert(target).unwrap();
+    writer
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE crawl_records SET response_time_ms = 'invalid off-page value' WHERE url != ?1",
+            [url("a")],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .try_query(GridQuery {
+                limit: 1,
+                ..marker_query()
+            })
+            .unwrap()
+            .total,
+        2
+    );
+    URL_ALIAS_EXPANSIONS.with(|count| count.set(0));
+    for _ in 0..3 {
+        assert_eq!(
+            store
+                .try_query(GridQuery {
+                    limit: 0,
+                    ..marker_query()
+                })
+                .unwrap()
+                .total,
+            2
+        );
+    }
+    assert_eq!(
+        URL_ALIAS_EXPANSIONS.with(|count| count.get()),
+        0,
+        "unchanged marker audits must reuse evidence"
+    );
+    for (marker, expected) in [(Some(true), 0), (None, 0), (Some(false), 2)] {
+        writer
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE crawl_records SET amp_document = ?1 WHERE url = ?2",
+                params![marker, url("target")],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .try_query(GridQuery {
+                    limit: 1,
+                    ..marker_query()
+                })
+                .unwrap()
+                .total,
+            expected
+        );
+    }
+    drop(writer);
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .try_query(GridQuery {
+                limit: 1,
+                ..marker_query()
+            })
+            .unwrap()
+            .total,
+        2
+    );
+    drop(store);
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -294,8 +547,16 @@ fn amp_sorting_and_old_summary_defaults_match_both_stores() {
     let mut value = serde_json::to_value(CrawlSummary::default()).unwrap();
     value.as_object_mut().unwrap().remove("ampToError");
     value.as_object_mut().unwrap().remove("ampNonReciprocal");
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("ampTargetMissingMarker");
     let restored: CrawlSummary = serde_json::from_value(value).unwrap();
     assert_eq!(serde_json::to_value(&restored).unwrap()["ampToError"], 0);
+    assert_eq!(
+        serde_json::to_value(&restored).unwrap()["ampTargetMissingMarker"],
+        0
+    );
     assert_eq!(
         serde_json::to_value(&restored).unwrap()["ampNonReciprocal"],
         0
@@ -370,4 +631,173 @@ fn amp_queries_share_the_reference_cache_and_keep_hydration_bounded() {
         1
     );
     assert!(URL_ALIAS_EXPANSIONS.with(|count| count.get()) > 0);
+}
+
+#[test]
+fn amp_later_declarations_are_retained_and_audited_with_backend_parity() {
+    let mut source = serde_json::to_value(page("source", Some("good"))).unwrap();
+    source["amphtmlTargets"] = serde_json::json!([url("good"), url("broken"), url("good")]);
+    let source: CrawlRecord = serde_json::from_value(source).unwrap();
+    let mut good = page("good", None);
+    good.canonical = Some(url("source"));
+    let mut broken = page("broken", None);
+    broken.status_code = Some(404);
+    for store in [
+        ActiveStore::memory(),
+        ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+    ] {
+        for row in [source.clone(), good.clone(), broken.clone()] {
+            store.upsert(row);
+        }
+        let retained = store
+            .records()
+            .into_iter()
+            .find(|row| row.url == url("source"))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(retained).unwrap()["amphtmlTargets"],
+            serde_json::json!([url("good"), url("broken"), url("good")])
+        );
+        let response = store.query(query());
+        assert_eq!(
+            response.total, 1,
+            "later failed AMP target must not be hidden by first successful target"
+        );
+        assert_eq!(response.rows[0].url, url("source"));
+    }
+}
+
+#[test]
+fn amp_multiple_inventory_counts_sources_searches_all_targets_and_keeps_unknowns() {
+    let memory = MemoryStore::new();
+    let sqlite = SqliteStore::in_memory().unwrap();
+    let mut multiple = page("source", Some("first"));
+    multiple.amphtml_targets = Some(vec![url("first"), url("later-🐸"), url("first")]);
+    let mut duplicate = multiple.clone();
+    duplicate.storage_key = "list:2:source".into();
+    duplicate.list_position = Some(2);
+    let mut incomplete = multiple.clone();
+    incomplete.url = url("incomplete");
+    incomplete.storage_key = incomplete.url.clone();
+    incomplete.indexability_status = "Response body incomplete".into();
+    let mut image = multiple.clone();
+    image.url = url("image");
+    image.storage_key = image.url.clone();
+    image.content_type = Some("image/png".into());
+    for row in [
+        multiple.clone(),
+        duplicate,
+        incomplete,
+        image,
+        page("legacy", Some("first")),
+    ] {
+        memory.upsert(row.clone());
+        sqlite.try_upsert(row).unwrap();
+    }
+    let query = GridQuery {
+        view: IssueView::AmpMultipleTargets,
+        limit: 1,
+        offset: 1,
+        global_search: Some("later-🐸".into()),
+        ..Default::default()
+    };
+    for response in [
+        memory.query(query.clone()),
+        sqlite.try_query(query).unwrap(),
+    ] {
+        assert_eq!(response.total, 2);
+        assert_eq!(response.summary.amp_multiple_targets, 2);
+        assert_eq!(response.rows[0].storage_key, "list:2:source");
+    }
+    assert_eq!(memory.progress_summary().amp_multiple_targets, 2);
+    assert_eq!(
+        sqlite.try_progress_summary().unwrap().amp_multiple_targets,
+        2
+    );
+    // Updating existing evidence invalidates both the inventory count and search predicates.
+    multiple.amphtml_targets = Some(vec![]);
+    memory.upsert(multiple.clone());
+    sqlite.try_upsert(multiple).unwrap();
+    assert_eq!(memory.progress_summary().amp_multiple_targets, 1);
+    assert_eq!(
+        sqlite.try_progress_summary().unwrap().amp_multiple_targets,
+        1
+    );
+    let mut legacy = serde_json::to_value(page("archive", Some("first"))).unwrap();
+    legacy.as_object_mut().unwrap().remove("amphtmlTargets");
+    let mut restored: CrawlRecord = serde_json::from_value(legacy).unwrap();
+    assert_eq!(restored.amphtml_targets, None);
+    restored.amphtml_targets = Some(vec![]);
+    let restored: CrawlRecord =
+        serde_json::from_value(serde_json::to_value(restored).unwrap()).unwrap();
+    assert_eq!(restored.amphtml_targets, Some(vec![]));
+    let mut summary = serde_json::to_value(CrawlSummary::default()).unwrap();
+    summary
+        .as_object_mut()
+        .unwrap()
+        .remove("ampMultipleTargets");
+    assert_eq!(
+        serde_json::from_value::<CrawlSummary>(summary)
+            .unwrap()
+            .amp_multiple_targets,
+        0
+    );
+}
+
+#[test]
+fn amp_later_reciprocity_and_explicit_empty_targets_use_measured_evidence() {
+    for store in [
+        ActiveStore::memory(),
+        ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+    ] {
+        let mut source = page("source", Some("good"));
+        source.amphtml_targets = Some(vec![url("good"), url("missing-return")]);
+        let mut good = page("good", None);
+        good.canonical = Some(url("source"));
+        store.upsert(source.clone());
+        store.upsert(good);
+        store.upsert(page("missing-return", None));
+        assert_eq!(store.query(reciprocity_query()).total, 1);
+        source.amphtml_targets = Some(vec![]);
+        source.amphtml = Some(url("missing-return"));
+        store.upsert(source);
+        assert_eq!(
+            store.query(reciprocity_query()).total,
+            0,
+            "explicit empty evidence must not fall back to legacy first target"
+        );
+    }
+}
+
+#[test]
+fn amp_legacy_sqlite_reopen_keeps_unknown_evidence_and_saves_new_declarations() {
+    let path = std::env::temp_dir().join(format!(
+        "ferrous-amp-migration-{}.sqlite3",
+        std::process::id()
+    ));
+    let store = SqliteStore::open(&path).unwrap();
+    store.try_upsert(page("legacy", Some("first"))).unwrap();
+    store
+        .connection()
+        .unwrap()
+        .execute_batch("ALTER TABLE crawl_records DROP COLUMN amphtml_targets; ALTER TABLE crawl_records DROP COLUMN amp_document;")
+        .unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    let mut row = store.try_records().unwrap().remove(0);
+    assert_eq!(row.amphtml_targets, None);
+    assert_eq!(row.amp_document, None);
+    assert_eq!(row.amphtml, Some(url("first")));
+    row.amphtml_targets = Some(vec![url("first"), url("second"), url("first")]);
+    row.amp_document = Some(true);
+    store.try_upsert(row).unwrap();
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        store.try_records().unwrap()[0].amphtml_targets,
+        Some(vec![url("first"), url("second"), url("first")])
+    );
+    assert_eq!(store.try_records().unwrap()[0].amp_document, Some(true));
+    drop(store);
+    std::fs::remove_file(path).unwrap();
 }

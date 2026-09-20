@@ -32,6 +32,114 @@ impl SqliteStore {
 }
 
 impl ActiveStore {
+    /// Visit records in the same order as `records`, including derived first-inlink fields.
+    /// SQLite decodes at most 256 records at once under one read transaction.
+    /// Memory clones one record at a time, retaining an index of first-inlink sources.
+    /// The visitor runs under the storage lock and must not reenter this store.
+    pub fn try_visit_records(
+        &self,
+        mut visitor: impl FnMut(CrawlRecord) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        let mut count = 0;
+        match self {
+            Self::Memory(store) => {
+                let inner = store.inner.read().map_err(|_| StorageError::LockPoisoned)?;
+                for record in &inner.records {
+                    let mut record = record.clone();
+                    annotate_first_inlink_sources(
+                        std::slice::from_mut(&mut record),
+                        &inner.first_inlink_sources,
+                    );
+                    visitor(record)?;
+                    count += 1;
+                }
+            }
+            Self::Sqlite(store) => {
+                let conn = store.connection()?;
+                let tx = conn.unchecked_transaction()?;
+                // ponytail: SQLite still sorts the full result; add an order index if profiling
+                // shows this dominates. Rust record hydration is bounded independently.
+                let mut statement = tx.prepare(
+                    "SELECT * FROM crawl_records ORDER BY COALESCE(list_position, id) ASC, id ASC",
+                )?;
+                let mut rows = statement.query_map([], record_from_row)?;
+                loop {
+                    let mut records = rows.by_ref().take(256).collect::<Result<Vec<_>, _>>()?;
+                    if records.is_empty() {
+                        break;
+                    }
+                    annotate_sqlite_first_inlink_sources(&tx, &mut records)?;
+                    for record in records {
+                        visitor(record)?;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Write the schema-1 frontier JSON without cloning the queue or seen set.
+    /// SQLite holds one read transaction across all three fields; Memory borrows its state.
+    /// The writer runs under the storage lock and must not reenter this store.
+    pub fn try_write_frontier_state_json(
+        &self,
+        writer: &mut impl std::io::Write,
+    ) -> Result<(), StorageError> {
+        match self {
+            Self::Memory(store) => {
+                let inner = store.inner.read().map_err(|_| StorageError::LockPoisoned)?;
+                serde_json::to_writer(writer, &inner.frontier_state)?;
+            }
+            Self::Sqlite(store) => {
+                let conn = store.connection()?;
+                let tx = conn.unchecked_transaction()?;
+                let populated: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM crawl_frontier_queue)
+                         OR EXISTS(SELECT 1 FROM crawl_frontier_seen)",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !populated {
+                    writer.write_all(b"null")?;
+                    return Ok(());
+                }
+                writer.write_all(b"{\"queued\":[")?;
+                let mut statement =
+                    tx.prepare("SELECT * FROM crawl_frontier_queue ORDER BY position ASC")?;
+                for (index, item) in statement.query_map([], frontier_item_from_row)?.enumerate() {
+                    if index != 0 {
+                        writer.write_all(b",")?;
+                    }
+                    serde_json::to_writer(&mut *writer, &item?)?;
+                }
+                writer.write_all(b"],\"seen\":[")?;
+                let mut statement =
+                    tx.prepare("SELECT url FROM crawl_frontier_seen ORDER BY url ASC")?;
+                for (index, url) in statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .enumerate()
+                {
+                    if index != 0 {
+                        writer.write_all(b",")?;
+                    }
+                    serde_json::to_writer(&mut *writer, &url?)?;
+                }
+                let crawled = tx
+                    .query_row(
+                        "SELECT value FROM crawl_frontier_meta WHERE key = 'crawled'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                write!(writer, "],\"crawled\":{crawled}}}")?;
+            }
+        }
+        Ok(())
+    }
+
     /// Visit a stable edge snapshot without cloning the full collection.
     /// The visitor runs under the storage lock and must not reenter this store.
     pub fn try_visit_link_edges(
@@ -59,7 +167,7 @@ impl ActiveStore {
                     .filter(|record| selected.contains(&record.id))
                     .cloned()
                     .collect::<Vec<_>>();
-                apply_first_inlink_sources(&mut records, &inner.link_edges);
+                annotate_first_inlink_sources(&mut records, &inner.first_inlink_sources);
                 records
             }
             Self::Sqlite(store) => {
@@ -126,6 +234,383 @@ mod tests {
             ActiveStore::memory(),
             ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
         ]
+    }
+
+    fn populate_record_stream(store: &ActiveStore) {
+        for index in 0..513 {
+            let mut record = CrawlRecord::pending("https://example.test/repeated".into(), 2);
+            record.storage_key = format!("list:{index}");
+            record.list_position = Some(513 - index);
+            record.list_duplicate_index = index + 1;
+            record.title = Some(format!("Original 🐸 {index}"));
+            record.final_url = "https://example.test/final".into();
+            store.upsert(record);
+        }
+        store.add_link_edge(LinkEdge {
+            id: 0,
+            source_url: "https://example.test/source".into(),
+            target_url: "https://example.test/final".into(),
+            anchor_text: "Original anchor 🐸".into(),
+            rel: String::new(),
+            rel_nofollow: false,
+            link_type: LinkType::Internal,
+            source_status_code: Some(200),
+            target_status_code: None,
+            source_depth: 1,
+            target_depth: Some(2),
+            source_position: 7,
+            discovery_order: 1,
+        });
+    }
+
+    #[test]
+    fn generic_record_visitor_preserves_payloads_and_propagates_late_sqlite_errors() {
+        fn collect<S: CrawlStore>(store: &S) -> Vec<CrawlRecord> {
+            let mut records = Vec::new();
+            store
+                .try_visit_records(&mut |record| {
+                    records.push(record);
+                    Ok(())
+                })
+                .unwrap();
+            records
+        }
+        let memory = MemoryStore::new();
+        let sqlite = SqliteStore::in_memory().unwrap();
+        for index in 0..257 {
+            let record = CrawlRecord::pending(format!("https://example.test/{index}"), 0);
+            memory.upsert(record.clone());
+            sqlite.try_upsert(record).unwrap();
+        }
+        assert_eq!(
+            serde_json::to_value(collect(&memory)).unwrap(),
+            serde_json::to_value(collect(&sqlite)).unwrap()
+        );
+        sqlite
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE crawl_records SET title_len = 'invalid' WHERE id = 257",
+                [],
+            )
+            .unwrap();
+        let mut count = 0;
+        assert!(
+            CrawlStore::try_visit_records(&sqlite, &mut |_| {
+                count += 1;
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(
+            count, 256,
+            "generic SQLite visitor must decode incrementally"
+        );
+        sqlite.clear();
+        assert!(collect(&sqlite).is_empty());
+    }
+
+    #[test]
+    fn record_visit_preserves_order_payloads_inlinks_and_stops_on_error() {
+        for store in stores() {
+            assert_eq!(
+                store.try_visit_records(|_| panic!("empty store")).unwrap(),
+                0
+            );
+            populate_record_stream(&store);
+            let expected = store.records();
+            let mut visited = Vec::new();
+            assert_eq!(
+                store
+                    .try_visit_records(|record| {
+                        assert_eq!(
+                            record.first_inlink_anchor_text.as_deref(),
+                            Some("Original anchor 🐸")
+                        );
+                        assert_eq!(record.first_inlink_source_position, Some(7));
+                        visited.push(record);
+                        Ok(())
+                    })
+                    .unwrap(),
+                513
+            );
+            assert_eq!(
+                serde_json::to_value(visited).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            let mut calls = 0;
+            let error = store
+                .try_visit_records(|_| {
+                    calls += 1;
+                    Err(std::io::Error::other("record writer failed"))
+                })
+                .unwrap_err();
+            assert_eq!(calls, 1);
+            assert!(error.to_string().contains("record writer failed"));
+            store.clear();
+            assert_eq!(
+                store
+                    .try_visit_records(|_| panic!("cleared store"))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn record_visit_keeps_records_and_inlinks_in_one_sqlite_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "ferrous-record-stream-snapshot-{}.sqlite3",
+            std::process::id()
+        ));
+        let store = ActiveStore::sqlite(&path).unwrap();
+        populate_record_stream(&store);
+        let expected = serde_json::to_value(store.records()).unwrap();
+        let external = Connection::open(&path).unwrap();
+        let mut visited = Vec::new();
+        store
+            .try_visit_records(|record| {
+                if visited.is_empty() {
+                    external
+                        .execute_batch(
+                            "BEGIN; UPDATE crawl_records SET title = 'Changed';
+                     UPDATE link_edges SET anchor_text = 'Changed'; COMMIT;",
+                        )
+                        .unwrap();
+                }
+                visited.push(record);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(serde_json::to_value(visited).unwrap(), expected);
+        let changed = store.records();
+        assert!(
+            changed
+                .iter()
+                .all(|record| record.title.as_deref() == Some("Changed")
+                    && record.first_inlink_anchor_text.as_deref() == Some("Changed"))
+        );
+        drop(external);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn frontier_json_preserves_empty_states_list_occurrences_and_unicode() {
+        let queued = [9, 2].map(|position| CrawlFrontierItem {
+            url: "https://example.test/🐸?q=\"quoted\"".into(),
+            depth: 3,
+            from_sitemap: position == 2,
+            storage_key: format!("list:{position}:same-url"),
+            list_position: Some(position),
+            list_duplicate_index: position,
+        });
+        for store in stores() {
+            for state in [
+                None,
+                Some(CrawlFrontierState {
+                    crawled: 19,
+                    ..Default::default()
+                }),
+                Some(CrawlFrontierState {
+                    queued: queued.to_vec(),
+                    seen: vec![],
+                    crawled: 41,
+                }),
+                Some(CrawlFrontierState {
+                    queued: vec![],
+                    seen: vec!["z\\\"\n🐸".into(), "a".into(), "a".into()],
+                    crawled: 42,
+                }),
+            ] {
+                store.clear_frontier_state();
+                if let Some(state) = state.clone() {
+                    store.save_frontier_state(state);
+                }
+                let mut expected = state;
+                if matches!(store, ActiveStore::Sqlite(_))
+                    && let Some(frontier) = &mut expected
+                {
+                    frontier.seen.sort();
+                    frontier.seen.dedup();
+                    if frontier.queued.is_empty() && frontier.seen.is_empty() {
+                        expected = None;
+                    }
+                }
+                let mut bytes = Vec::new();
+                store.try_write_frontier_state_json(&mut bytes).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<Option<CrawlFrontierState>>(&bytes).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frontier_json_keeps_one_sqlite_snapshot_and_releases_failed_writes() {
+        use std::io::Write;
+
+        struct UpdatingWriter<'a> {
+            connection: &'a Connection,
+            bytes: Vec<u8>,
+            fail: bool,
+        }
+        impl Write for UpdatingWriter<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.bytes.is_empty() {
+                    self.connection
+                        .execute_batch(
+                            "BEGIN; DELETE FROM crawl_frontier_queue;
+                         DELETE FROM crawl_frontier_seen;
+                         INSERT INTO crawl_frontier_seen(url) VALUES ('changed');
+                         UPDATE crawl_frontier_meta SET value = '999'; COMMIT;",
+                        )
+                        .unwrap();
+                }
+                self.bytes.extend_from_slice(bytes);
+                if self.fail {
+                    return Err(std::io::Error::other("frontier disk full"));
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "ferrous-frontier-json-snapshot-{}.sqlite3",
+            std::process::id()
+        ));
+        let store = ActiveStore::sqlite(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let expected = CrawlFrontierState {
+            queued: vec![CrawlFrontierItem {
+                url: "https://example.test/first".into(),
+                depth: 2,
+                from_sitemap: true,
+                storage_key: "first".into(),
+                list_position: Some(7),
+                list_duplicate_index: 3,
+            }],
+            seen: vec!["original".into()],
+            crawled: 42,
+        };
+        for fail in [false, true] {
+            store.save_frontier_state(expected.clone());
+            let mut writer = UpdatingWriter {
+                connection: &connection,
+                bytes: vec![],
+                fail,
+            };
+            let result = store.try_write_frontier_state_json(&mut writer);
+            if fail {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("frontier disk full")
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<CrawlFrontierState>(&writer.bytes).unwrap(),
+                    expected
+                );
+            }
+            let current = store.load_frontier_state().unwrap();
+            assert!(current.queued.is_empty());
+            assert_eq!(current.seen, ["changed"]);
+            assert_eq!(current.crawled, 999);
+            store.clear_frontier_state();
+            let mut bytes = Vec::new();
+            store.try_write_frontier_state_json(&mut bytes).unwrap();
+            assert_eq!(bytes, b"null");
+        }
+        drop(connection);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[ignore = "isolated frontier JSON export memory and timing workload"]
+    fn frontier_json_export_workload() {
+        use std::hash::{Hash, Hasher};
+        use std::io::{Read, Write};
+
+        let count: usize = std::env::var("FF_FRONTIER_EXPORT_SEEN")
+            .unwrap_or_else(|_| "1000000".into())
+            .parse()
+            .unwrap();
+        assert!(count >= 20);
+        let hydrated =
+            std::env::var("FF_FRONTIER_EXPORT_MODE").is_ok_and(|mode| mode == "hydrated");
+        let directory = std::env::temp_dir().join(format!(
+            "ferrous-frontier-json-workload-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let store = ActiveStore::sqlite(directory.join("frontier.sqlite3")).unwrap();
+        let ActiveStore::Sqlite(sqlite) = &store else {
+            unreachable!()
+        };
+        sqlite.connection().unwrap().execute_batch(&format!(
+            "BEGIN;
+             WITH RECURSIVE sequence(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM sequence WHERE n+1 < {count})
+             INSERT INTO crawl_frontier_seen(url) SELECT printf('https://example.test/page/%09d', n) FROM sequence;
+             WITH RECURSIVE sequence(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM sequence WHERE n+1 < {queued})
+             INSERT INTO crawl_frontier_queue(position,url,depth,from_sitemap,storage_key,list_position,list_duplicate_index)
+             SELECT n, 'https://example.test/repeated', n%8, n%2, printf('list:%09d',n), n+1, n+1 FROM sequence;
+             INSERT INTO crawl_frontier_meta(key,value) VALUES ('crawled','12345'); COMMIT;",
+            queued = count / 20,
+        )).unwrap();
+        let path = directory.join("frontier.json");
+        let mut elapsed = Vec::new();
+        for _ in 0..3 {
+            let mut writer = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+            let started = std::time::Instant::now();
+            if hydrated {
+                serde_json::to_writer(&mut writer, &sqlite.try_load_frontier_state().unwrap())
+                    .unwrap();
+            } else {
+                store.try_write_frontier_state_json(&mut writer).unwrap();
+            }
+            writer.flush().unwrap();
+            elapsed.push(started.elapsed());
+        }
+        elapsed.sort();
+        // Compare identical byte counts/digests across separate baseline/streaming processes
+        // without hydrating JSON during RSS verification.
+        let mut reader = std::fs::File::open(&path).unwrap();
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        let mut buffer = [0; 65536];
+        loop {
+            let count = reader.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            buffer[..count].hash(&mut hash);
+        }
+        assert_eq!(
+            store.try_frontier_summary().unwrap(),
+            Some(CrawlFrontierSummary {
+                queued: count / 20,
+                seen: count,
+                crawled: 12345,
+            })
+        );
+        eprintln!(
+            "frontier_export mode={} queued={} seen={count} samples=3 median_ms={:.3} bytes={} digest={:016x}",
+            if hydrated { "hydrated" } else { "streamed" },
+            count / 20,
+            elapsed[1].as_secs_f64() * 1000.0,
+            reader.metadata().unwrap().len(),
+            hash.finish()
+        );
+        drop(reader);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

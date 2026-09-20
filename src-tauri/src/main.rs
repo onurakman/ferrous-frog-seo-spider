@@ -37,8 +37,8 @@ use ferrous_frog_crawler_core::{
 use ferrous_frog_export::{
     audit_workbook_to_writer, export_preset, graph_nodes_to_csv, link_edges_to_csv,
     link_edges_to_csv_string, query_to_xlsx_writer, records_to_csv, records_to_csv_string,
-    records_to_html_report_store_writer, records_to_sitemap_xml, records_to_xlsx_bytes,
-    redirect_chains_to_csv_string, sitemap_validation_to_csv_string, store_link_edges_to_csv,
+    records_to_sitemap_xml, records_to_xlsx_bytes, redirect_chains_to_csv_string,
+    sitemap_validation_to_csv_string, store_link_edges_to_csv, store_to_html_report_writer,
     write_export_files,
 };
 use ferrous_frog_integrations::{
@@ -228,7 +228,7 @@ struct ExportFileRequest {
     record_ids: Option<Vec<u64>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum ExportFileKind {
     Csv,
@@ -1581,18 +1581,14 @@ fn export_redirect_chains_csv(state: State<'_, AppState>) -> Result<String, Stri
 #[tauri::command]
 async fn export_html_report(state: State<'_, AppState>) -> Result<String, String> {
     with_store_worker(&state, true, move |store| {
-        let records = match store {
-            ActiveStore::Memory(store) => store.records(),
-            ActiveStore::Sqlite(store) => store.try_records().map_err(|error| error.to_string())?,
-        };
         let mut output = Vec::new();
-        records_to_html_report_store_writer(&records, store, &audit_thresholds(), &mut output)?;
+        store_to_html_report_writer(store, &audit_thresholds(), &mut output)?;
         String::from_utf8(output).map_err(|error| error.to_string())
     })
     .await
 }
 
-fn stream_export_file(
+async fn stream_export_file(
     app: &AppHandle,
     state: &State<'_, AppState>,
     request: &ExportFileRequest,
@@ -1611,36 +1607,34 @@ fn stream_export_file(
         _ => return Ok(None),
     };
     let path = export_path(app, &filename)?;
-    let mut file = fs::File::create(&path)
-        .map_err(|error| format!("failed to create export file: {error}"))?;
-    let store = state
-        .store
-        .lock()
-        .map_err(|_| "store lock poisoned".to_string())?;
+    export_basic_stream_file(state, path, request.kind, request.query.clone())
+        .await
+        .map(Some)
+}
 
-    let row_count = match &request.kind {
-        ExportFileKind::Csv => write_grid_csv_stream(
-            &store,
-            request.query.clone().unwrap_or_else(export_grid_query),
-            &mut file,
-        )?,
-        ExportFileKind::Sitemap => write_sitemap_xml_stream(
-            &store,
-            request.query.clone().unwrap_or_else(export_grid_query),
-            &mut file,
-        )?,
-        ExportFileKind::LinkEdgesCsv => write_link_edges_csv_stream(&store, &mut file)?,
-        ExportFileKind::RedirectChainsCsv => write_redirect_chains_csv_stream(&store, &mut file)?,
-        ExportFileKind::SitemapValidationCsv => {
-            write_sitemap_validation_csv_stream(&store, &mut file)?
-        }
-        _ => unreachable!("non-streaming export kind returned earlier"),
-    };
-
-    Ok(Some(ExportFileResult {
-        path: path.to_string_lossy().into_owned(),
-        row_count,
-    }))
+async fn export_basic_stream_file(
+    state: &AppState,
+    path: PathBuf,
+    kind: ExportFileKind,
+    query: Option<GridQuery>,
+) -> Result<ExportFileResult, String> {
+    with_store_worker(state, true, move |store| {
+        write_atomic_export(&path, |file| match kind {
+            ExportFileKind::Csv => {
+                write_grid_csv_stream(store, query.unwrap_or_else(export_grid_query), file)
+            }
+            ExportFileKind::Sitemap => {
+                write_sitemap_xml_stream(store, query.unwrap_or_else(export_grid_query), file)
+            }
+            ExportFileKind::LinkEdgesCsv => write_link_edges_csv_stream(store, file),
+            ExportFileKind::RedirectChainsCsv => write_redirect_chains_csv_stream(store, file),
+            ExportFileKind::SitemapValidationCsv => {
+                write_sitemap_validation_csv_stream(store, file)
+            }
+            _ => unreachable!("non-streaming export kind returned earlier"),
+        })
+    })
+    .await
 }
 
 fn write_grid_csv_stream(
@@ -1708,7 +1702,7 @@ fn write_redirect_chains_csv_stream(
     let mut wrote_header = false;
 
     loop {
-        let response = store.query(query.clone());
+        let response = query_store_rows(store, query.clone())?;
         let chunk_len = response.rows.len();
         let csv =
             redirect_chains_to_csv_string(&response.rows).map_err(|error| error.to_string())?;
@@ -1894,17 +1888,10 @@ async fn export_html_report_file(
 ) -> Result<ExportFileResult, String> {
     with_store_worker(state, true, move |store| {
         write_atomic_export(&path, |file| {
-            // ponytail: full record snapshot retains global audit semantics; link edges stream.
-            let records = match store {
-                ActiveStore::Memory(store) => store.records(),
-                ActiveStore::Sqlite(store) => {
-                    store.try_records().map_err(|error| error.to_string())?
-                }
-            };
             let mut writer = BufWriter::new(file);
-            records_to_html_report_store_writer(&records, store, &audit_thresholds(), &mut writer)?;
+            let count = store_to_html_report_writer(store, &audit_thresholds(), &mut writer)?;
             writer.flush().map_err(|error| error.to_string())?;
-            Ok(records.len())
+            Ok(count)
         })
     })
     .await
@@ -1930,26 +1917,18 @@ fn write_crawl_archive_stream(
 ) -> Result<usize, String> {
     write!(writer, "{{\n  \"schemaVersion\": {CRAWL_ARCHIVE_SCHEMA_VERSION},\n  \"exportedAtMs\": {timestamp},\n  \"records\": ")
         .map_err(|error| error.to_string())?;
-    let row_count = match store {
-        ActiveStore::Memory(memory) => {
-            // ponytail: keep one Memory snapshot in insertion order; add a raw record visitor
-            // if large headless archives need bounded hydration. Grid paging repeats full audits.
-            let records = memory.records();
-            serde_json::to_writer(&mut *writer, &records).map_err(|error| error.to_string())?;
-            records.len()
-        }
-        ActiveStore::Sqlite(_) => write_archive_array(writer, "records", |offset| {
-            let response = query_store_rows(
-                store,
-                GridQuery {
-                    offset,
-                    limit: EXPORT_STREAM_PAGE_SIZE,
-                    ..GridQuery::default()
-                },
-            )?;
-            Ok((response.rows, response.total))
-        })?,
-    };
+    writer.write_all(b"[").map_err(|error| error.to_string())?;
+    let mut first = true;
+    let row_count = store
+        .try_visit_records(|record| {
+            if !first {
+                writer.write_all(b",")?;
+            }
+            first = false;
+            serde_json::to_writer(&mut *writer, &record).map_err(std::io::Error::other)
+        })
+        .map_err(|error| error.to_string())?;
+    writer.write_all(b"]").map_err(|error| error.to_string())?;
     writer
         .write_all(b",\n  \"linkEdges\": ")
         .map_err(|error| error.to_string())?;
@@ -2005,18 +1984,12 @@ fn write_crawl_archive_stream(
             .map_err(|error| error.to_string())?;
         Ok((response.captures, response.total))
     })?;
-    // ponytail: hydrate the whole frontier; extend its visitor with seen/crawled metadata
-    // if large resume snapshots need bounded memory.
-    let frontier = match store {
-        ActiveStore::Memory(memory) => memory.load_frontier_state(),
-        ActiveStore::Sqlite(sqlite) => sqlite
-            .try_load_frontier_state()
-            .map_err(|error| error.to_string())?,
-    };
     writer
         .write_all(b",\n  \"frontierState\": ")
         .map_err(|error| error.to_string())?;
-    serde_json::to_writer(&mut *writer, &frontier).map_err(|error| error.to_string())?;
+    store
+        .try_write_frontier_state_json(writer)
+        .map_err(|error| error.to_string())?;
     writer
         .write_all(b"\n}\n")
         .map_err(|error| error.to_string())?;
@@ -2463,7 +2436,7 @@ async fn export_file(
         )
         .await;
     }
-    if let Some(result) = stream_export_file(&app, &state, &request, timestamp)? {
+    if let Some(result) = stream_export_file(&app, &state, &request, timestamp).await? {
         return Ok(result);
     }
 
@@ -3977,6 +3950,7 @@ fn main() {
             pagespeed::run_page_speed,
             pagespeed::run_page_speed_bulk,
             pagespeed::run_field_vitals,
+            pagespeed::run_field_vitals_bulk,
             pagespeed::cancel_page_speed,
             save_search_console_credentials,
             clear_search_console_credentials,

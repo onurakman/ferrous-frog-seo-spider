@@ -22,10 +22,12 @@ pub use audit_reports::*;
 mod archive_restore;
 mod native_exports;
 mod page_captures;
+mod progress_summary;
 pub use page_captures::{
     CapturedHeader, MAX_CAPTURE_BYTES, MAX_CAPTURE_HEADER_BYTES, MAX_CAPTURE_HEADERS,
     MAX_CAPTURE_PAGE_SIZE, PageCapture, PageCaptureQuery, PageCaptureResponse,
 };
+use progress_summary::CachedSummary;
 
 #[cfg(test)]
 mod content_hash_tests;
@@ -132,9 +134,12 @@ pub enum IssueView {
     PaginationPrevLoop,
     PaginationNextNonReciprocal,
     PaginationPrevNonReciprocal,
+    PaginationCanonicalToLinkedPage,
     PaginationMultipleTargets,
+    AmpMultipleTargets,
     AmpToError,
     AmpNonReciprocal,
+    AmpTargetMissingMarker,
     DirectivesNoindex,
     ImagesMissingAlt,
     ImagesAltTooLong,
@@ -152,6 +157,7 @@ pub enum IssueView {
     StructuredDataInvalid,
     StructuredDataWarning,
     HtmlDeprecatedTags,
+    HtmlMissingDoctype,
     HtmlDuplicateIds,
     RenderedDomChanged,
     NearDuplicate,
@@ -386,6 +392,14 @@ pub struct CrawlRecord {
     pub x_content_type_options_header: bool,
     pub viewport: bool,
     pub amphtml: Option<String>,
+    #[serde(default)]
+    pub amphtml_targets: Option<Vec<String>>,
+    /// AMP marker observed in the original HTTP HTML, not the rendered DOM.
+    #[serde(default)]
+    pub amp_document: Option<bool>,
+    /// HTML doctype observed in the original HTTP source, not rendered outerHTML.
+    #[serde(default)]
+    pub html_doctype: Option<bool>,
     pub rel_next: Option<String>,
     pub rel_prev: Option<String>,
     #[serde(default)]
@@ -523,6 +537,9 @@ impl CrawlRecord {
             x_content_type_options_header: false,
             viewport: false,
             amphtml: None,
+            amphtml_targets: None,
+            amp_document: None,
+            html_doctype: None,
             rel_next: None,
             rel_prev: None,
             rel_next_targets: None,
@@ -670,11 +687,17 @@ pub struct CrawlSummary {
     #[serde(default)]
     pub pagination_prev_non_reciprocal: usize,
     #[serde(default)]
+    pub pagination_canonical_to_linked_page: usize,
+    #[serde(default)]
     pub pagination_multiple_targets: usize,
+    #[serde(default)]
+    pub amp_multiple_targets: usize,
     #[serde(default)]
     pub amp_to_error: usize,
     #[serde(default)]
     pub amp_non_reciprocal: usize,
+    #[serde(default)]
+    pub amp_target_missing_marker: usize,
     pub noindex: usize,
     pub images_missing_alt: usize,
     pub images_alt_too_long: usize,
@@ -684,6 +707,8 @@ pub struct CrawlSummary {
     pub structured_data_invalid: usize,
     pub structured_data_warnings: usize,
     pub deprecated_html_tags: usize,
+    #[serde(default)]
+    pub missing_html_doctype: usize,
     pub duplicate_ids: usize,
     pub rendered_dom_changed: usize,
     pub missing_viewport: usize,
@@ -1321,6 +1346,21 @@ pub trait CrawlStore: Clone + Send + Sync + 'static {
     fn merge_analytics_metrics(&self, metrics: Vec<AnalyticsMetricRow>) -> usize;
     fn merge_backlink_metrics(&self, metrics: Vec<BacklinkMetricRow>) -> usize;
     fn records(&self) -> Vec<CrawlRecord>;
+    /// Visit records in backend order. The callback must not reenter this store.
+    /// Built-in backends stream; the default preserves compatibility for custom backends.
+    fn try_visit_records(
+        &self,
+        visitor: &mut dyn FnMut(CrawlRecord) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        // ponytail: custom stores retain snapshot compatibility; override for bounded hydration.
+        let records = self.records();
+        let count = records.len();
+        for record in records {
+            visitor(record)?;
+        }
+        Ok(count)
+    }
+
     fn query(&self, query: GridQuery) -> GridResponse;
     fn link_edges(&self, query: LinkEdgeQuery) -> LinkEdgeResponse;
     /// Visit all retained edges in storage order. The callback must not reenter this store.
@@ -1433,7 +1473,10 @@ struct MemoryStoreInner {
     url_to_index: HashMap<String, usize>,
     alias_to_indices: HashMap<String, BTreeSet<usize>>,
     inlink_counts: HashMap<String, u32>,
+    first_inlink_sources: HashMap<String, FirstInlinkSource>,
     link_edges: Vec<LinkEdge>,
+    edge_source_indices: HashMap<String, Vec<usize>>,
+    edge_target_indices: HashMap<String, Vec<usize>>,
     image_assets: Vec<ImageAsset>,
     page_references: Vec<PageReference>,
     page_captures: std::collections::BTreeMap<String, PageCapture>,
@@ -1507,8 +1550,11 @@ impl MemoryStore {
                 .or_default()
                 .insert(index);
         }
-        update_memory_edge_statuses(&mut inner.link_edges, &record);
-        apply_first_inlink_sources(std::slice::from_mut(&mut record), &inner.link_edges);
+        update_memory_edge_statuses(&mut inner, &record);
+        annotate_first_inlink_sources(
+            std::slice::from_mut(&mut record),
+            &inner.first_inlink_sources,
+        );
         record
     }
 
@@ -1586,18 +1632,37 @@ impl MemoryStore {
         edge.id = inner.next_edge_id;
         edge.discovery_order = edge.id;
 
-        if let Some(index) = memory_record_index_by_url(&inner, &edge.source_url) {
+        let source_aliases = url_aliases(&edge.source_url);
+        let target_aliases = url_aliases(&edge.target_url);
+        if let Some(index) = memory_record_index_by_aliases(&inner, &source_aliases) {
             let source = &inner.records[index];
             edge.source_status_code = source.status_code;
             edge.source_depth = source.depth;
         }
 
-        if let Some(index) = memory_record_index_by_url(&inner, &edge.target_url) {
+        if let Some(index) = memory_record_index_by_aliases(&inner, &target_aliases) {
             let target = &inner.records[index];
             edge.target_status_code = target.status_code;
             edge.target_depth = Some(target.depth);
         }
 
+        index_first_inlink_source(&mut inner.first_inlink_sources, &edge, &target_aliases);
+        // Edges are append-only; endpoint indices remain valid until clear resets the store.
+        let index = inner.link_edges.len();
+        for alias in source_aliases {
+            inner
+                .edge_source_indices
+                .entry(alias)
+                .or_default()
+                .push(index);
+        }
+        for alias in target_aliases {
+            inner
+                .edge_target_indices
+                .entry(alias)
+                .or_default()
+                .push(index);
+        }
         inner.link_edges.push(edge.clone());
         edge
     }
@@ -1721,7 +1786,7 @@ impl MemoryStore {
     pub fn records(&self) -> Vec<CrawlRecord> {
         let inner = self.inner.read().expect("memory store lock poisoned");
         let mut records = inner.records.clone();
-        apply_first_inlink_sources(&mut records, &inner.link_edges);
+        annotate_first_inlink_sources(&mut records, &inner.first_inlink_sources);
         records
     }
 
@@ -1741,8 +1806,8 @@ impl MemoryStore {
     }
 
     pub fn summary(&self) -> CrawlSummary {
-        let records = self.records();
-        summarize(&records)
+        let inner = self.inner.read().expect("memory store lock poisoned");
+        summarize(&inner.records)
     }
 
     pub fn query(&self, query: GridQuery) -> GridResponse {
@@ -1753,16 +1818,17 @@ impl MemoryStore {
                 summary: self.summary(),
             };
         }
-        let mut rows = self.records();
-        let references = reference_diagnostics(&rows);
-        let exact = exact_duplicate_hashes(&rows);
-        let mut summary = summarize_without_canonicals(&rows);
+        let inner = self.inner.read().expect("memory store lock poisoned");
+        let records = &inner.records;
+        let references = reference_diagnostics(records);
+        let exact = exact_duplicate_hashes(records);
+        let mut summary = summarize_without_canonicals(records);
         add_reference_summary(&mut summary, &references);
-        summary.exact_duplicates = rows
+        summary.exact_duplicates = records
             .iter()
             .filter(|row| is_exact_duplicate_record(row, &exact))
             .count();
-        let html_rows = rows.iter().filter(|row| is_success_html_record(row));
+        let html_rows = records.iter().filter(|row| is_success_html_record(row));
         let title_counts =
             duplicate_counts(html_rows.clone().filter_map(|row| row.title.as_deref()));
         let meta_counts = duplicate_counts(
@@ -1774,28 +1840,36 @@ impl MemoryStore {
         let h2_counts = duplicate_counts(html_rows.clone().filter_map(|row| row.h2.as_deref()));
         let near_duplicate_counts =
             cluster_counts(html_rows.filter_map(|row| row.near_duplicate_cluster_id));
-        let hreflang_index = HreflangAuditIndex::from_records(&rows);
-        let mut references = references.iter();
-
-        rows.retain(|row| {
-            matches_view(
-                row,
-                &query.view,
-                &query.thresholds,
-                &title_counts,
-                &meta_counts,
-                &h1_counts,
-                &h2_counts,
-                &near_duplicate_counts,
-                &exact,
-                &hreflang_index,
-                references
-                    .next()
-                    .expect("one reference diagnostic per record"),
-            )
-        });
+        let hreflang_index = HreflangAuditIndex::from_records(records);
+        // ponytail: borrow through paging; audit indexes and read-lock duration grow with the dataset.
+        // Use immutable snapshots if concurrent writer latency requires shorter locks.
+        let mut rows: Vec<_> = records
+            .iter()
+            .zip(&references)
+            .filter(|(row, reference)| {
+                matches_view(
+                    row,
+                    &query.view,
+                    &query.thresholds,
+                    &title_counts,
+                    &meta_counts,
+                    &h1_counts,
+                    &h2_counts,
+                    &near_duplicate_counts,
+                    &exact,
+                    &hreflang_index,
+                    reference,
+                )
+            })
+            .map(|(row, _)| {
+                (
+                    row,
+                    first_inlink_source_for_record(row, &inner.first_inlink_sources),
+                )
+            })
+            .collect();
         if let Some(segment_matcher) = SegmentMatcher::from_query(&query) {
-            rows.retain(|row| segment_matcher.matches(row));
+            rows.retain(|(row, _)| segment_matcher.matches(row));
         }
 
         if let Some(search) = query
@@ -1804,12 +1878,12 @@ impl MemoryStore {
             .map(|value| value.trim().to_lowercase())
             && !search.is_empty()
         {
-            rows.retain(|row| row_matches_search(row, &search));
+            rows.retain(|(row, source)| row_matches_search(row, &search, *source));
         }
 
         if let Some(group) = &query.filters {
             let rules: Vec<_> = group.rules.iter().map(PreparedGridRule::new).collect();
-            rows.retain(|row| {
+            rows.retain(|(row, _)| {
                 rules.is_empty()
                     || match group.match_mode {
                         GridFilterMatch::All => rules.iter().all(|rule| rule.matches(row)),
@@ -1821,13 +1895,17 @@ impl MemoryStore {
         if let Some(sort_by) = query.sort_by.as_deref() {
             sort_rows(&mut rows, sort_by, &query.sort_dir);
         } else {
-            rows.sort_by(compare_default_row_order);
+            rows.sort_by(|left, right| compare_default_row_order(left.0, right.0));
         }
 
         let total = rows.len();
         let start = query.offset.min(total);
         let end = start.saturating_add(query.limit).min(total);
-        let rows = rows[start..end].to_vec();
+        let mut rows: Vec<_> = rows[start..end]
+            .iter()
+            .map(|(row, _)| (*row).clone())
+            .collect();
+        annotate_first_inlink_sources(&mut rows, &inner.first_inlink_sources);
 
         GridResponse {
             rows,
@@ -1838,7 +1916,7 @@ impl MemoryStore {
 
     pub fn link_edges(&self, query: LinkEdgeQuery) -> LinkEdgeResponse {
         let inner = self.inner.read().expect("memory store lock poisoned");
-        let mut edges = inner.link_edges.clone();
+        let mut edges: Vec<_> = inner.link_edges.iter().collect();
         filter_link_edges(&mut edges, &query, &inner.records);
         if let Some(search) = query
             .global_search
@@ -1853,14 +1931,19 @@ impl MemoryStore {
         }
         let total = edges.len();
         let limit = query.limit.min(1_000_000);
-        let rows = edges.into_iter().skip(query.offset).take(limit).collect();
+        let rows = edges
+            .into_iter()
+            .skip(query.offset)
+            .take(limit)
+            .cloned()
+            .collect();
 
         LinkEdgeResponse { edges: rows, total }
     }
 
     pub fn anchor_texts(&self, query: LinkEdgeQuery) -> AnchorTextResponse {
         let inner = self.inner.read().expect("memory store lock poisoned");
-        let mut edges = inner.link_edges.clone();
+        let mut edges: Vec<_> = inner.link_edges.iter().collect();
         filter_link_edges(&mut edges, &query, &inner.records);
         if let Some(search) = query
             .global_search
@@ -2072,6 +2155,13 @@ impl CrawlStore for MemoryStore {
         Self::link_edges(self, query)
     }
 
+    fn try_visit_records(
+        &self,
+        visitor: &mut dyn FnMut(CrawlRecord) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        ActiveStore::Memory(self.clone()).try_visit_records(visitor)
+    }
+
     fn try_visit_link_edges(
         &self,
         visitor: &mut dyn FnMut(&LinkEdge) -> std::io::Result<()>,
@@ -2141,14 +2231,9 @@ pub struct SqliteStore {
     image_alias_revision: Arc<Mutex<Option<i64>>>,
 }
 
-struct CachedSummary {
-    revision: i64,
-    summary: CrawlSummary,
-}
-
 struct CachedReferences {
     revision: i64,
-    counts: [usize; 14],
+    counts: [usize; 16],
 }
 
 struct CachedExactDuplicates {
@@ -2266,6 +2351,11 @@ impl SqliteStore {
         record.inlink_count =
             sqlite_inlink_count_for_record(&conn, &record)?.unwrap_or(record.inlink_count);
         let redirect_chain = serde_json::to_string(&record.redirect_chain)?;
+        let amphtml_targets = record
+            .amphtml_targets
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let rel_next_targets = record
             .rel_next_targets
             .as_ref()
@@ -2415,7 +2505,10 @@ impl SqliteStore {
                     content_hash = ?103,
                     content_hash_context = ?104,
                     rel_next_targets = ?105,
-                    rel_prev_targets = ?106
+                    rel_prev_targets = ?106,
+                    amphtml_targets = ?107,
+                    amp_document = ?108,
+                    html_doctype = ?109
                  WHERE id = ?92",
                 params![
                     record.url,
@@ -2527,7 +2620,10 @@ impl SqliteStore {
                     record.content_hash,
                     record.content_hash_context,
                     rel_next_targets,
-                    rel_prev_targets
+                    rel_prev_targets,
+                    amphtml_targets,
+                    record.amp_document,
+                    record.html_doctype
                 ],
             )?;
             update_sqlite_edge_statuses(&conn, &record)?;
@@ -2640,7 +2736,10 @@ impl SqliteStore {
                     content_hash,
                     content_hash_context,
                     rel_next_targets,
-                    rel_prev_targets
+                    rel_prev_targets,
+                    amphtml_targets,
+                    amp_document,
+                    html_doctype
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
@@ -2651,7 +2750,7 @@ impl SqliteStore {
                     ?70, ?71, ?72, ?73, ?74, ?75, ?76, ?77, ?78, ?79, ?80,
                     ?81, ?82, ?83, ?84, ?85, ?86, ?87, ?88, ?89, ?90, ?91, ?92, ?93,
                     ?94, ?95, ?96, ?97, ?98, ?99, ?100, ?101, ?102, ?103,
-                    ?104, ?105
+                    ?104, ?105, ?106, ?107, ?108
                  )",
                 params![
                     record.url,
@@ -2762,7 +2861,10 @@ impl SqliteStore {
                     record.content_hash,
                     record.content_hash_context,
                     rel_next_targets,
-                    rel_prev_targets
+                    rel_prev_targets,
+                    amphtml_targets,
+                    record.amp_document,
+                    record.html_doctype
                 ],
             )?;
             record.id = conn.last_insert_rowid() as u64;
@@ -3674,34 +3776,7 @@ impl SqliteStore {
         Ok(summary)
     }
 
-    fn progress_summary_with_connection(
-        &self,
-        conn: &Connection,
-    ) -> Result<CrawlSummary, StorageError> {
-        let revision = crawl_audit_revision(conn)?;
-        // ponytail: reuse aggregates between writes; incremental counters if active large crawls dominate.
-        let mut cache = self
-            .summary_cache
-            .lock()
-            .map_err(|_| StorageError::LockPoisoned)?;
-        if let Some(cached) = &*cache
-            && cached.revision == revision
-        {
-            return Ok(cached.summary.clone());
-        }
-        let mut summary = sqlite_progress_counts(conn)?;
-        summary.title_duplicate = sqlite_duplicate_count(conn, "title")?;
-        summary.meta_duplicate = sqlite_duplicate_count(conn, "meta_description")?;
-        summary.h1_duplicate = sqlite_duplicate_count(conn, "h1")?;
-        summary.h2_duplicate = sqlite_duplicate_count(conn, "h2")?;
-        *cache = Some(CachedSummary {
-            revision,
-            summary: summary.clone(),
-        });
-        Ok(summary)
-    }
-
-    fn ensure_reference_diagnostics(&self, conn: &Connection) -> Result<[usize; 14], StorageError> {
+    fn ensure_reference_diagnostics(&self, conn: &Connection) -> Result<[usize; 16], StorageError> {
         let revision = crawl_audit_revision(conn)?;
         let mut cache = self
             .reference_cache
@@ -3727,7 +3802,7 @@ impl SqliteStore {
                 COALESCE((status_code BETWEEN 400 AND 599 OR ({NO_RESPONSE_SQL})
                     OR (status_code BETWEEN 300 AND 399 AND error IS NOT NULL)), 0),
                 COALESCE(error != 'Redirect limit exceeded', 1), amphtml,
-                rel_next_targets, rel_prev_targets
+                rel_next_targets, rel_prev_targets, amphtml_targets, amp_document
                 FROM crawl_records ORDER BY id", broken_record_sql(), broken_record_sql());
             let mut statement = transaction.prepare(&sql)?;
             let rows = statement.query_map([], reference_audit_record_from_row)?;
@@ -3971,6 +4046,9 @@ impl SqliteStore {
                 x_content_type_options_header INTEGER NOT NULL DEFAULT 0,
                 viewport INTEGER NOT NULL DEFAULT 0,
                 amphtml TEXT,
+                amphtml_targets TEXT,
+                amp_document INTEGER,
+                html_doctype INTEGER,
                 rel_next TEXT,
                 rel_prev TEXT,
                 rel_next_targets TEXT,
@@ -4179,6 +4257,9 @@ impl SqliteStore {
         )?;
         add_column_if_missing(&conn, "viewport", "INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&conn, "amphtml", "TEXT")?;
+        add_column_if_missing(&conn, "amphtml_targets", "TEXT")?;
+        add_column_if_missing(&conn, "amp_document", "INTEGER")?;
+        add_column_if_missing(&conn, "html_doctype", "INTEGER")?;
         add_column_if_missing(&conn, "meta_keywords", "TEXT")?;
         add_column_if_missing(&conn, "field_vitals", "TEXT")?;
         for column in [
@@ -4285,6 +4366,7 @@ impl SqliteStore {
                 UPDATE crawl_audit_revision SET revision = revision + 1 WHERE id = 1;
             END;",
         )?;
+        progress_summary::initialize(&conn)?;
         add_table_column_if_missing(
             &conn,
             "link_edges",
@@ -4403,6 +4485,13 @@ impl CrawlStore for SqliteStore {
     fn link_edges(&self, query: LinkEdgeQuery) -> LinkEdgeResponse {
         self.try_link_edges(query)
             .expect("sqlite link edge query failed")
+    }
+
+    fn try_visit_records(
+        &self,
+        visitor: &mut dyn FnMut(CrawlRecord) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        ActiveStore::Sqlite(self.clone()).try_visit_records(visitor)
     }
 
     fn try_visit_link_edges(
@@ -4648,6 +4737,13 @@ impl CrawlStore for ActiveStore {
         }
     }
 
+    fn try_visit_records(
+        &self,
+        visitor: &mut dyn FnMut(CrawlRecord) -> std::io::Result<()>,
+    ) -> Result<usize, StorageError> {
+        Self::try_visit_records(self, visitor)
+    }
+
     fn try_visit_link_edges(
         &self,
         visitor: &mut dyn FnMut(&LinkEdge) -> std::io::Result<()>,
@@ -4830,6 +4926,12 @@ fn summarize_without_canonicals(records: &[CrawlRecord]) -> CrawlSummary {
             continue;
         }
 
+        summary.amp_multiple_targets += usize::from(
+            record
+                .amphtml_targets
+                .as_ref()
+                .is_some_and(|targets| targets.len() > 1),
+        );
         summary.pagination_multiple_targets += usize::from(
             record
                 .rel_next_targets
@@ -4932,6 +5034,9 @@ fn summarize_without_canonicals(records: &[CrawlRecord]) -> CrawlSummary {
         }
         if record.deprecated_html_tag_count > 0 {
             summary.deprecated_html_tags += 1;
+        }
+        if record.html_doctype == Some(false) {
+            summary.missing_html_doctype += 1;
         }
         if record.duplicate_id_count > 0 {
             summary.duplicate_ids += 1;
@@ -5515,31 +5620,33 @@ fn optional_u16_value(value: Option<u16>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn memory_record_index_by_url(inner: &MemoryStoreInner, url: &str) -> Option<usize> {
+fn memory_record_index_by_aliases(
+    inner: &MemoryStoreInner,
+    aliases: &HashSet<String>,
+) -> Option<usize> {
     // A redirect or List occurrence can share aliases with later records.
     // Keep the earliest stored record, including when its aliases change on update.
-    url_aliases(url)
+    aliases
         .iter()
         .filter_map(|alias| inner.alias_to_indices.get(alias)?.first().copied())
         .min()
 }
 
-fn update_memory_edge_statuses(edges: &mut [LinkEdge], record: &CrawlRecord) {
-    let aliases = record_url_aliases(record);
-    for edge in edges {
-        if url_aliases(&edge.source_url)
-            .iter()
-            .any(|alias| aliases.contains(alias))
-        {
-            edge.source_status_code = record.status_code;
-            edge.source_depth = record.depth;
+fn update_memory_edge_statuses(inner: &mut MemoryStoreInner, record: &CrawlRecord) {
+    for alias in record_url_aliases(record) {
+        if let Some(indices) = inner.edge_source_indices.get(&alias) {
+            for &index in indices {
+                let edge = &mut inner.link_edges[index];
+                edge.source_status_code = record.status_code;
+                edge.source_depth = record.depth;
+            }
         }
-        if url_aliases(&edge.target_url)
-            .iter()
-            .any(|alias| aliases.contains(alias))
-        {
-            edge.target_status_code = record.status_code;
-            edge.target_depth = Some(record.depth);
+        if let Some(indices) = inner.edge_target_indices.get(&alias) {
+            for &index in indices {
+                let edge = &mut inner.link_edges[index];
+                edge.target_status_code = record.status_code;
+                edge.target_depth = Some(record.depth);
+            }
         }
     }
 }
@@ -5561,7 +5668,7 @@ fn memory_inlink_count_for_aliases(
         .sum()
 }
 
-fn filter_link_edges(edges: &mut Vec<LinkEdge>, query: &LinkEdgeQuery, records: &[CrawlRecord]) {
+fn filter_link_edges(edges: &mut Vec<&LinkEdge>, query: &LinkEdgeQuery, records: &[CrawlRecord]) {
     match query.view {
         LinkEdgeView::All => {}
         LinkEdgeView::Internal => edges.retain(|edge| edge.link_type == LinkType::Internal),
@@ -5599,7 +5706,7 @@ struct AnchorTextAccumulator {
     sources: HashSet<String>,
 }
 
-fn aggregate_anchor_texts(edges: Vec<LinkEdge>) -> Vec<AnchorTextRow> {
+fn aggregate_anchor_texts(edges: Vec<&LinkEdge>) -> Vec<AnchorTextRow> {
     let mut groups: HashMap<(String, String, String), AnchorTextAccumulator> = HashMap::new();
 
     for edge in edges {
@@ -5634,7 +5741,7 @@ fn aggregate_anchor_texts(edges: Vec<LinkEdge>) -> Vec<AnchorTextRow> {
         if entry.row.target_status_code.is_none() {
             entry.row.target_status_code = edge.target_status_code;
         }
-        entry.sources.insert(edge.source_url);
+        entry.sources.insert(edge.source_url.clone());
     }
 
     groups
@@ -6061,6 +6168,9 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CrawlRecord> {
         x_content_type_options_header: row.get("x_content_type_options_header")?,
         viewport: row.get("viewport")?,
         amphtml: row.get("amphtml")?,
+        amphtml_targets: json_column(row, "amphtml_targets")?,
+        amp_document: row.get("amp_document")?,
+        html_doctype: row.get("html_doctype")?,
         meta_keywords: row.get("meta_keywords")?,
         rel_next: row.get("rel_next")?,
         rel_prev: row.get("rel_prev")?,
@@ -6296,42 +6406,48 @@ fn update_sqlite_edge_statuses(
     Ok(())
 }
 
-fn apply_first_inlink_sources(records: &mut [CrawlRecord], edges: &[LinkEdge]) {
-    let mut first_sources: HashMap<String, FirstInlinkSource> = HashMap::new();
-    for edge in edges {
-        let candidate = FirstInlinkSource {
-            source_url: edge.source_url.clone(),
-            anchor_text: edge.anchor_text.clone(),
-            source_position: edge.source_position,
-            discovery_order: edge.discovery_order,
-        };
-        for alias in url_aliases(&edge.target_url) {
-            first_sources
-                .entry(alias)
-                .and_modify(|current| {
-                    if first_source_order(&candidate, current) == Ordering::Less {
-                        *current = candidate.clone();
-                    }
-                })
-                .or_insert_with(|| candidate.clone());
-        }
+fn index_first_inlink_source(
+    first_sources: &mut HashMap<String, FirstInlinkSource>,
+    edge: &LinkEdge,
+    target_aliases: &HashSet<String>,
+) {
+    // Edges are append-only and their discovery order is assigned from increasing IDs.
+    for alias in target_aliases {
+        first_sources
+            .entry(alias.clone())
+            .or_insert_with(|| FirstInlinkSource {
+                source_url: edge.source_url.clone(),
+                anchor_text: edge.anchor_text.clone(),
+                source_position: edge.source_position,
+                discovery_order: edge.discovery_order,
+            });
     }
+}
 
+fn annotate_first_inlink_sources(
+    records: &mut [CrawlRecord],
+    first_sources: &HashMap<String, FirstInlinkSource>,
+) {
     for record in records {
         record.first_inlink_source_url = None;
         record.first_inlink_anchor_text = None;
         record.first_inlink_source_position = None;
-        let record_aliases = record_url_aliases(record);
-        if let Some(first_source) = record_aliases
-            .iter()
-            .filter_map(|alias| first_sources.get(alias))
-            .min_by(|left, right| first_source_order(left, right))
-        {
+        if let Some(first_source) = first_inlink_source_for_record(record, first_sources) {
             record.first_inlink_source_url = Some(first_source.source_url.clone());
             record.first_inlink_anchor_text = Some(first_source.anchor_text.clone());
             record.first_inlink_source_position = Some(first_source.source_position);
         }
     }
+}
+
+fn first_inlink_source_for_record<'a>(
+    record: &CrawlRecord,
+    first_sources: &'a HashMap<String, FirstInlinkSource>,
+) -> Option<&'a FirstInlinkSource> {
+    record_url_aliases(record)
+        .iter()
+        .filter_map(|alias| first_sources.get(alias))
+        .min_by(|left, right| first_source_order(left, right))
 }
 
 fn first_source_order(left: &FirstInlinkSource, right: &FirstInlinkSource) -> Ordering {
@@ -6402,12 +6518,7 @@ fn annotate_sqlite_first_inlink_sources(
     }
 
     for record in records {
-        let record_aliases = record_url_aliases(record);
-        if let Some(first_source) = record_aliases
-            .iter()
-            .filter_map(|alias| first_sources.get(alias))
-            .min_by(|left, right| first_source_order(left, right))
-        {
+        if let Some(first_source) = first_inlink_source_for_record(record, &first_sources) {
             record.first_inlink_source_url = Some(first_source.source_url.clone());
             record.first_inlink_anchor_text = Some(first_source.anchor_text.clone());
             record.first_inlink_source_position = Some(first_source.source_position);
@@ -6524,6 +6635,9 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             x_content_type_options_header INTEGER NOT NULL DEFAULT 0,
             viewport INTEGER NOT NULL DEFAULT 0,
             amphtml TEXT,
+            amphtml_targets TEXT,
+                amp_document INTEGER,
+            html_doctype INTEGER,
             rel_next TEXT,
             rel_prev TEXT,
             rel_next_targets TEXT,
@@ -6631,6 +6745,9 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             x_content_type_options_header,
             viewport,
             amphtml,
+            amphtml_targets,
+            amp_document,
+            html_doctype,
             rel_next,
             rel_prev,
             rel_next_targets,
@@ -6726,6 +6843,9 @@ fn migrate_final_url_unique_constraint(conn: &Connection) -> Result<(), StorageE
             x_content_type_options_header,
             viewport,
             amphtml,
+            amphtml_targets,
+            amp_document,
+            html_doctype,
             rel_next,
             rel_prev,
             rel_next_targets,
@@ -7169,13 +7289,15 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
         ),
         IssueView::CanonicalMissing => clauses.push("(canonical IS NULL OR ff_trim(canonical) = '')".to_string()),
         IssueView::CanonicalMultiple => clauses.push("canonical_count > 1".to_string()),
+        IssueView::AmpMultipleTargets => clauses.push("COALESCE(json_array_length(amphtml_targets), 0) > 1".to_string()),
         IssueView::PaginationMultipleTargets => clauses.push("(COALESCE(json_array_length(rel_next_targets), 0) > 1 OR COALESCE(json_array_length(rel_prev_targets), 0) > 1)".to_string()),
         IssueView::CanonicalUncrawled | IssueView::CanonicalToRedirect | IssueView::CanonicalToError
         | IssueView::CanonicalNonIndexable | IssueView::CanonicalChain | IssueView::CanonicalLoop
         | IssueView::PaginationNextToError | IssueView::PaginationPrevToError
         | IssueView::PaginationNextLoop | IssueView::PaginationPrevLoop
         | IssueView::PaginationNextNonReciprocal | IssueView::PaginationPrevNonReciprocal
-        | IssueView::AmpToError | IssueView::AmpNonReciprocal => {
+        | IssueView::PaginationCanonicalToLinkedPage
+        | IssueView::AmpToError | IssueView::AmpNonReciprocal | IssueView::AmpTargetMissingMarker => {
             let mask = reference_view_mask(&query.view).expect("reference view");
             clauses.push(format!("id IN (SELECT record_id FROM ff_reference_diagnostics WHERE (flags & {mask}) != 0)"));
         }
@@ -7224,6 +7346,7 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
             clauses.push("structured_data_warning_count > 0".to_string())
         }
         IssueView::HtmlDeprecatedTags => clauses.push("deprecated_html_tag_count > 0".to_string()),
+        IssueView::HtmlMissingDoctype => clauses.push("html_doctype = 0".to_string()),
         IssueView::HtmlDuplicateIds => clauses.push("duplicate_id_count > 0".to_string()),
         IssueView::RenderedDomChanged => clauses.push("rendered_dom_changed != 0".to_string()),
         IssueView::NearDuplicate => clauses.push(format!(
@@ -7289,6 +7412,9 @@ fn query_filter_sql(query: &GridQuery) -> (String, Vec<String>) {
         ));
         predicates.push(format!(
             "EXISTS (SELECT 1 FROM json_each(rel_prev_targets) target WHERE ff_contains(target.value, {parameter}))"
+        ));
+        predicates.push(format!(
+            "EXISTS (SELECT 1 FROM json_each(amphtml_targets) target WHERE ff_contains(target.value, {parameter}))"
         ));
         predicates.push(format!("ff_custom_contains(custom_extractions, custom_searches, structured_data_issues, {parameter})"));
         predicates.push(sqlite_first_inlink_expression(&format!(
@@ -7584,73 +7710,7 @@ fn summary_count(conn: &Connection, sql: &str) -> Result<usize, StorageError> {
     Ok(value)
 }
 
-fn sqlite_progress_counts(conn: &Connection) -> Result<CrawlSummary, StorageError> {
-    let view_filter = |view| {
-        let (filter, args) = query_filter_sql(&GridQuery {
-            view,
-            ..GridQuery::default()
-        });
-        debug_assert!(args.is_empty());
-        filter
-    };
-    // Pair each SQL projection with its decoded field so column order cannot drift.
-    macro_rules! count_fields {
-        ($($field:ident: $filter:expr),+ $(,)?) => {{
-            let projections = [$({
-                let filter = $filter;
-                let count = if filter.is_empty() {
-                    "COUNT(*)".to_string()
-                } else {
-                    format!("COUNT(*) FILTER({filter})")
-                };
-                format!("{count} AS {}", stringify!($field))
-            }),+];
-            let sql = format!("SELECT {} FROM crawl_records", projections.join(", "));
-            Ok(conn.query_row(&sql, [], |row| Ok(CrawlSummary {
-                $($field: row.get::<_, i64>(stringify!($field))? as usize,)+
-                ..CrawlSummary::default()
-            }))?)
-        }};
-    }
-    count_fields! {
-        total: view_filter(IssueView::All),
-        internal: view_filter(IssueView::Internal),
-        external: view_filter(IssueView::External),
-        success: view_filter(IssueView::Status2xx),
-        redirects: view_filter(IssueView::Status3xx),
-        client_errors: view_filter(IssueView::Status4xx),
-        server_errors: view_filter(IssueView::Status5xx),
-        no_response: view_filter(IssueView::NoResponse),
-        broken: view_filter(IssueView::BrokenLinks),
-        near_duplicates: view_filter(IssueView::NearDuplicate),
-        indexable: " WHERE indexability = 'Indexable'".to_string(),
-        non_indexable: " WHERE indexability = 'Non-indexable'".to_string(),
-        title_missing: view_filter(IssueView::TitleMissing),
-        title_multiple: view_filter(IssueView::TitleMultiple),
-        meta_missing: view_filter(IssueView::MetaMissing),
-        meta_multiple: view_filter(IssueView::MetaMultiple),
-        h1_missing: view_filter(IssueView::H1Missing),
-        h2_missing: view_filter(IssueView::H2Missing),
-        canonical_missing: view_filter(IssueView::CanonicalMissing),
-        canonical_multiple: view_filter(IssueView::CanonicalMultiple),
-        pagination_multiple_targets: view_filter(IssueView::PaginationMultipleTargets),
-        noindex: view_filter(IssueView::DirectivesNoindex),
-        images_missing_alt: view_filter(IssueView::ImagesMissingAlt),
-        images_alt_too_long: view_filter(IssueView::ImagesAltTooLong),
-        mixed_content: view_filter(IssueView::SecurityMixedContent),
-        insecure_forms: view_filter(IssueView::SecurityInsecureForms),
-        hreflang_invalid: view_filter(IssueView::HreflangInvalid),
-        structured_data_invalid: view_filter(IssueView::StructuredDataInvalid),
-        structured_data_warnings: view_filter(IssueView::StructuredDataWarning),
-        deprecated_html_tags: view_filter(IssueView::HtmlDeprecatedTags),
-        duplicate_ids: view_filter(IssueView::HtmlDuplicateIds),
-        rendered_dom_changed: view_filter(IssueView::RenderedDomChanged),
-        missing_viewport: view_filter(IssueView::MobileMissingViewport),
-        missing_hsts: view_filter(IssueView::SecurityMissingHsts),
-        sitemap_orphans: view_filter(IssueView::SitemapOrphan),
-    }
-}
-
+#[cfg(test)]
 fn sqlite_duplicate_count(conn: &Connection, column: &str) -> Result<usize, StorageError> {
     let column = sqlite_identifier(column);
     summary_count(
@@ -7759,6 +7819,8 @@ pub struct ReferenceDiagnostics {
     pub amp_to_error: bool,
     /// An observed complete HTML AMP target does not canonically return to its source.
     pub amp_non_reciprocal: bool,
+    /// An observed complete HTML target explicitly lacks an amp/⚡ marker in its original HTML.
+    pub amp_target_missing_marker: bool,
     /// The source's next-only path enters a cycle, including self-pagination.
     pub pagination_next_loop: bool,
     /// The source's previous-only path enters a cycle, including self-pagination.
@@ -7767,6 +7829,8 @@ pub struct ReferenceDiagnostics {
     pub pagination_next_non_reciprocal: bool,
     /// An observed previous page has no captured next return, or returns to another known page.
     pub pagination_prev_non_reciprocal: bool,
+    /// The canonical resolves to a different observed HTML page declared as next or previous.
+    pub pagination_canonical_to_linked_page: bool,
 }
 
 impl ReferenceDiagnostics {
@@ -7780,6 +7844,8 @@ impl ReferenceDiagnostics {
             | (u16::from(self.pagination_next_non_reciprocal) << 11)
             | (u16::from(self.pagination_prev_non_reciprocal) << 12)
             | (u16::from(self.amp_non_reciprocal) << 13)
+            | (u16::from(self.pagination_canonical_to_linked_page) << 14)
+            | (u16::from(self.amp_target_missing_marker) << 15)
     }
 }
 
@@ -7794,6 +7860,8 @@ struct ReferenceAuditRecord {
     rel_next_targets: Option<Vec<String>>,
     rel_prev_targets: Option<Vec<String>>,
     amphtml: Option<String>,
+    amphtml_targets: Option<Vec<String>>,
+    amp_document: Option<bool>,
     eligible: bool,
     internal: bool,
     fetched: bool,
@@ -7818,6 +7886,8 @@ impl From<&CrawlRecord> for ReferenceAuditRecord {
             rel_next_targets: record.rel_next_targets.clone(),
             rel_prev_targets: record.rel_prev_targets.clone(),
             amphtml: record.amphtml.clone(),
+            amphtml_targets: record.amphtml_targets.clone(),
+            amp_document: record.amp_document,
             eligible: is_success_html_record(record),
             internal: record.classification == UrlClassification::Internal,
             fetched: record.status_code.is_some()
@@ -7867,6 +7937,8 @@ fn reference_audit_record_from_row(
         rel_next_targets: json_column(row, "rel_next_targets")?,
         rel_prev_targets: json_column(row, "rel_prev_targets")?,
         amphtml: row.get(16)?,
+        amphtml_targets: json_column(row, "amphtml_targets")?,
+        amp_document: row.get("amp_document")?,
         eligible: row.get(4)?,
         internal: row.get(5)?,
         fetched: row.get(6)?,
@@ -8025,7 +8097,33 @@ fn build_reference_diagnostics(records: &[ReferenceAuditRecord]) -> Vec<Referenc
             let prev_targets = pagination_targets(record, false)
                 .filter_map(&observed_target)
                 .collect::<Vec<_>>();
-            let amp_target = record.amphtml.as_deref().and_then(observed_target);
+            diagnostic.pagination_canonical_to_linked_page = record
+                .canonical
+                .as_deref()
+                .and_then(&observed_target)
+                .filter(|&index| records[index].eligible)
+                .and_then(|index| normalized_final_url(&records[index].final_url))
+                .is_some_and(|canonical| {
+                    normalized_final_url(&record.final_url)
+                        .is_some_and(|source| source != canonical)
+                        && next_targets.iter().chain(&prev_targets).any(|&index| {
+                            records[index].eligible
+                                && normalized_final_url(&records[index].final_url)
+                                    .is_some_and(|target| target == canonical)
+                        })
+                });
+            let amp_targets = record
+                .amphtml_targets
+                .iter()
+                .flatten()
+                .chain(
+                    record
+                        .amphtml
+                        .iter()
+                        .filter(|_| record.amphtml_targets.is_none()),
+                )
+                .filter_map(|target| observed_target(target))
+                .collect::<Vec<_>>();
             let target_has_error =
                 |target: Option<usize>| target.is_some_and(|index| records[index].target_error);
             diagnostic.pagination_next_to_error = next_targets
@@ -8036,10 +8134,16 @@ fn build_reference_diagnostics(records: &[ReferenceAuditRecord]) -> Vec<Referenc
                 .iter()
                 .copied()
                 .any(|target| target_has_error(Some(target)));
-            diagnostic.amp_to_error = target_has_error(amp_target);
-            diagnostic.amp_non_reciprocal = amp_target
+            diagnostic.amp_to_error = amp_targets
+                .iter()
+                .any(|&target| target_has_error(Some(target)));
+            diagnostic.amp_target_missing_marker = amp_targets.iter().any(|&index| {
+                records[index].eligible && records[index].amp_document == Some(false)
+            });
+            diagnostic.amp_non_reciprocal = amp_targets
+                .into_iter()
                 .filter(|&index| records[index].eligible)
-                .is_some_and(|index| {
+                .any(|index| {
                     let canonical = records[index]
                         .canonical
                         .as_deref()
@@ -8348,12 +8452,14 @@ fn reference_view_mask(view: &IssueView) -> Option<u16> {
         IssueView::PaginationNextNonReciprocal => 2048,
         IssueView::PaginationPrevNonReciprocal => 4096,
         IssueView::AmpNonReciprocal => 8192,
+        IssueView::PaginationCanonicalToLinkedPage => 16384,
+        IssueView::AmpTargetMissingMarker => 32768,
         _ => return None,
     })
 }
 
-fn reference_counts(diagnostics: &[ReferenceDiagnostics]) -> [usize; 14] {
-    let mut counts = [0; 14];
+fn reference_counts(diagnostics: &[ReferenceDiagnostics]) -> [usize; 16] {
+    let mut counts = [0; 16];
     for diagnostic in diagnostics {
         for (index, count) in counts.iter_mut().enumerate() {
             *count += usize::from(diagnostic.flags() & (1 << index) != 0);
@@ -8362,7 +8468,7 @@ fn reference_counts(diagnostics: &[ReferenceDiagnostics]) -> [usize; 14] {
     counts
 }
 
-fn set_reference_summary(summary: &mut CrawlSummary, counts: [usize; 14]) {
+fn set_reference_summary(summary: &mut CrawlSummary, counts: [usize; 16]) {
     [
         summary.canonical_uncrawled,
         summary.canonical_to_redirect,
@@ -8378,6 +8484,8 @@ fn set_reference_summary(summary: &mut CrawlSummary, counts: [usize; 14]) {
         summary.pagination_next_non_reciprocal,
         summary.pagination_prev_non_reciprocal,
         summary.amp_non_reciprocal,
+        summary.pagination_canonical_to_linked_page,
+        summary.amp_target_missing_marker,
     ] = counts;
 }
 
@@ -8606,6 +8714,9 @@ fn matches_view(
         IssueView::PaginationPrevLoop => references.pagination_prev_loop,
         IssueView::PaginationNextNonReciprocal => references.pagination_next_non_reciprocal,
         IssueView::PaginationPrevNonReciprocal => references.pagination_prev_non_reciprocal,
+        IssueView::PaginationCanonicalToLinkedPage => {
+            references.pagination_canonical_to_linked_page
+        }
         IssueView::PaginationMultipleTargets => {
             row.rel_next_targets
                 .as_ref()
@@ -8615,8 +8726,13 @@ fn matches_view(
                     .as_ref()
                     .is_some_and(|targets| targets.len() > 1)
         }
+        IssueView::AmpMultipleTargets => row
+            .amphtml_targets
+            .as_ref()
+            .is_some_and(|targets| targets.len() > 1),
         IssueView::AmpToError => references.amp_to_error,
         IssueView::AmpNonReciprocal => references.amp_non_reciprocal,
+        IssueView::AmpTargetMissingMarker => references.amp_target_missing_marker,
         IssueView::DirectivesNoindex => row.indexability_status.to_lowercase().contains("noindex"),
         IssueView::ImagesMissingAlt => row.images_missing_alt > 0,
         IssueView::ImagesAltTooLong => row.images_alt_too_long > 0,
@@ -8648,6 +8764,7 @@ fn matches_view(
         }
         IssueView::StructuredDataWarning => row.structured_data_warning_count > 0,
         IssueView::HtmlDeprecatedTags => row.deprecated_html_tag_count > 0,
+        IssueView::HtmlMissingDoctype => row.html_doctype == Some(false),
         IssueView::HtmlDuplicateIds => row.duplicate_id_count > 0,
         IssueView::RenderedDomChanged => row.rendered_dom_changed,
         IssueView::NearDuplicate => {
@@ -8710,9 +8827,12 @@ fn is_html_audit_view(view: &IssueView) -> bool {
             | IssueView::PaginationPrevLoop
             | IssueView::PaginationNextNonReciprocal
             | IssueView::PaginationPrevNonReciprocal
+            | IssueView::PaginationCanonicalToLinkedPage
             | IssueView::PaginationMultipleTargets
+            | IssueView::AmpMultipleTargets
             | IssueView::AmpToError
             | IssueView::AmpNonReciprocal
+            | IssueView::AmpTargetMissingMarker
             | IssueView::ImagesMissingAlt
             | IssueView::ImagesAltTooLong
             | IssueView::SecurityMixedContent
@@ -8727,6 +8847,7 @@ fn is_html_audit_view(view: &IssueView) -> bool {
             | IssueView::StructuredDataInvalid
             | IssueView::StructuredDataWarning
             | IssueView::HtmlDeprecatedTags
+            | IssueView::HtmlMissingDoctype
             | IssueView::HtmlDuplicateIds
             | IssueView::RenderedDomChanged
             | IssueView::NearDuplicate
@@ -8819,7 +8940,11 @@ pub fn is_success_html_record(row: &CrawlRecord) -> bool {
             .unwrap_or(false)
 }
 
-fn row_matches_search(row: &CrawlRecord, search: &str) -> bool {
+fn row_matches_search(
+    row: &CrawlRecord,
+    search: &str,
+    first_source: Option<&FirstInlinkSource>,
+) -> bool {
     row.url.to_lowercase().contains(search)
         || row.final_url.to_lowercase().contains(search)
         || row
@@ -8893,6 +9018,11 @@ fn row_matches_search(row: &CrawlRecord, search: &str) -> bool {
                 .iter()
                 .any(|target| target.to_lowercase().contains(search))
         })
+        || row.amphtml_targets.as_ref().is_some_and(|targets| {
+            targets
+                .iter()
+                .any(|target| target.to_lowercase().contains(search))
+        })
         || row.rel_prev_targets.as_ref().is_some_and(|targets| {
             targets
                 .iter()
@@ -8938,21 +9068,18 @@ fn row_matches_search(row: &CrawlRecord, search: &str) -> bool {
             .search_console_average_position
             .map(|value| value.to_string().contains(search))
             .unwrap_or(false)
-        || row
-            .first_inlink_source_url
-            .as_deref()
+        || first_source
+            .map(|source| source.source_url.as_str())
             .unwrap_or("")
             .to_lowercase()
             .contains(search)
-        || row
-            .first_inlink_anchor_text
-            .as_deref()
+        || first_source
+            .map(|source| source.anchor_text.as_str())
             .unwrap_or("")
             .to_lowercase()
             .contains(search)
-        || row
-            .first_inlink_source_position
-            .map(|position| position.to_string().contains(search))
+        || first_source
+            .map(|source| source.source_position.to_string().contains(search))
             .unwrap_or(false)
         || custom_data_matches_search(
             &row.custom_extractions,
@@ -9011,9 +9138,23 @@ fn link_edge_matches_search(edge: &LinkEdge, search: &str) -> bool {
         || edge.discovery_order.to_string().contains(search)
 }
 
-fn sort_rows(rows: &mut [CrawlRecord], sort_by: &str, sort_dir: &SortDirection) {
+fn sort_rows(
+    rows: &mut [(&CrawlRecord, Option<&FirstInlinkSource>)],
+    sort_by: &str,
+    sort_dir: &SortDirection,
+) {
     rows.sort_by(|left, right| {
-        let ordering = compare_rows(left, right, sort_by);
+        let ordering = match sort_by {
+            "firstInlinkSourceUrl" => left
+                .1
+                .map(|source| source.source_url.as_str())
+                .cmp(&right.1.map(|source| source.source_url.as_str())),
+            "firstInlinkSourcePosition" => left
+                .1
+                .map(|source| source.source_position)
+                .cmp(&right.1.map(|source| source.source_position)),
+            _ => compare_rows(left.0, right.0, sort_by),
+        };
         match sort_dir {
             SortDirection::Asc => ordering,
             SortDirection::Desc => ordering.reverse(),
@@ -9151,12 +9292,6 @@ fn compare_rows(left: &CrawlRecord, right: &CrawlRecord, sort_by: &str) -> Order
             .near_duplicate_cluster_id
             .cmp(&right.near_duplicate_cluster_id),
         "inlinkCount" => left.inlink_count.cmp(&right.inlink_count),
-        "firstInlinkSourceUrl" => left
-            .first_inlink_source_url
-            .cmp(&right.first_inlink_source_url),
-        "firstInlinkSourcePosition" => left
-            .first_inlink_source_position
-            .cmp(&right.first_inlink_source_position),
         "outlinkCount" => left.outlink_count.cmp(&right.outlink_count),
         "title" => left.title.cmp(&right.title),
         "url" => left.url.cmp(&right.url),
@@ -9191,7 +9326,7 @@ fn custom_search_sort_value(record: &CrawlRecord, name: &str) -> usize {
         .sum::<usize>()
 }
 
-fn sort_link_edges(edges: &mut [LinkEdge], sort_by: &str, sort_dir: &SortDirection) {
+fn sort_link_edges(edges: &mut [&LinkEdge], sort_by: &str, sort_dir: &SortDirection) {
     edges.sort_by(|left, right| {
         let ordering = compare_link_edges(left, right, sort_by);
         match sort_dir {
@@ -9380,6 +9515,12 @@ mod pagespeed_tests;
 mod amp_tests;
 
 #[cfg(test)]
+mod html_doctype_tests;
+
+#[cfg(test)]
+mod memory_endpoint_tests;
+
+#[cfg(test)]
 mod multiple_metadata_tests;
 
 #[cfg(test)]
@@ -9397,6 +9538,108 @@ mod graph_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_first_inlink_index_does_not_rebuild_on_record_writes_or_reads() {
+        for edge_count in [50, 500] {
+            let store = ActiveStore::memory();
+            for index in 0..edge_count {
+                store.add_link_edge(test_edge(
+                    "https://example.com/source",
+                    &format!("https://example.com/target/{index}"),
+                    LinkType::Internal,
+                ));
+            }
+            URL_ALIAS_EXPANSIONS.with(|count| count.set(0));
+            let record = store.upsert(CrawlRecord::pending(
+                "https://example.com/target/0".into(),
+                1,
+            ));
+            let upsert_work = URL_ALIAS_EXPANSIONS.with(|count| count.replace(0));
+            let records = store.records();
+            let read_work = URL_ALIAS_EXPANSIONS.with(|count| count.replace(0));
+            let selected = store.try_records_by_ids(&[record.id]).unwrap();
+            let selected_work = URL_ALIAS_EXPANSIONS.with(|count| count.replace(0));
+            let mut visited = Vec::new();
+            store
+                .try_visit_records(|record| {
+                    visited.push(record);
+                    Ok(())
+                })
+                .unwrap();
+            let visitor_work = URL_ALIAS_EXPANSIONS.with(|count| count.get());
+            eprintln!(
+                "Memory first-inlink: {edge_count} edges, {upsert_work} upsert and {read_work}/{selected_work}/{visitor_work} read alias expansions"
+            );
+            for record in [&record, &records[0], &selected[0], &visited[0]] {
+                assert_eq!(
+                    record.first_inlink_source_url.as_deref(),
+                    Some("https://example.com/source")
+                );
+            }
+            assert!(
+                upsert_work <= 20,
+                "Upsert scanned unrelated endpoints/sources for {edge_count} edges: {upsert_work} alias expansions"
+            );
+            assert!(
+                [read_work, selected_work, visitor_work]
+                    .into_iter()
+                    .all(|work| work <= 3),
+                "Reads rebuilt sources for {edge_count} edges: {read_work}/{selected_work}/{visitor_work} alias expansions"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_first_inlink_index_preserves_discovery_aliases_occurrences_and_clear() {
+        let store = MemoryStore::new();
+        let mut first = test_edge(
+            "https://example.com/z-first",
+            "https://example.com#fragment",
+            LinkType::Internal,
+        );
+        first.anchor_text = "First discovered".into();
+        first.source_position = 9;
+        first.discovery_order = 999;
+        store.add_link_edge(first);
+        let mut later = test_edge(
+            "https://example.com/a-later",
+            "https://example.com/final",
+            LinkType::Internal,
+        );
+        later.source_position = 1;
+        later.discovery_order = 0;
+        store.add_link_edge(later);
+        for position in [1, 2] {
+            let mut record = CrawlRecord::pending("https://example.com/".into(), 1);
+            record.storage_key = format!("list:{position}:https://example.com/");
+            record.final_url = "https://example.com/final".into();
+            let record = store.upsert(record);
+            assert_eq!(
+                record.first_inlink_source_url.as_deref(),
+                Some("https://example.com/z-first")
+            );
+            assert_eq!(
+                record.first_inlink_anchor_text.as_deref(),
+                Some("First discovered")
+            );
+            assert_eq!(record.first_inlink_source_position, Some(9));
+        }
+        assert_eq!(store.records().len(), 2);
+        store.clear();
+        let mut record = store.upsert(CrawlRecord::pending("https://example.com/".into(), 1));
+        assert!(record.first_inlink_source_url.is_none());
+        store.add_link_edge(test_edge(
+            "https://example.com/after-clear",
+            "https://example.com/",
+            LinkType::Internal,
+        ));
+        record = store.upsert(record);
+        assert_eq!(
+            record.first_inlink_source_url.as_deref(),
+            Some("https://example.com/after-clear")
+        );
+    }
 
     #[test]
     fn memory_ingestion_lookups_do_not_scan_unrelated_records() {
@@ -9644,7 +9887,8 @@ mod tests {
             measurements.push(steps);
         }
         assert!(
-            measurements.iter().all(|steps| *steps < 300),
+            // Includes constant work to journal the changed ID for incremental summaries.
+            measurements.iter().all(|steps| *steps < 400),
             "One sitemap membership update scanned the crawl: {measurements:?} VM steps"
         );
         assert!(
@@ -12300,7 +12544,7 @@ mod tests {
         assert_eq!(store.load_frontier_state(), None);
     }
 
-    fn test_edge(source_url: &str, target_url: &str, link_type: LinkType) -> LinkEdge {
+    pub(super) fn test_edge(source_url: &str, target_url: &str, link_type: LinkType) -> LinkEdge {
         LinkEdge {
             id: 0,
             source_url: source_url.to_string(),

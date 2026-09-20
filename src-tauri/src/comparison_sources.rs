@@ -40,20 +40,20 @@ impl ComparisonSources {
     ) -> Result<Self, String> {
         let baseline = read_archive_records(reader, &directory.path().join("baseline.sqlite3"))?;
         let current_path = directory.path().join("current.sqlite3");
-        // ponytail: Memory and in-memory SQLite current sources still hydrate records once;
-        // add a stable record visitor if these headless comparison inputs need bounded staging.
-        let current = match current {
-            ActiveStore::Memory(store) => stage_records(store.records(), &current_path)?,
-            ActiveStore::Sqlite(store) => match store
+        let source_path = match current {
+            ActiveStore::Memory(_) => None,
+            ActiveStore::Sqlite(store) => store
                 .try_database_path()
-                .map_err(|error| error.to_string())?
-            {
-                Some(path) => copy_records(&path, &current_path)?,
-                None => stage_records(
-                    store.try_records().map_err(|error| error.to_string())?,
-                    &current_path,
-                )?,
-            },
+                .map_err(|error| error.to_string())?,
+        };
+        let current = if let Some(path) = source_path {
+            copy_records(&path, &current_path)?
+        } else {
+            let mut stage = RecordStage::new(&current_path)?;
+            current
+                .try_visit_records(|record| stage.insert(record).map_err(std::io::Error::other))
+                .map_err(|error| error.to_string())?;
+            stage.finish()?
         };
         Ok(Self {
             baseline,
@@ -110,6 +110,7 @@ fn copy_records(source: &Path, destination: &Path) -> Result<SqliteStore, String
         .map_err(|error| format!("failed to initialize comparison records: {error}"))
 }
 
+#[cfg(test)]
 fn stage_records(records: Vec<CrawlRecord>, path: &Path) -> Result<SqliteStore, String> {
     let mut stage = RecordStage::new(path)?;
     for record in records {

@@ -1,3 +1,6 @@
+mod html_stream;
+pub use html_stream::store_to_html_report_writer;
+
 pub mod audit_report;
 pub mod audit_report_comparison;
 pub use audit_report::{
@@ -30,7 +33,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod workbook_tests;
 
-const HEADERS: [&str; 113] = [
+const HEADERS: [&str; 123] = [
     "id",
     "url",
     "final_url",
@@ -144,6 +147,16 @@ const HEADERS: [&str; 113] = [
     "backlink_authority",
     "rel_next_targets",
     "rel_prev_targets",
+    "amphtml_targets",
+    "field_has_data",
+    "field_fcp_ms_p75",
+    "field_ttfb_ms_p75",
+    "field_requested_url",
+    "field_completed_at_ms",
+    "field_collection_period_start",
+    "field_collection_period_end",
+    "amp_document",
+    "html_doctype",
 ];
 
 fn optional_number(value: Option<f64>) -> String {
@@ -170,7 +183,9 @@ fn performance_columns(record: &CrawlRecord) -> [String; 19] {
         optional_number(lab.and_then(|s| s.lcp_ms)),
         optional_number(lab.and_then(|s| s.cls)),
         optional_number(lab.and_then(|s| s.tbt_ms)),
-        field
+        record
+            .field_vitals
+            .as_ref()
             .map(|s| format!("{:?}", s.form_factor).to_ascii_lowercase())
             .unwrap_or_default(),
         optional_number(field.and_then(|s| s.lcp_ms_p75)),
@@ -189,6 +204,29 @@ fn performance_columns(record: &CrawlRecord) -> [String; 19] {
             .map(|value| value.to_string())
             .unwrap_or_default(),
         optional_number(record.backlink_authority),
+    ]
+}
+
+/// Appended field evidence keeps existing CSV/XLSX column positions stable.
+fn field_evidence_columns(record: &CrawlRecord) -> [String; 7] {
+    let snapshot = record.field_vitals.as_ref();
+    let data = snapshot.filter(|snapshot| snapshot.has_data);
+    [
+        snapshot.map(|s| s.has_data.to_string()).unwrap_or_default(),
+        optional_number(data.and_then(|s| s.fcp_ms_p75)),
+        optional_number(data.and_then(|s| s.ttfb_ms_p75)),
+        snapshot
+            .map(|s| s.requested_url.clone())
+            .unwrap_or_default(),
+        snapshot
+            .map(|s| s.completed_at_ms.to_string())
+            .unwrap_or_default(),
+        snapshot
+            .and_then(|s| s.collection_period_start.clone())
+            .unwrap_or_default(),
+        snapshot
+            .and_then(|s| s.collection_period_end.clone())
+            .unwrap_or_default(),
     ]
 }
 
@@ -319,7 +357,7 @@ impl ExportKind {
 }
 
 /// Writes each requested format for a finished crawl into `dir`, returning the created files.
-/// Files are written directly; callers that need atomic publication should export into a fresh folder.
+/// Each file replaces its destination only after a successful write and flush; a bundle is not one transaction.
 pub fn write_export_files<S: CrawlStore>(
     store: &S,
     thresholds: &AuditThresholds,
@@ -330,30 +368,18 @@ pub fn write_export_files<S: CrawlStore>(
         return Ok(Vec::new());
     }
     std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
-    let records = if kinds
-        .iter()
-        .any(|kind| !matches!(kind, ExportKind::LinksCsv | ExportKind::AuditWorkbook))
-    {
-        store.records()
-    } else {
-        Vec::new()
-    };
     let mut written = Vec::new();
     for kind in kinds {
         let path = dir.join(kind.file_name());
-        let file = std::fs::File::create(&path)
-            .map_err(|error| format!("create {}: {error}", path.display()))?;
-        let mut writer = std::io::BufWriter::new(file);
+        let mut temporary = tempfile::NamedTempFile::new_in(dir)
+            .map_err(|error| format!("create export in {}: {error}", dir.display()))?;
+        let mut writer = std::io::BufWriter::new(temporary.as_file_mut());
         let result: Result<(), String> = match kind {
-            ExportKind::Csv => records_to_csv(&records, &mut writer).map_err(|e| e.to_string()),
-            ExportKind::Xlsx => records_to_xlsx_bytes(&records)
-                .map_err(|e| e.to_string())
-                .and_then(|bytes| writer.write_all(&bytes).map_err(|e| e.to_string())),
-            ExportKind::Sitemap => writer
-                .write_all(records_to_sitemap_xml(&records).as_bytes())
-                .map_err(|e| e.to_string()),
+            ExportKind::Csv => store_records_to_csv(store, &mut writer).map(|_| ()),
+            ExportKind::Xlsx => store_records_to_xlsx_writer(store, &mut writer).map(|_| ()),
+            ExportKind::Sitemap => store_records_to_sitemap_writer(store, &mut writer).map(|_| ()),
             ExportKind::HtmlReport => {
-                records_to_html_report_store_writer(&records, store, thresholds, &mut writer)
+                store_to_html_report_writer(store, thresholds, &mut writer).map(|_| ())
             }
             ExportKind::AuditWorkbook => audit_workbook_to_writer(
                 |mut query: GridQuery| {
@@ -365,12 +391,20 @@ pub fn write_export_files<S: CrawlStore>(
             .map(|_| ()),
             ExportKind::LinksCsv => store_link_edges_to_csv(store, &mut writer).map(|_| ()),
             ExportKind::RedirectsCsv => {
-                redirect_chains_to_csv(&records, &mut writer).map_err(|e| e.to_string())
+                store_redirect_chains_to_csv(store, &mut writer).map(|_| ())
             }
         };
         result
             .and_then(|()| writer.flush().map_err(|e| e.to_string()))
             .map_err(|error| format!("{}: {error}", path.display()))?;
+        drop(writer);
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| format!("flush {}: {error}", path.display()))?;
+        temporary
+            .persist(&path)
+            .map_err(|error| format!("save {}: {error}", path.display()))?;
         written.push(path);
     }
     Ok(written)
@@ -395,175 +429,207 @@ pub fn records_to_csv<W: Write>(records: &[CrawlRecord], writer: W) -> csv::Resu
     writer.write_record(HEADERS)?;
 
     for record in records {
-        writer.write_record(
-            [
-                record.id.to_string(),
-                record.url.clone(),
-                record.final_url.clone(),
-                format!("{:?}", record.classification),
-                record
-                    .status_code
-                    .map(|code| code.to_string())
-                    .unwrap_or_default(),
-                record.status_text.clone(),
-                record.content_type.clone().unwrap_or_default(),
-                record.indexability.clone(),
-                record.indexability_status.clone(),
-                record.response_time_ms.to_string(),
-                record
-                    .dns_lookup_time_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record
-                    .ttfb_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record
-                    .download_time_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record
-                    .total_network_time_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record
-                    .transfer_rate_bytes_per_sec
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record.resolved_ip_count.to_string(),
-                record.size_bytes.to_string(),
-                record.response_hash.clone().unwrap_or_default(),
-                record.word_count.to_string(),
-                format!("{:.4}", record.text_to_code_ratio),
-                record
-                    .simhash
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record
-                    .near_duplicate_cluster_id
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record.depth.to_string(),
-                record.redirect_target.clone().unwrap_or_default(),
-                record.title.clone().unwrap_or_default(),
-                record.title_len.to_string(),
-                record.meta_description.clone().unwrap_or_default(),
-                record.meta_description_len.to_string(),
-                record.meta_robots.clone().unwrap_or_default(),
-                record.x_robots_tag.clone().unwrap_or_default(),
-                record.h1.clone().unwrap_or_default(),
-                record.h1_len.to_string(),
-                record.h1_count.to_string(),
-                record.h2.clone().unwrap_or_default(),
-                record.h2_len.to_string(),
-                record.h2_count.to_string(),
-                record.canonical.clone().unwrap_or_default(),
-                record.canonical_count.to_string(),
-                record.image_count.to_string(),
-                record.images_missing_alt.to_string(),
-                record.images_alt_too_long.to_string(),
-                record.mixed_content_count.to_string(),
-                record.insecure_form_count.to_string(),
-                record.hsts_header.to_string(),
-                record.content_security_policy_header.to_string(),
-                record.x_frame_options_header.to_string(),
-                record.x_content_type_options_header.to_string(),
-                record.viewport.to_string(),
-                record.amphtml.clone().unwrap_or_default(),
-                record.rel_next.clone().unwrap_or_default(),
-                record.rel_prev.clone().unwrap_or_default(),
-                record.hreflang_count.to_string(),
-                record.hreflang_invalid_count.to_string(),
-                record.hreflang_missing_self_reference.to_string(),
-                record.json_ld_count.to_string(),
-                record.json_ld_invalid_count.to_string(),
-                record.structured_data_error_count.to_string(),
-                record.structured_data_warning_count.to_string(),
-                serde_json::to_string(&record.structured_data_issues).unwrap_or_default(),
-                record.open_graph_count.to_string(),
-                record.twitter_card_count.to_string(),
-                record.deprecated_html_tag_count.to_string(),
-                record.duplicate_id_count.to_string(),
-                record.js_rendered.to_string(),
-                record.rendered_dom_changed.to_string(),
-                record.rendered_word_count_delta.to_string(),
-                record.rendered_link_count_delta.to_string(),
-                record.inlink_count.to_string(),
-                record.outlink_count.to_string(),
-                record.internal_outlink_count.to_string(),
-                record.external_outlink_count.to_string(),
-                serde_json::to_string(&record.custom_extractions).unwrap_or_default(),
-                serde_json::to_string(&record.custom_searches).unwrap_or_default(),
-                record.error.clone().unwrap_or_default(),
-                record.in_sitemap.to_string(),
-                record.storage_key.clone(),
-                record
-                    .list_position
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record.list_duplicate_index.to_string(),
-                record.first_inlink_source_url.clone().unwrap_or_default(),
-                record.first_inlink_anchor_text.clone().unwrap_or_default(),
-                record
-                    .first_inlink_source_position
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record
-                    .tcp_connect_time_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record
-                    .tls_handshake_time_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record.title_pixel_width.to_string(),
-                record.meta_description_pixel_width.to_string(),
-                record
-                    .search_console_clicks
-                    .map(|value| format!("{value:.4}"))
-                    .unwrap_or_default(),
-                record
-                    .search_console_impressions
-                    .map(|value| format!("{value:.4}"))
-                    .unwrap_or_default(),
-                record
-                    .search_console_ctr
-                    .map(|value| format!("{value:.6}"))
-                    .unwrap_or_default(),
-                record
-                    .search_console_average_position
-                    .map(|value| format!("{value:.4}"))
-                    .unwrap_or_default(),
-                record
-                    .title_count
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record
-                    .meta_description_count
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                record.meta_keywords.clone().unwrap_or_default(),
-            ]
-            .into_iter()
-            .chain(performance_columns(record))
-            .chain([
-                record
-                    .rel_next_targets
-                    .as_ref()
-                    .map(|targets| serde_json::to_string(targets).unwrap_or_default())
-                    .unwrap_or_default(),
-                record
-                    .rel_prev_targets
-                    .as_ref()
-                    .map(|targets| serde_json::to_string(targets).unwrap_or_default())
-                    .unwrap_or_default(),
-            ])
-            .collect::<Vec<String>>(),
-        )?;
+        write_record_csv_row(&mut writer, record)?;
     }
 
     writer.flush()?;
     Ok(())
+}
+
+fn write_record_csv_row<W: Write>(writer: &mut Writer<W>, record: &CrawlRecord) -> csv::Result<()> {
+    writer.write_record(
+        [
+            record.id.to_string(),
+            record.url.clone(),
+            record.final_url.clone(),
+            format!("{:?}", record.classification),
+            record
+                .status_code
+                .map(|code| code.to_string())
+                .unwrap_or_default(),
+            record.status_text.clone(),
+            record.content_type.clone().unwrap_or_default(),
+            record.indexability.clone(),
+            record.indexability_status.clone(),
+            record.response_time_ms.to_string(),
+            record
+                .dns_lookup_time_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .ttfb_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .download_time_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .total_network_time_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .transfer_rate_bytes_per_sec
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record.resolved_ip_count.to_string(),
+            record.size_bytes.to_string(),
+            record.response_hash.clone().unwrap_or_default(),
+            record.word_count.to_string(),
+            format!("{:.4}", record.text_to_code_ratio),
+            record
+                .simhash
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .near_duplicate_cluster_id
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record.depth.to_string(),
+            record.redirect_target.clone().unwrap_or_default(),
+            record.title.clone().unwrap_or_default(),
+            record.title_len.to_string(),
+            record.meta_description.clone().unwrap_or_default(),
+            record.meta_description_len.to_string(),
+            record.meta_robots.clone().unwrap_or_default(),
+            record.x_robots_tag.clone().unwrap_or_default(),
+            record.h1.clone().unwrap_or_default(),
+            record.h1_len.to_string(),
+            record.h1_count.to_string(),
+            record.h2.clone().unwrap_or_default(),
+            record.h2_len.to_string(),
+            record.h2_count.to_string(),
+            record.canonical.clone().unwrap_or_default(),
+            record.canonical_count.to_string(),
+            record.image_count.to_string(),
+            record.images_missing_alt.to_string(),
+            record.images_alt_too_long.to_string(),
+            record.mixed_content_count.to_string(),
+            record.insecure_form_count.to_string(),
+            record.hsts_header.to_string(),
+            record.content_security_policy_header.to_string(),
+            record.x_frame_options_header.to_string(),
+            record.x_content_type_options_header.to_string(),
+            record.viewport.to_string(),
+            record.amphtml.clone().unwrap_or_default(),
+            record.rel_next.clone().unwrap_or_default(),
+            record.rel_prev.clone().unwrap_or_default(),
+            record.hreflang_count.to_string(),
+            record.hreflang_invalid_count.to_string(),
+            record.hreflang_missing_self_reference.to_string(),
+            record.json_ld_count.to_string(),
+            record.json_ld_invalid_count.to_string(),
+            record.structured_data_error_count.to_string(),
+            record.structured_data_warning_count.to_string(),
+            serde_json::to_string(&record.structured_data_issues).unwrap_or_default(),
+            record.open_graph_count.to_string(),
+            record.twitter_card_count.to_string(),
+            record.deprecated_html_tag_count.to_string(),
+            record.duplicate_id_count.to_string(),
+            record.js_rendered.to_string(),
+            record.rendered_dom_changed.to_string(),
+            record.rendered_word_count_delta.to_string(),
+            record.rendered_link_count_delta.to_string(),
+            record.inlink_count.to_string(),
+            record.outlink_count.to_string(),
+            record.internal_outlink_count.to_string(),
+            record.external_outlink_count.to_string(),
+            serde_json::to_string(&record.custom_extractions).unwrap_or_default(),
+            serde_json::to_string(&record.custom_searches).unwrap_or_default(),
+            record.error.clone().unwrap_or_default(),
+            record.in_sitemap.to_string(),
+            record.storage_key.clone(),
+            record
+                .list_position
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record.list_duplicate_index.to_string(),
+            record.first_inlink_source_url.clone().unwrap_or_default(),
+            record.first_inlink_anchor_text.clone().unwrap_or_default(),
+            record
+                .first_inlink_source_position
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .tcp_connect_time_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .tls_handshake_time_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record.title_pixel_width.to_string(),
+            record.meta_description_pixel_width.to_string(),
+            record
+                .search_console_clicks
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_default(),
+            record
+                .search_console_impressions
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_default(),
+            record
+                .search_console_ctr
+                .map(|value| format!("{value:.6}"))
+                .unwrap_or_default(),
+            record
+                .search_console_average_position
+                .map(|value| format!("{value:.4}"))
+                .unwrap_or_default(),
+            record
+                .title_count
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record
+                .meta_description_count
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            record.meta_keywords.clone().unwrap_or_default(),
+        ]
+        .into_iter()
+        .chain(performance_columns(record))
+        .chain([
+            record
+                .rel_next_targets
+                .as_ref()
+                .map(|targets| serde_json::to_string(targets).unwrap_or_default())
+                .unwrap_or_default(),
+            record
+                .rel_prev_targets
+                .as_ref()
+                .map(|targets| serde_json::to_string(targets).unwrap_or_default())
+                .unwrap_or_default(),
+            record
+                .amphtml_targets
+                .as_ref()
+                .map(|targets| serde_json::to_string(targets).unwrap_or_default())
+                .unwrap_or_default(),
+        ])
+        .chain(field_evidence_columns(record))
+        .chain([record
+            .amp_document
+            .map(|value| value.to_string())
+            .unwrap_or_default()])
+        .chain([record
+            .html_doctype
+            .map(|value| value.to_string())
+            .unwrap_or_default()])
+        .collect::<Vec<String>>(),
+    )
+}
+
+fn store_records_to_csv<S: CrawlStore, W: Write>(store: &S, writer: W) -> Result<usize, String> {
+    let mut writer = Writer::from_writer(writer);
+    writer
+        .write_record(HEADERS)
+        .map_err(|error| error.to_string())?;
+    let count = store
+        .try_visit_records(&mut |record| {
+            write_record_csv_row(&mut writer, &record).map_err(std::io::Error::other)
+        })
+        .map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())?;
+    Ok(count)
 }
 
 pub fn records_to_csv_string(records: &[CrawlRecord]) -> csv::Result<String> {
@@ -672,36 +738,61 @@ pub fn redirect_chains_to_csv<W: Write>(records: &[CrawlRecord], writer: W) -> c
     writer.write_record(REDIRECT_CHAIN_HEADERS)?;
 
     for record in records {
-        for (index, hop) in record.redirect_chain.iter().enumerate() {
-            writer.write_record([
-                record.id.to_string(),
-                record.url.clone(),
-                record.final_url.clone(),
-                (index + 1).to_string(),
-                hop.url.clone(),
-                hop.status_code.to_string(),
-                hop.location.clone().unwrap_or_default(),
-                hop.dns_lookup_time_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                hop.tcp_connect_time_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                hop.tls_handshake_time_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                hop.ttfb_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                hop.elapsed_ms
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-            ])?;
-        }
+        write_redirect_csv_rows(&mut writer, record)?;
     }
 
     writer.flush()?;
     Ok(())
+}
+
+fn write_redirect_csv_rows<W: Write>(
+    writer: &mut Writer<W>,
+    record: &CrawlRecord,
+) -> csv::Result<()> {
+    for (index, hop) in record.redirect_chain.iter().enumerate() {
+        writer.write_record([
+            record.id.to_string(),
+            record.url.clone(),
+            record.final_url.clone(),
+            (index + 1).to_string(),
+            hop.url.clone(),
+            hop.status_code.to_string(),
+            hop.location.clone().unwrap_or_default(),
+            hop.dns_lookup_time_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            hop.tcp_connect_time_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            hop.tls_handshake_time_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            hop.ttfb_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+            hop.elapsed_ms
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ])?;
+    }
+    Ok(())
+}
+
+fn store_redirect_chains_to_csv<S: CrawlStore, W: Write>(
+    store: &S,
+    writer: W,
+) -> Result<usize, String> {
+    let mut writer = Writer::from_writer(writer);
+    writer
+        .write_record(REDIRECT_CHAIN_HEADERS)
+        .map_err(|error| error.to_string())?;
+    let count = store
+        .try_visit_records(&mut |record| {
+            write_redirect_csv_rows(&mut writer, &record).map_err(std::io::Error::other)
+        })
+        .map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())?;
+    Ok(count)
 }
 
 pub fn redirect_chains_to_csv_string(records: &[CrawlRecord]) -> csv::Result<String> {
@@ -751,17 +842,47 @@ pub fn records_to_xlsx_bytes(records: &[CrawlRecord]) -> Result<Vec<u8>, XlsxErr
     }
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet();
-    worksheet.set_name("Crawl Results")?;
-
-    for (column, header) in HEADERS.iter().enumerate() {
-        worksheet.write_string(0, column as u16, *header)?;
-    }
+    write_xlsx_headers(worksheet)?;
 
     for (index, record) in records.iter().enumerate() {
         write_xlsx_record(worksheet, (index + 1) as u32, record)?;
     }
 
     workbook.save_to_buffer()
+}
+
+fn write_xlsx_headers(worksheet: &mut Worksheet) -> Result<(), XlsxError> {
+    worksheet.set_name("Crawl Results")?;
+    for (column, header) in HEADERS.iter().enumerate() {
+        worksheet.write_string(0, column as u16, *header)?;
+    }
+    Ok(())
+}
+
+fn store_records_to_xlsx_writer<S: CrawlStore, W: Write + Send>(
+    store: &S,
+    writer: W,
+) -> Result<usize, String> {
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet_with_constant_memory();
+    write_xlsx_headers(worksheet).map_err(|error| error.to_string())?;
+    let mut row = 0;
+    store
+        .try_visit_records(&mut |record| {
+            if row == EXCEL_DATA_ROW_LIMIT {
+                return Err(std::io::Error::other(
+                    "XLSX exceeds Excel's 1,048,575 data rows per worksheet; use CSV",
+                ));
+            }
+            row += 1;
+            write_xlsx_record(worksheet, row as u32, &record)
+                .map_err(|error| std::io::Error::other(format!("XLSX row {row}: {error}")))
+        })
+        .map_err(|error| error.to_string())?;
+    workbook
+        .save_to_writer(writer)
+        .map_err(|error| error.to_string())?;
+    Ok(row)
 }
 
 fn write_xlsx_record(
@@ -936,13 +1057,18 @@ fn write_xlsx_record(
         worksheet.write_number(row, 90, value as f64)?;
     }
     worksheet.write_string(row, 91, record.meta_keywords.as_deref().unwrap_or_default())?;
-    for (offset, value) in performance_columns(record).into_iter().enumerate() {
-        if !value.is_empty() {
-            let column = 92 + offset as u16;
-            match value.parse::<f64>() {
-                Ok(number) => worksheet.write_number(row, column, number)?,
-                Err(_) => worksheet.write_string(row, column, &value)?,
-            };
+    for (start, values) in [
+        (92, performance_columns(record).as_slice()),
+        (114, field_evidence_columns(record).as_slice()),
+    ] {
+        for (offset, value) in values.iter().enumerate() {
+            if !value.is_empty() {
+                let column = start + offset as u16;
+                match value.parse::<f64>() {
+                    Ok(number) => worksheet.write_number(row, column, number)?,
+                    Err(_) => worksheet.write_string(row, column, value)?,
+                };
+            }
         }
     }
     if let Some(targets) = &record.rel_next_targets {
@@ -950,6 +1076,15 @@ fn write_xlsx_record(
     }
     if let Some(targets) = &record.rel_prev_targets {
         worksheet.write_string(row, 112, serde_json::to_string(targets).unwrap_or_default())?;
+    }
+    if let Some(targets) = &record.amphtml_targets {
+        worksheet.write_string(row, 113, serde_json::to_string(targets).unwrap_or_default())?;
+    }
+    if let Some(marker) = record.amp_document {
+        worksheet.write_string(row, 121, marker.to_string())?;
+    }
+    if let Some(doctype) = record.html_doctype {
+        worksheet.write_string(row, 122, doctype.to_string())?;
     }
     Ok(())
 }
@@ -976,14 +1111,7 @@ pub fn query_to_xlsx_writer<W: Write + Send>(
     }
     let mut workbook = Workbook::new();
     let worksheet = workbook.add_worksheet_with_constant_memory();
-    worksheet
-        .set_name("Crawl Results")
-        .map_err(|error| error.to_string())?;
-    for (column, header) in HEADERS.iter().enumerate() {
-        worksheet
-            .write_string(0, column as u16, *header)
-            .map_err(|error| error.to_string())?;
-    }
+    write_xlsx_headers(worksheet).map_err(|error| error.to_string())?;
     while query.offset < initial.total {
         query.limit = XLSX_PAGE_SIZE.min(initial.total - query.offset);
         let response = fetch(query.clone())?;
@@ -1117,6 +1245,10 @@ const AUDIT_SHEETS: [AuditSheet; 7] = [
         &[
             ("Missing canonical", IssueView::CanonicalMissing),
             ("Multiple canonicals", IssueView::CanonicalMultiple),
+            (
+                "Pagination canonical to linked page",
+                IssueView::PaginationCanonicalToLinkedPage,
+            ),
         ],
         &[
             "id",
@@ -1128,6 +1260,10 @@ const AUDIT_SHEETS: [AuditSheet; 7] = [
             "canonical_count",
             "indexability",
             "indexability_status",
+            "rel_next",
+            "rel_prev",
+            "rel_next_targets",
+            "rel_prev_targets",
         ],
     ),
     (
@@ -1425,6 +1561,22 @@ fn write_workbook_record(
             worksheet.write_number(row, 6, record.canonical_count as f64)?;
             worksheet.write_string(row, 7, &record.indexability)?;
             worksheet.write_string(row, 8, &record.indexability_status)?;
+            worksheet.write_string(row, 9, record.rel_next.as_deref().unwrap_or_default())?;
+            worksheet.write_string(row, 10, record.rel_prev.as_deref().unwrap_or_default())?;
+            if let Some(targets) = &record.rel_next_targets {
+                worksheet.write_string(
+                    row,
+                    11,
+                    serde_json::to_string(targets).unwrap_or_default(),
+                )?;
+            }
+            if let Some(targets) = &record.rel_prev_targets {
+                worksheet.write_string(
+                    row,
+                    12,
+                    serde_json::to_string(targets).unwrap_or_default(),
+                )?;
+            }
         }
         "Content" => {
             worksheet.write_string(row, 5, record.response_hash.as_deref().unwrap_or_default())?;
@@ -1438,23 +1590,48 @@ fn write_workbook_record(
     Ok(())
 }
 
-pub fn records_to_sitemap_xml(records: &[CrawlRecord]) -> String {
-    let mut xml = String::from(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+const SITEMAP_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-"#,
-    );
+"#;
+const SITEMAP_FOOTER: &str = "</urlset>\n";
 
-    for record in records.iter().filter(|record| sitemap_eligible(record)) {
-        xml.push_str("  <url>\n");
-        xml.push_str("    <loc>");
-        xml.push_str(&escape_xml(&record.final_url));
-        xml.push_str("</loc>\n");
-        xml.push_str("  </url>\n");
+pub fn records_to_sitemap_xml(records: &[CrawlRecord]) -> String {
+    let mut xml = Vec::new();
+    xml.extend_from_slice(SITEMAP_HEADER.as_bytes());
+    for record in records {
+        write_sitemap_record(&mut xml, record)
+            .expect("writing sitemap to a byte vector cannot fail");
     }
+    xml.extend_from_slice(SITEMAP_FOOTER.as_bytes());
+    String::from_utf8(xml).expect("sitemap rows are UTF-8")
+}
 
-    xml.push_str("</urlset>\n");
-    xml
+fn write_sitemap_record<W: Write>(writer: &mut W, record: &CrawlRecord) -> std::io::Result<()> {
+    if sitemap_eligible(record) {
+        writeln!(
+            writer,
+            "  <url>\n    <loc>{}</loc>\n  </url>",
+            escape_xml(&record.final_url)
+        )?;
+    }
+    Ok(())
+}
+
+fn store_records_to_sitemap_writer<S: CrawlStore, W: Write>(
+    store: &S,
+    mut writer: W,
+) -> Result<usize, String> {
+    writer
+        .write_all(SITEMAP_HEADER.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let count = store
+        .try_visit_records(&mut |record| write_sitemap_record(&mut writer, &record))
+        .map_err(|error| error.to_string())?;
+    writer
+        .write_all(SITEMAP_FOOTER.as_bytes())
+        .map_err(|error| error.to_string())?;
+    writer.flush().map_err(|error| error.to_string())?;
+    Ok(count)
 }
 
 pub fn records_to_html_report(
@@ -1623,20 +1800,29 @@ fn build_html_report_with_broken_links(
     thresholds: &AuditThresholds,
     broken_links: ReportSection,
 ) -> HtmlReport {
-    let summary = summarize(records);
-    let broken_edge_count = broken_links.count;
-    let image_issue_count = records
-        .iter()
-        .filter(|record| !image_issues(record, thresholds).is_empty())
-        .count();
-    let security_issue_count = records
-        .iter()
-        .filter(|record| has_security_issue(record))
-        .count();
-    let validation_issue_count = records
-        .iter()
-        .filter(|record| !html_validation_issues(record).is_empty())
-        .count();
+    report_from_sections(
+        summarize(records),
+        [
+            broken_url_section(records),
+            broken_links,
+            metadata_section(records, thresholds),
+            headings_and_canonicals_section(records, thresholds),
+            image_section(records, thresholds),
+            performance_section(records),
+            security_section(records),
+            structured_data_section(records),
+            html_validation_section(records),
+            rendering_section(records),
+        ],
+    )
+}
+
+fn report_from_sections(summary: CrawlSummary, sections: [ReportSection; 10]) -> HtmlReport {
+    let [_, links, _, _, images, _, security, _, validation, _] = &sections;
+    let broken_edge_count = links.count;
+    let image_issue_count = images.count;
+    let security_issue_count = security.count;
+    let validation_issue_count = validation.count;
 
     HtmlReport {
         title: "Technical SEO Report".to_string(),
@@ -1665,18 +1851,7 @@ fn build_html_report_with_broken_links(
             route("Security", "Mixed content, insecure forms, HSTS, CSP, X-Frame-Options, and content-type headers."),
             route("Frontend", "Deprecated HTML tags, duplicate id attributes, and reusable template issues."),
         ],
-        sections: vec![
-            broken_url_section(records),
-            broken_links,
-            metadata_section(records, thresholds),
-            headings_and_canonicals_section(records, thresholds),
-            image_section(records, thresholds),
-            performance_section(records),
-            security_section(records),
-            structured_data_section(records),
-            html_validation_section(records),
-            rendering_section(records),
-        ],
+        sections: sections.into(),
     }
 }
 
@@ -1775,7 +1950,11 @@ struct BrokenLinkReport {
 }
 
 impl BrokenLinkReport {
-    fn observe(&mut self, edge: &LinkEdge, failed_urls: &HashSet<&str>) {
+    fn observe<T: std::borrow::Borrow<str> + Eq + std::hash::Hash>(
+        &mut self,
+        edge: &LinkEdge,
+        failed_urls: &HashSet<T>,
+    ) {
         if !broken_edge(edge, failed_urls) {
             return;
         }
@@ -1821,11 +2000,20 @@ fn metadata_section(records: &[CrawlRecord], thresholds: &AuditThresholds) -> Re
             .clone()
             .filter_map(|record| record.meta_description.as_deref()),
     );
+    metadata_section_with_counts(records, thresholds, &title_counts, &meta_counts)
+}
+
+fn metadata_section_with_counts<'a>(
+    records: impl Iterator<Item = &'a CrawlRecord>,
+    thresholds: &AuditThresholds,
+    title_counts: &HashMap<String, usize>,
+    meta_counts: &HashMap<String, usize>,
+) -> ReportSection {
     let mut rows = Vec::new();
     let mut total_count = 0;
 
     for record in records {
-        let issues = metadata_issues(record, &title_counts, &meta_counts, thresholds);
+        let issues = metadata_issues(record, title_counts, meta_counts, thresholds);
         if issues.is_empty() {
             continue;
         }
@@ -1867,11 +2055,19 @@ fn headings_and_canonicals_section(
         .iter()
         .filter(|record| is_success_html_record(record));
     let h1_counts = text_counts(records.clone().filter_map(|record| record.h1.as_deref()));
+    headings_section_with_counts(records, thresholds, &h1_counts)
+}
+
+fn headings_section_with_counts<'a>(
+    records: impl Iterator<Item = &'a CrawlRecord>,
+    thresholds: &AuditThresholds,
+    h1_counts: &HashMap<String, usize>,
+) -> ReportSection {
     let mut rows = Vec::new();
     let mut total_count = 0;
 
     for record in records {
-        let issues = heading_canonical_issues(record, &h1_counts, thresholds);
+        let issues = heading_canonical_issues(record, h1_counts, thresholds);
         if issues.is_empty() {
             continue;
         }
@@ -2142,7 +2338,10 @@ fn rendering_section(records: &[CrawlRecord]) -> ReportSection {
     )
 }
 
-fn broken_edge(edge: &LinkEdge, failed_urls: &HashSet<&str>) -> bool {
+fn broken_edge<T: std::borrow::Borrow<str> + Eq + std::hash::Hash>(
+    edge: &LinkEdge,
+    failed_urls: &HashSet<T>,
+) -> bool {
     edge.target_status_code.is_some_and(|code| code >= 400)
         || failed_urls.contains(edge.target_url.as_str())
 }
@@ -2292,6 +2491,7 @@ fn performance_issues(record: &CrawlRecord) -> Vec<String> {
     issues
 }
 
+#[cfg(test)]
 fn has_security_issue(record: &CrawlRecord) -> bool {
     !security_issues(record).is_empty()
 }

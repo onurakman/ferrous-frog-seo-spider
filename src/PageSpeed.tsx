@@ -163,9 +163,10 @@ export function PageSpeedPanel({ snapshot, strategy, onStrategy, disabledReason,
 }
 
 // Real-user Core Web Vitals from the Chrome UX Report; separate from the Lighthouse lab run above.
-export function FieldVitalsPanel({ snapshot, formFactor, onFormFactor, disabledReason, onRun }: {
+export function FieldVitalsPanel({ snapshot, formFactor, onFormFactor, disabledReason, onRun, selectedCount, onRunSelected, bulkStatus }: {
   snapshot?: FieldVitalsSnapshot | null; formFactor: FieldFormFactor; onFormFactor: (value: FieldFormFactor) => void;
   disabledReason?: string; onRun: () => void;
+  selectedCount: number; onRunSelected: () => void; bulkStatus?: string;
 }) {
   const date = new Date(snapshot?.completedAtMs ?? NaN);
   return <div className="field-vitals-panel">
@@ -176,8 +177,13 @@ export function FieldVitalsPanel({ snapshot, formFactor, onFormFactor, disabledR
       <button className="primary" data-action="run-field-vitals" onClick={onRun} disabled={Boolean(disabledReason)} title={disabledReason}>
         <RefreshCw size={14} />{snapshot ? "Fetch field data again" : "Fetch field data"}
       </button>
+      <button data-action="run-field-vitals-selected" onClick={onRunSelected}
+        disabled={Boolean(disabledReason) || selectedCount === 0 || selectedCount > 500}
+        title={disabledReason ?? (selectedCount > 500 ? "Select up to 500 rows" : "Fetch field data for up to 500 selected rows")}>
+        <RefreshCw size={14} />Fetch {selectedCount > 0 ? `${selectedCount.toLocaleString()} selected` : "selected"}
+      </button>
     </div>
-    <p className="page-speed-caption">{disabledReason ?? "Chrome UX Report p75 values from real Chrome users over the last 28 days."}</p>
+    <p className="page-speed-caption">{bulkStatus ?? disabledReason ?? "Chrome UX Report p75 values from real Chrome users over the last 28 days. Selected rows run one at a time; saved results for the same URL and form factor are skipped, including no-data results. Fetch field data again refreshes the current URL."}</p>
     {snapshot ? <div className="page-speed-result">
       <div className="page-speed-attribution">
         <strong>{snapshot.formFactor === "desktop" ? "Desktop" : snapshot.formFactor === "tablet" ? "Tablet" : "Phone"} · Field data</strong>

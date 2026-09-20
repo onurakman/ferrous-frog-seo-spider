@@ -295,6 +295,16 @@ fn sqlite_progress_summary_keeps_revision_invalidation_external_writes_and_rollb
         writer
             .execute("DELETE FROM crawl_records WHERE id = 2", [])
             .unwrap();
+        // A later local mutation cannot hide the intervening external commit.
+        reader.try_upsert(page(2)).unwrap();
+        let mixed = reader.try_progress_summary().unwrap();
+        assert_eq!(
+            (mixed.total, mixed.title_missing, mixed.title_duplicate),
+            (2, 1, 0)
+        );
+        writer
+            .execute("DELETE FROM crawl_records WHERE id != 1", [])
+            .unwrap();
         assert_eq!(reader.try_progress_summary().unwrap().total, 1);
         reader.try_upsert(page(0)).unwrap();
         assert_eq!(reader.try_progress_summary().unwrap().title_missing, 0);
@@ -302,6 +312,199 @@ fn sqlite_progress_summary_keeps_revision_invalidation_external_writes_and_rollb
         assert_summary_eq(
             reader.try_progress_summary().unwrap(),
             CrawlSummary::default(),
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn sqlite_progress_summary_recounts_only_changed_records() {
+    let sqlite = SqliteStore::in_memory().unwrap();
+    let memory = MemoryStore::new();
+    for index in 0..256 {
+        let mut row = page(index);
+        row.near_duplicate_cluster_id = Some((index / 2) as u64);
+        sqlite.try_upsert(row.clone()).unwrap();
+        memory.upsert(row);
+    }
+    assert_summary_eq(
+        sqlite.try_progress_summary().unwrap(),
+        memory.progress_summary(),
+    );
+    let work = count_text_work(&sqlite);
+    let mut changed = page(0);
+    changed.title = None;
+    changed.h1 = Some("Unique heading".into());
+    changed.near_duplicate_cluster_id = Some(900);
+    changed.in_sitemap = true;
+    sqlite.try_upsert(changed.clone()).unwrap();
+    memory.upsert(changed);
+    sqlite
+        .try_add_inlink("https://example.test/page/0")
+        .unwrap();
+    memory.add_inlink("https://example.test/page/0");
+    assert_summary_eq(
+        sqlite.try_progress_summary().unwrap(),
+        memory.progress_summary(),
+    );
+    assert!(
+        work.load(AtomicOrdering::Relaxed) <= 8,
+        "One changed record must not normalize unchanged records: {} calls",
+        work.load(AtomicOrdering::Relaxed)
+    );
+    work.store(0, AtomicOrdering::Relaxed);
+    sqlite.try_upsert(page(256)).unwrap();
+    memory.upsert(page(256));
+    assert_summary_eq(
+        sqlite.try_progress_summary().unwrap(),
+        memory.progress_summary(),
+    );
+    assert!(work.load(AtomicOrdering::Relaxed) <= 8);
+    sqlite.connection().unwrap().execute_batch(
+        "BEGIN; UPDATE crawl_records SET title = NULL; DELETE FROM crawl_records WHERE id = 1; ROLLBACK;"
+    ).unwrap();
+    work.store(0, AtomicOrdering::Relaxed);
+    assert_summary_eq(
+        sqlite.try_progress_summary().unwrap(),
+        memory.progress_summary(),
+    );
+    assert_eq!(work.load(AtomicOrdering::Relaxed), 0);
+    sqlite.try_clear().unwrap();
+    assert_summary_eq(
+        sqlite.try_progress_summary().unwrap(),
+        CrawlSummary::default(),
+    );
+    sqlite.try_upsert(page(0)).unwrap();
+    let summary = sqlite.try_progress_summary().unwrap();
+    assert_eq!(
+        (
+            summary.total,
+            summary.title_duplicate,
+            summary.near_duplicates
+        ),
+        (1, 0, 0)
+    );
+}
+
+#[test]
+fn sqlite_incremental_summary_removes_old_ids_and_duplicate_membership() {
+    let sqlite = SqliteStore::in_memory().unwrap();
+    let mut a = page(0);
+    a.near_duplicate_cluster_id = Some(7);
+    let mut b = page(1);
+    b.near_duplicate_cluster_id = Some(7);
+    sqlite.try_upsert(a).unwrap();
+    sqlite.try_upsert(b).unwrap();
+    let summary = sqlite.try_progress_summary().unwrap();
+    assert_eq!(
+        (
+            summary.total,
+            summary.title_duplicate,
+            summary.near_duplicates
+        ),
+        (2, 2, 2)
+    );
+    sqlite
+        .connection()
+        .unwrap()
+        .execute_batch(
+            "UPDATE crawl_records SET id = 100, content_type = 'image/png' WHERE id = 1;",
+        )
+        .unwrap();
+    let summary = sqlite.try_progress_summary().unwrap();
+    assert_eq!(
+        (
+            summary.total,
+            summary.title_duplicate,
+            summary.near_duplicates
+        ),
+        (2, 0, 0)
+    );
+    sqlite.connection().unwrap().execute_batch(
+        "DELETE FROM crawl_records WHERE id = 100;
+         UPDATE crawl_records SET id = 100, title = NULL, near_duplicate_cluster_id = NULL WHERE id = 2;"
+    ).unwrap();
+    let summary = sqlite.try_progress_summary().unwrap();
+    assert_eq!(
+        (
+            summary.total,
+            summary.title_missing,
+            summary.title_duplicate,
+            summary.near_duplicates
+        ),
+        (1, 1, 0, 0)
+    );
+    // A failing refresh must discard its partially adjusted cache before retrying.
+    sqlite
+        .connection()
+        .unwrap()
+        .execute_batch("UPDATE crawl_records SET amphtml_targets = 'invalid JSON' WHERE id = 100;")
+        .unwrap();
+    assert!(sqlite.try_progress_summary().is_err());
+    sqlite
+        .connection()
+        .unwrap()
+        .execute_batch("UPDATE crawl_records SET amphtml_targets = '[]' WHERE id = 100;")
+        .unwrap();
+    let summary = sqlite.try_progress_summary().unwrap();
+    assert_eq!(
+        (
+            summary.total,
+            summary.title_missing,
+            summary.title_duplicate
+        ),
+        (1, 1, 0)
+    );
+}
+
+#[test]
+fn sqlite_progress_summary_uses_one_snapshot_during_external_commit() {
+    let path = std::env::temp_dir().join(format!(
+        "ferrous-frog-summary-snapshot-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let reader = SqliteStore::open(&path).unwrap();
+        reader.try_upsert(page(0)).unwrap();
+        reader.try_upsert(page(1)).unwrap();
+        let writer_path = path.clone();
+        let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let did_write = written.clone();
+        reader
+            .connection()
+            .unwrap()
+            .create_scalar_function(
+                "ff_text_key",
+                1,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                move |context| {
+                    if !did_write.swap(true, AtomicOrdering::SeqCst) {
+                        Connection::open(&writer_path)?
+                            .execute("UPDATE crawl_records SET title = NULL", [])?;
+                    }
+                    Ok(normalize_text_key(
+                        context
+                            .get::<Option<String>>(0)?
+                            .as_deref()
+                            .unwrap_or_default(),
+                    ))
+                },
+            )
+            .unwrap();
+        let before = reader.try_progress_summary().unwrap();
+        assert!(written.load(AtomicOrdering::SeqCst));
+        assert_eq!(
+            (before.total, before.title_missing, before.title_duplicate),
+            (2, 0, 2)
+        );
+        let after = reader.try_progress_summary().unwrap();
+        assert_eq!(
+            (after.total, after.title_missing, after.title_duplicate),
+            (2, 2, 0)
         );
     }
     std::fs::remove_file(path).unwrap();

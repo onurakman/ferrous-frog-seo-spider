@@ -521,7 +521,11 @@ fn audit_cache_revision_rolls_back_with_record_changes() {
         ),
         (1, 0, 1)
     );
-    assert!(work.load(Ordering::Relaxed) > expected_work);
+    assert_eq!(
+        work.load(Ordering::Relaxed),
+        expected_work,
+        "Deleting a record must not renormalize unchanged metadata"
+    );
 }
 
 #[test]

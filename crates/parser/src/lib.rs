@@ -116,7 +116,14 @@ pub struct PageSignals {
     pub mixed_content_count: u32,
     pub insecure_form_count: u32,
     pub viewport: bool,
+    /// Parsed document has an HTML-named doctype; not syntax or standards-mode validation.
+    #[serde(default)]
+    pub html_doctype: bool,
+    /// Root HTML marker presence only; this does not establish AMP validity.
+    #[serde(default)]
+    pub amp_document: bool,
     pub amphtml: Option<String>,
+    pub amphtml_targets: Vec<String>,
     pub rel_next: Option<String>,
     pub rel_prev: Option<String>,
     pub rel_next_targets: Vec<String>,
@@ -261,7 +268,8 @@ pub fn parse_html_with_content(
     let h2_count = element_count(&document, "h2");
     let canonical = canonical_href(&document, base_url);
     let canonical_count = canonical_count(&document);
-    let amphtml = link_href_by_rel(&document, base_url, "amphtml");
+    let amphtml_targets = link_hrefs_by_rel(&document, base_url, "amphtml");
+    let amphtml = amphtml_targets.first().cloned();
     let rel_next_targets = link_hrefs_by_rel(&document, base_url, "next");
     let rel_prev_targets = link_hrefs_by_rel(&document, base_url, "prev");
     let rel_next = rel_next_targets.first().cloned();
@@ -352,7 +360,15 @@ pub fn parse_html_with_content(
         mixed_content_count: mixed_content_count(&document, base_url),
         insecure_form_count: insecure_form_count(&document, base_url),
         viewport: meta_content(&document, "viewport").is_some(),
+        html_doctype: document.tree.root().children().any(|node| {
+            node.value()
+                .as_doctype()
+                .is_some_and(|doctype| doctype.name().eq_ignore_ascii_case("html"))
+        }),
+        amp_document: document.root_element().value().attr("amp").is_some()
+            || document.root_element().value().attr("⚡").is_some(),
         amphtml,
+        amphtml_targets,
         rel_next,
         rel_prev,
         rel_next_targets,
@@ -1400,6 +1416,151 @@ fn normalize_whitespace(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn html_doctype_captures_the_parsed_document_declaration_only() {
+        let base = Url::parse("https://example.test/").unwrap();
+        for (html, expected) in [
+            ("<!doctype html><p>Modern declaration</p>", true),
+            ("<!DOCTYPE HTML><html><body>Uppercase</body></html>", true),
+            (
+                "<!DOCTYPE html PUBLIC '-//W3C//DTD HTML 4.01 Transitional//EN' 'http://www.w3.org/TR/html4/loose.dtd'><p>Historical declaration</p>",
+                true,
+            ),
+            (
+                "<!DOCTYPE html SYSTEM 'about:legacy-compat'><p>Legacy system declaration</p>",
+                true,
+            ),
+            (
+                " \n<!-- Leading comment --><!doctype html><p>Declaration after comments</p>",
+                true,
+            ),
+            (
+                "<html><head></head><body>No declaration</body></html>",
+                false,
+            ),
+            ("<!doctype frog><p>Wrong document name</p>", false),
+            ("<!doctype><p>Missing document name</p>", false),
+            ("<!-- <!doctype html> --><p>Comment only</p>", false),
+            ("<script>const text = '<!doctype html>';</script>", false),
+            (
+                "<template><!doctype html></template><p>Inert declaration</p>",
+                false,
+            ),
+            ("<template>&lt;!doctype html&gt;</template>", false),
+            (
+                "<html><!doctype html><body>Late declaration</body></html>",
+                false,
+            ),
+            ("<p>Content first</p><!doctype html>", false),
+            (
+                "<!doctype frog><!doctype html><p>First declaration wins</p>",
+                false,
+            ),
+            // HTML parsing retains these malformed declarations; presence is not validity.
+            ("<!doctypehtml><p>Missing whitespace</p>", true),
+            (
+                "<!doctype html PUBLIC><p>Missing public identifier</p>",
+                true,
+            ),
+            ("<!doctype html", true),
+        ] {
+            let signals = parse_html(&base, html);
+            assert_eq!(
+                serde_json::to_value(signals).unwrap()["htmlDoctype"],
+                expected,
+                "{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_page_signals_default_to_no_html_doctype() {
+        let mut value = serde_json::to_value(parse_html(
+            &Url::parse("https://example.test/").unwrap(),
+            "<!doctype html><p>Declared document</p>",
+        ))
+        .unwrap();
+        value.as_object_mut().unwrap().remove("htmlDoctype");
+        let restored: PageSignals = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap()["htmlDoctype"],
+            false
+        );
+    }
+
+    #[test]
+    fn amp_document_marker_uses_only_the_root_html_element() {
+        let base = Url::parse("https://example.test/").unwrap();
+        for (html, expected) in [
+            ("<html><head></head><body>Normal page</body></html>", false),
+            (
+                "<html amp><body>Marker only, not validated AMP</body></html>",
+                true,
+            ),
+            ("<html ⚡><body>Lightning marker</body></html>", true),
+            ("<HTML AMP><BODY>Uppercase marker</BODY></HTML>", true),
+            ("<html amp=''><body>Empty marker</body></html>", true),
+            (
+                "<html amp='false'><body>Attribute presence</body></html>",
+                true,
+            ),
+            (
+                "<html ⚡=''><body>Empty lightning marker</body></html>",
+                true,
+            ),
+            (
+                "<html ⚡='yes'><body>Valued lightning marker</body></html>",
+                true,
+            ),
+            (
+                "<link rel='amphtml' href='/amp'><p>Linked AMP page only</p>",
+                false,
+            ),
+            (
+                "<html><body><div amp><span ⚡>Descendant markers</span></div></body></html>",
+                false,
+            ),
+            (
+                "<html><body><template><html amp><div ⚡>Inert marker</div></html></template></body></html>",
+                false,
+            ),
+            (
+                "<html><body><script>const text = '<html amp>';</script><!-- <html ⚡> --></body></html>",
+                false,
+            ),
+            (
+                "<html><body><svg amp><g ⚡/></svg><math amp><mi ⚡>x</mi></math></body></html>",
+                false,
+            ),
+            (
+                "<html amp4ads amp4email data-amp><body>Other attributes</body></html>",
+                false,
+            ),
+        ] {
+            let signals = parse_html(&base, html);
+            assert_eq!(
+                serde_json::to_value(signals).unwrap()["ampDocument"],
+                expected,
+                "{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_page_signals_default_to_no_amp_document_marker() {
+        let mut value = serde_json::to_value(parse_html(
+            &Url::parse("https://example.test/").unwrap(),
+            "<html amp><body>Marker</body></html>",
+        ))
+        .unwrap();
+        value.as_object_mut().unwrap().remove("ampDocument");
+        let restored: PageSignals = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap()["ampDocument"],
+            false
+        );
+    }
+
+    #[test]
     fn active_document_metadata_ignores_svg_titles() {
         let signals = super::parse_html(
             &url::Url::parse("https://example.test/").unwrap(),
@@ -1738,6 +1899,7 @@ mod tests {
             (None, None, None, None)
         );
         assert_eq!(signals.canonical_count, 0);
+        assert!(signals.amphtml_targets.is_empty());
         assert_eq!(signals.hreflang_count, 0);
         assert!(!signals.hreflang_missing_self_reference);
         assert!(signals.hreflang_links.is_empty());
@@ -1761,6 +1923,7 @@ mod tests {
             (None, None, None, None)
         );
         assert_eq!(signals.canonical_count, 0);
+        assert!(signals.amphtml_targets.is_empty());
         assert_eq!(signals.hreflang_count, 0);
         assert!(signals.reference_links.is_empty());
         assert!(signals.sitemaps.is_empty());
@@ -1920,6 +2083,39 @@ mod tests {
         assert_eq!(
             signals.rel_prev.as_deref(),
             Some("https://example.test/shared")
+        );
+    }
+
+    #[test]
+    fn amp_targets_preserve_each_valid_active_declaration_in_order() {
+        let signals = scoped_signals(
+            "<head>
+                <template><link rel='amphtml' href='/inert'></template>
+                <svg><link rel='amphtml' href='/foreign'/></svg>
+                <link rel='amphtml' href='javascript:alert(1)'>
+                <link rel='amphtml' href='file:///local'>
+                <link rel='amphtml' href='http://[invalid'>
+                <link rel='amphtml' href=''>
+                <link rel='amphtml'>
+                <link rel='notamphtml' href='/unrelated'>
+                <link rel='AMPHTML alternate' href='/first#fragment'>
+                <link rel='amphtml' href='/second'>
+                <link rel='amphtml' href='/first'>
+            </head>",
+            &[],
+            &[],
+        );
+        assert_eq!(
+            signals.amphtml.as_deref(),
+            Some("https://example.test/first")
+        );
+        assert_eq!(
+            serde_json::to_value(&signals).unwrap()["amphtmlTargets"],
+            serde_json::json!([
+                "https://example.test/first",
+                "https://example.test/second",
+                "https://example.test/first"
+            ])
         );
     }
 

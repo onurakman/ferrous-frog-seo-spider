@@ -12,3 +12,4 @@ minijinja.workspace = true
 rust_xlsxwriter = { workspace = true, features = ["constant_memory"] }
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true

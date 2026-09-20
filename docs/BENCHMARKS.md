@@ -335,12 +335,12 @@ The graph still uses literal final URLs and existing backend record order. Node 
 ## What Remains
 
 - The first summary still scans the dataset. Record writes invalidate the cache, including commits from another SQLite connection; frontier-only writes now retain it. Frequent queries while ingesting a million URLs still need incremental counters or fewer repeated aggregate scans.
-- Ordinary SQLite completion checkpoints write only changed queue/seen/sitemap/counter rows. Startup, Stop and worker errors still clone/sort/replace the full frontier; Memory updates scan its pending vector and sort seen keys after discoveries. Those paths still need larger-scale measurements.
+- Ordinary SQLite completion checkpoints and worker errors write only changed frontier rows; ordinary Stop reuses that durable state. Startup and interrupted discovery still hydrate or replace the full frontier. Memory updates scan its pending vector and sort seen keys after discoveries. Those remaining paths need larger-scale measurements.
 - Duplicate queries still normalize and group matching text inside SQLite. They decode only the requested row window, but grouping remains proportional to dataset size.
 - Hreflang audits rebuild temporary alias joins for their count and page queries. Repeated audits during active large crawls may justify persistent indexed aliases or cached issue membership, with explicit invalidation.
-- Memory upsert still scans existing edges for status updates and first-inlink source annotations, and its progress summaries still scan retained records. Alias indexing removes repeated record lookup scans without making all ingestion work constant-time.
+- Memory maintains URL aliases and first-inlink sources as records and edges arrive. Upsert still scans existing edges for status updates, and progress summaries still scan retained records. The retained indexes consume memory proportional to aliases; ingestion is not constant-time.
 - Graph hydration is capped, but its record/key scans and internal-edge counts still grow with the crawl. Measure concurrent ingestion and SQLite temporary working memory before claiming constant-cost refreshes at larger scales.
-- The 1,000-page local crawler now covers edges, a live frontier, interrupted/reopened crawls and an initial physical NVMe comparison. Increase workload variety and scale, add concurrent UI query traffic, broader disk measurements and packaged desktop memory before making large-site capacity claims.
+- The local crawler now covers 10,000 live pages, retained edges/frontiers, interrupted/reopened crawls and concurrent bounded storage queries on physical NVMe. Two serial before/after runs extend the physical-disk evidence, but larger and denser workloads, repeated unchanged-build trials, other storage devices and actual packaged desktop responsiveness/memory remain open.
 
 ## Frozen Audit Reports: 100,000 Pages and 1,000,001 Links
 
@@ -433,7 +433,57 @@ The 1,000-page polling cases produced only 3–6 samples each, with medians of 1
 
 The larger fixture verified 2,060 unique stored URLs, 14,220 edges, 20 planted HTTP failures, 20 robots-blocked URLs and 20 redirects. It made 2,061 uninterrupted or 2,069 interrupted HTTP requests, never requested excluded/robots paths or stripped tracking queries, and retained all completed IDs after stopping at 500 records. The smaller case retained the original 1,030 URLs, 7,110 edges and request-count invariants. No external website was crawled.
 
-Progress summaries and other whole-record operations still grow with the dataset. More than 2,000 live pages, denser reference/resource graphs, repeated physical-disk trials, rendering and actual desktop frame/input responsiveness remain open scale work.
+At this checkpoint, more than 2,000 live pages and repeated physical-disk trials were unmeasured; the [5,000-page follow-up](#5000-page-crawls-and-maintained-first-inlink-sources) below extends both. Progress summaries and other whole-record operations still grow with the dataset. Denser reference/resource graphs, rendering and actual desktop frame/input responsiveness remain open scale work.
+
+## 5,000-Page Crawls And Maintained First-Inlink Sources
+
+Measured on 2026-09-20 with the existing local HTTP fixture, increasing the page count from 2,000 to 5,000 without changing its checks or 600-second phase deadlines. Each executable runs Memory and file-backed SQLite, both uninterrupted and stopped/resumed, with concurrent queries enabled. SQLite is closed and reopened before resuming.
+
+```bash
+cargo test --release --locked -p ferrous-frog-crawler-core synthetic_local_site_crawler_load --no-run
+crawl_tmp=$(mktemp -d "$HOME/.cache/ferrous-crawler-scale.XXXXXX")
+TMPDIR="$crawl_tmp" FERROUS_CRAWLER_PAGES=5000 FERROUS_CRAWLER_QUERIES=1 /usr/bin/time -f 'peak_rss_kib=%M elapsed_seconds=%e' target/release/deps/ferrous_frog_crawler_core-<hash> --ignored --exact tests::synthetic_local_site_crawler_load --nocapture
+rmdir "$crawl_tmp"
+```
+
+Use the executable path printed by compilation. The measured runs used separate copied executables and fresh private temporary directories under the user's cache directory on `/dev/nvme0n1p2` (ext4). SQLite retained WAL and `synchronous=NORMAL`. The machine had an AMD Ryzen 9 9955HX, 59 GiB RAM, Ubuntu 26.04.1, Linux 7.0.0-31-generic and Rust 1.98.1. Compilation, repository tests, browser fixtures and packaging did not overlap either timed run. Host background services remained active; caches were not flushed and CPU frequency was not fixed. The OS and implementation differ from the historical 2,000-page run, so this is not an isolated size-scaling comparison.
+
+Both builds came from the working tree based on `6299b66`, including archive frontier streaming and AMP target capture/storage changes. The baseline preceded the generic record visitor and HTML streaming changes. The second build additionally contained those changes and the maintained Memory first-inlink index; the fixture does not export reports or invoke that visitor. Copied executable SHA-256 values were `6f747b736c0f7c46363876a92b5ecd5d8d0775fb06280613b5e0b45aac4542e1` before and `55a7715a54d35257fc44b158f29dc20ae6d59f952cec14159e413cf1e9e9752c` after. These are two serial runs with different builds, one observation per case/build, not repeated unchanged-build samples or crawl-time medians.
+
+Previously, Memory record upserts and reads rebuilt first-inlink sources from all retained edges. It now indexes the earliest source for each target alias when appending an edge, and reuses that index for annotations. Source ordering, fragment/host aliases, redirect/List occurrences and clear behavior remain covered by semantic tests. `cargo test --locked -p ferrous-frog-storage memory_first_inlink_index -- --nocapture` also checks that growing the edge fixture from 50 to 500 does not reintroduce complete source-index rebuilding during record writes, snapshots, selected-ID reads or streaming visits. Edge-status updates still scanned edges in these measured builds; the endpoint-index follow-up below removes that scan.
+
+| Backend / case | Before | After |
+| --- | ---: | ---: |
+| Memory, uninterrupted | 161.165 s | 101.295 s |
+| Memory, stop/resume | 161.596 s | 101.719 s |
+| SQLite, uninterrupted | 103.165 s | 99.614 s |
+| SQLite, stop/reopen/resume | 154.044 s | 98.053 s |
+
+Memory elapsed time decreased approximately 37% in both cases in this paired observation. The Memory index does not change SQLite ingestion; its differing times show run-to-run variation rather than an attributable index benefit. For example, reaching Stop at 1,250 SQLite records took 46.572 seconds before and 5.260 seconds after. These runs do not identify the cause of that variation or establish a general throughput guarantee.
+
+| Backend / case | Build | Polls | Median poll | p95 poll | Maximum poll |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Memory, uninterrupted | Before | 102 | 89.438 ms | 133.978 ms | 151.975 ms |
+| Memory, uninterrupted | After | 65 | 79.766 ms | 121.998 ms | 128.677 ms |
+| Memory, stop/resume | Before | 103 | 89.481 ms | 131.295 ms | 142.836 ms |
+| Memory, stop/resume | After | 66 | 81.061 ms | 116.099 ms | 132.453 ms |
+| SQLite, uninterrupted | Before | 65 | 56.888 ms | 294.596 ms | 689.022 ms |
+| SQLite, uninterrupted | After | 63 | 63.778 ms | 250.434 ms | 352.713 ms |
+| SQLite, stop/reopen/resume | Before | 95 | 77.677 ms | 370.514 ms | 475.774 ms |
+| SQLite, stop/reopen/resume | After | 62 | 60.421 ms | 285.111 ms | 361.731 ms |
+
+Each poll requests a sorted 50-row grid window, a searched 50-edge window and frontier counts, then waits 1.5 seconds. The table includes storage-lock waits and all three queries; the reported percentiles describe only these samples. Polls do not drive Tauri IPC, React, frames or input handling.
+
+| Whole test process | Before | After |
+| --- | ---: | ---: |
+| Elapsed, including final verification | 581.41 s | 401.93 s |
+| Peak RSS | 85,444 KiB (83.44 MiB) | 125,436 KiB (122.50 MiB) |
+
+Peak RSS increased in the second process. The maintained index retains source information proportional to distinct target aliases, but this aggregate measurement does not isolate its allocation cost: it also includes both backends, SQLite allocations, the mock server/request log, final verification snapshots and allocator retention across cases. Kernel/filesystem page-cache memory and a desktop window are excluded. Per-crawl timings exclude final assertions; interrupted totals include Stop, reopen and Resume.
+
+All eight completed cases verified exactly 5,150 unique stored URLs and 35,550 edges, with 50 planted HTTP failures, 50 robots-blocked URLs and 50 redirects. Requests totaled 5,151 uninterrupted or 5,159 interrupted; no robots-blocked, excluded or stripped-query path was requested. Delayed response-handler overlap peaked at six or seven under the configured limit of eight. Stop at 1,250 records retained a pending frontier and every completed ID; each finished frontier was empty. Query windows remained bounded and recovery counts consistent. Both test processes passed and removed their temporary databases. Request spacing was disabled only for this localhost fixture, response delay remained 5 ms, robots stayed enabled and no external site was crawled.
+
+This extends live-crawl coverage beyond 2,000 pages and repeats the physical NVMe workload across two builds. At that checkpoint, more than 5,000 live pages remained unmeasured; the 10,000-page follow-up below extends coverage. Denser resource/reference graphs, unchanged-build distributions, rendering, other devices/platforms and actual desktop frame/input responsiveness remain open. Full progress scans and startup/interrupted-discovery frontier hydration remain separate costs; the endpoint-index follow-up removes the earlier edge-status scan.
 
 ## Archive Comparison Record Staging: 50,000 Records
 
@@ -496,4 +546,153 @@ The workload generates its input item by item before starting the import timer. 
 
 This is one local observation, not a median, latency guarantee or before/after speedup comparison. The timer excludes fixture generation, compilation and result assertions; it includes opening the session index and final database publication/opening, but does not drive the Tauri IPC or frontend session activation. Peak RSS covers the entire test process, including input generation, SQLite allocations and verification; it excludes filesystem page-cache memory. The input file, SQLite dataset and private staging still require disk space.
 
-Import memory is bounded by individual records/captures and batches of at most 256 evidence/frontier rows, rather than by the total array sizes. Individual fields can still be large; capture limits remain the existing 1 MiB per body/text value and 512 headers / 64 KiB. Older optional reference/capture fields remain optional. Duplicate record/evidence identities or normalized record keys now fail instead of being silently renumbered or overwritten. Stored record inlink counts and captured link metadata survive; image size/oversized and first-inlink annotations retain their existing query-derived behavior. Archive export frontier hydration, Memory export/query snapshots and the legacy immediate archive comparison buffer remain separate limitations.
+Import memory is bounded by individual records/captures and batches of at most 256 evidence/frontier rows, rather than by the total array sizes. Individual fields can still be large; capture limits remain the existing 1 MiB per body/text value and 512 headers / 64 KiB. Older optional reference/capture fields remain optional. Duplicate record/evidence identities or normalized record keys now fail instead of being silently renumbered or overwritten. Stored record inlink counts and captured link metadata survive; image size/oversized and first-inlink annotations retain their existing query-derived behavior. At that checkpoint, archive export frontier hydration remained; the follow-up below removes it. Memory export/query snapshots and the legacy immediate archive comparison buffer remain separate limitations.
+
+
+## Archive Resume State: 50,000 Queued and 1,000,000 Seen
+
+Schema-1 archive export now writes the saved frontier without creating full queue/seen vectors. Memory serializes its borrowed checkpoint under one read lock. SQLite decodes one queued item or seen key at a time, in the same order as the previous loader, and holds one read transaction across both arrays and the completed count. This snapshot covers the frontier section, not the complete paged archive.
+
+Run the two modes in separate processes so the hydrated baseline does not contaminate the streaming peak RSS:
+
+```bash
+cargo test --release --locked -p ferrous-frog-storage frontier_json_export_workload --no-run
+FF_FRONTIER_EXPORT_SEEN=1000000 FF_FRONTIER_EXPORT_MODE=hydrated /usr/bin/time -f 'peak_rss_kib=%M elapsed_seconds=%e' target/release/deps/ferrous_frog_storage-<hash> --ignored --exact native_exports::tests::frontier_json_export_workload --nocapture
+FF_FRONTIER_EXPORT_SEEN=1000000 FF_FRONTIER_EXPORT_MODE=streamed /usr/bin/time -f 'peak_rss_kib=%M elapsed_seconds=%e' target/release/deps/ferrous_frog_storage-<hash> --ignored --exact native_exports::tests::frontier_json_export_workload --nocapture
+```
+
+Measured on 2026-09-19 from the working tree based on `6299b66`, using Rust 1.98.1 and the optimized test build. Both modes ran serially before CI, with the database and output under `/tmp` (tmpfs). SQL generates the fixture without allocating a Rust collection: 50,000 queued List occurrences of one request URL with distinct storage keys/positions, varying depth/sitemap flags, 1,000,000 ordered seen keys, and a completed count of 12,345. There are no crawl records, links, images or captures.
+
+| Measurement | Full frontier hydration | Streamed frontier |
+| --- | ---: | ---: |
+| Median serialization/write time, 3 samples | 127.714 ms | 102.917 ms |
+| Peak process RSS | 88,580 KiB | 10,460 KiB |
+| Complete JSON bytes | 45,352,825 | 45,352,825 |
+| Same-build output digest | `ce541aafa0e40990` | `ce541aafa0e40990` |
+
+The baseline calls the existing fallible full loader, then Serde; the new mode calls the same storage writer used by desktop archive export. Both use a buffered file writer and include flush, but not `fsync`, in the timer. Peak RSS covers fixture generation, all three exports and verification; it excludes tmpfs/page-cache storage. The digest is Rust's standard-library non-cryptographic hasher over fixed-size read chunks, used only for byte parity within this build. No complete output is loaded during verification.
+
+This local workload reduced peak process RSS by approximately 88%; the timing samples are observations, not a physical-disk or whole-desktop performance guarantee. The SQL fixture, retained database, output file and any individually large URL still consume storage/memory. Scheduler startup and interrupted-discovery hydration, Memory record snapshots, and consistency against external writes across other archive sections remain separate work.
+
+Focused storage tests preserve empty/null backend behavior, queue-only/seen-only checkpoints, Unicode and List occurrence evidence. A WAL writer changes all frontier tables during export to verify one snapshot and successful lock/transaction release after writer errors. Desktop archive tests verify valid early rows reach the writer before later queue/seen decode failures, reject partial publication, preserve earlier exports, and retain complete archive round trips.
+
+Final verification passed `make ci`: 586 default workspace tests, Clippy, formatting, frontend build/browser smoke, both offline report packages, three rendering unit tests, seven serialized real-Chrome fixtures and version/release guards. `cargo build --locked -p ferrous-frog-app` also passed. This Linux run used privately extracted Ubuntu GTK/WebKit development packages via pkg-config/library paths; no host packages were installed. Native installer/GUI checks were not repeated for this storage-only change.
+
+
+## Memory Query Payload Allocation
+
+Memory summaries now borrow stored records. Grid and link queries filter/sort borrowed candidates and clone only the returned window; anchor aggregation also borrows its input. First-inlink search and sorting use the maintained source index rather than stale imported annotation fields. Existing SQLite/List/alias/filter tests preserve observable query behavior.
+
+```bash
+cargo test --locked -p ferrous-frog-storage --test memory_query_allocations -- --nocapture
+```
+
+The isolated integration-test executable measures Rust allocation requests after fixture creation. Its 64 records hold 8 MiB of custom-extraction values, and 64 link occurrences hold another 8 MiB of anchor text. It requests a summary, zero-row and one-row searched/sorted grid windows, and one searched/sorted link. Each operation must allocate less than 1 MiB while preserving exact totals, the last row/link and full returned values. Before the borrowing change, the regression failed because summaries and even empty result windows copied all retained record payloads; the link regression independently caught full edge copying. This is a regression ceiling, not a general per-query memory limit.
+
+The measurement counts allocation/reallocation request sizes, not live bytes or peak process RSS; it excludes stored fixture data, filesystem cache and non-Rust allocations. The test contains one synchronous case to avoid interference from other test workloads. Candidate lists, audit/reference/duplicate indexes, matching work and anchor groups still scale with the crawl and field lengths. Each query holds a read lock until it completes, so Memory writers wait through filtering, sorting and audit work. Actual concurrent writer latency and desktop frame responsiveness require separate measurements; SQLite remains the default desktop backend.
+
+## Memory Link Endpoint Updates
+
+Memory now indexes source and target URL aliases when appending an edge. Upserting a record updates only edges matching its current aliases, without parsing unrelated endpoints again. The append path reuses its parsed aliases for record lookup and first-inlink indexing. The indexes retain URL keys and edge positions proportional to endpoint-alias memberships; they do not make the graph constant-memory.
+
+```bash
+cargo test --locked -p ferrous-frog-storage memory_endpoint_updates -- --nocapture
+cargo test --locked -p ferrous-frog-storage memory_endpoint_update_workload -- --ignored --nocapture
+```
+
+On 2026-09-20, the failing work-count regression performed 112 alias expansions with 50 unrelated edges before the change. The indexed implementation performs 12 with either 50 or 500 edges. A second workload updates one existing record attached to four self-edges, with 50 or 5,000 unrelated edges, and checks every edge after each of seven samples:
+
+| Unrelated edges | Before alias expansions | After alias expansions | Before median | After median |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 123 | 15 | 0.479 ms | 0.054 ms |
+| 5,000 | 10,023 | 15 | 37.022 ms | 0.054 ms |
+
+These are local debug-profile public-upsert samples, excluding fixture creation and assertions. The baseline may have overlapped native/build work, so elapsed times are illustrative observations; deterministic work counts establish removal of the unrelated-edge scan. They do not establish a whole-crawl throughput gain or isolated index memory cost. A scan oracle and Memory/SQLite fixtures preserve latest-upsert status/depth, earliest-record lookup on edge append, shared redirect/List identities, changing aliases, unknown status overwrites and clear/reuse. Per-record progress semantics and SQLite updates are unchanged.
+
+## 10,000-Page Live Crawl Follow-Up
+
+The existing localhost fixture passed all four cases on 2026-09-20 with `FERROUS_CRAWLER_PAGES=10000` and `FERROUS_CRAWLER_QUERIES=1`. Use the same release-build command as the 5,000-page run, changing only the page-count environment variable. The copied test executable SHA-256 was `bd9998a03adbe669c44ee7bc961323164d1d33cb60be23037686d7e125df5dc0`, built from the working tree based on `6299b66` after borrowed Memory query windows, endpoint indexing and the new pagination/AMP/doctype audits. SQLite used a fresh private directory on the same physical NVMe volume, WAL and `synchronous=NORMAL`.
+
+| Backend / case | Elapsed | Polls | Median poll | p95 poll | Maximum poll |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Memory, uninterrupted | 46.450 s | 30 | 102.354 ms | 142.565 ms | 142.823 ms |
+| Memory, stop/resume | 46.380 s | 30 | 99.292 ms | 136.762 ms | 139.163 ms |
+| SQLite, uninterrupted | 351.902 s | 217 | 115.550 ms | 255.019 ms | 1,252.763 ms |
+| SQLite, stop/reopen/resume | 348.946 s | 216 | 110.764 ms | 216.372 ms | 682.382 ms |
+
+Each completed case retained exactly 10,300 records and 71,100 edges, including 100 planted failures, 100 redirects and 100 robots-blocked URLs. HTTP requests totaled 10,301 uninterrupted or 10,309 interrupted, with no disallowed, excluded or stripped-query request. Delayed-handler overlap peaked at seven in Memory and six in SQLite, below the configured concurrency of eight. Stop occurred at exactly 2,500 records; reopening/resuming preserved completed IDs and ended with an empty frontier. All bounded grid/link/recovery polls passed. Memory reached Stop in 3.408 seconds and SQLite in 16.447 seconds; completed interrupted timings include Stop, reopen and Resume.
+
+The whole test process, including final assertions, took 795.81 seconds and peaked at 146,980 KiB RSS (143.54 MiB). This includes both backends, endpoint/first-inlink indexes, mock-server request records, verification snapshots and allocator retention; it does not isolate index cost or desktop memory. Compilation, repository tests, browser fixtures and packaging did not overlap the timed run. Lightweight source/document work and one read-only SQLite count check occurred while it ran; host services remained active, caches were not flushed and CPU frequency was not fixed. The retained local log is `/tmp/ferrous-roadmap-10k/run.log`.
+
+This is one observation per case, not a median across unchanged-build runs. It is not a paired performance comparison with the older 5,000-page build: dataset size, query borrowing, endpoint indexing and audit fields all changed. It extends live-crawl correctness coverage to 10,000 pages; larger/denser graphs, repeated trials, other devices, rendered crawls and actual desktop frame/input responsiveness remain open. At this point, SQLite progress summaries still rescanned the dataset after record changes; the incremental follow-up below addresses local refreshes. Scheduler startup/interrupted-discovery hydration remains size-dependent.
+
+The final working tree also passed `make ci`: 633 default workspace tests, formatting/Clippy/version/release checks, the frontend build and browser smoke, complete offline single/follow-up report fixtures, three rendering unit tests and seven serialized Chrome fixtures. An embedded-assets debug desktop build passed the expanded [native crawl/reopen/report/export/quit smoke](NATIVE_TESTING.md). These checks ran separately from the timed workload.
+
+## Incremental SQLite Progress Summaries
+
+SQLite now journals locally changed record IDs in connection-local TEMP tables. Transactional triggers count local revisions independently of the persistent record revision. A matching revision permits refreshing only those IDs; an external record commit causes a complete snapshot rebuild. Deleted IDs remove their previous contribution. The journal and revision changes roll back with their records, and a failed refresh discards its partial cache before retrying. Ordinary counters reuse grid predicates; normalized title/description/H1/H2 frequencies and eligible near-duplicate cluster frequencies maintain exact member counts across the one/two-member boundary.
+
+The cache retains one predicate bitmask, four normalized metadata strings and an optional cluster ID per record, plus group frequencies. It does not decode or retain full records, custom fields, captures or HTML. Memory nevertheless grows with record count, distinct metadata and string lengths. First use, reopening and external record changes still scan narrow audit metadata; reference/exact-duplicate graphs and filtered grid queries retain their existing behavior. Every completed crawl record still emits its current progress counts.
+
+```bash
+cargo test --locked -p ferrous-frog-storage summary_tests -- --nocapture
+cargo test --release --locked -p ferrous-frog-storage sqlite_progress_summary_workload -- --ignored --nocapture
+```
+
+The deterministic changed-record regression starts with 256 records. Replacing one record and updating its inlink count previously invoked text normalization 1,024 times; incremental refresh invokes it four times, with a ceiling of eight to reject unrelated-row work. Initial summary visits in the existing 128-record fixture fall from 768 to 128. Fixtures also cover Unicode and empty metadata, List occurrences, failed/non-HTML/incomplete eligibility, group membership removal, changed/reused IDs, local rollback, external writes followed by local writes, a commit during a summary read, malformed audit data and successful retry, clear/reuse and unrelated corrupt payloads. Sitemap membership updates now include constant journal work: 334 VM steps for both 500 and 2,000 records; the regression retains its size-scaling bound.
+
+Two copied release executables were run serially on 2026-09-20 using the existing 10,000-record workload. Seven samples follow a warm summary, each after a local response-time update to one record. Fixture construction, warm-up and writes are outside the timed interval; each result must match the warm summary. No Ferrous Frog compilation, browser or other repository tests overlapped these samples; unrelated host activity was not controlled.
+
+| Metadata case | Previous median | Incremental median | Incremental min–max |
+| --- | ---: | ---: | ---: |
+| Mixed | 34.731 ms | 0.154 ms | 0.145–0.198 ms |
+| Repeated | 33.373 ms | 0.149 ms | 0.143–0.191 ms |
+| Empty/Unicode whitespace | 32.061 ms | 0.152 ms | 0.147–0.201 ms |
+
+These are local cached-dataset observations, not a whole-crawl speedup or a bound on first-use/external-write rebuilds. The timed mutation changes a failed row's response time; the separate regression exercises successful HTML metadata and group changes. Temporary logs: `/tmp/ff-summary-paired-before.log` and `/tmp/ff-summary-paired-after.log`.
+
+The same 10,000-page live fixture then passed using copied executable SHA-256 `ddb045f851898d7663f1bca2f1847198d06d19cebf32c14337ba6d5a04ebf16b`, a fresh private SQLite directory on the physical NVMe volume, and concurrent bounded queries:
+
+| Backend / case | Elapsed | Polls | Median poll | p95 / maximum poll |
+| --- | ---: | ---: | ---: | ---: |
+| Memory, uninterrupted | 49.095 s | 31 | 104.527 ms | 162.022 / 174.883 ms |
+| Memory, stop/resume | 64.913 s | 41 | 135.118 ms | 237.874 / 313.473 ms |
+| SQLite, uninterrupted | 18.845 s | 12 | 100.422 ms | 151.405 / 151.405 ms |
+| SQLite, stop/reopen/resume | 17.502 s | 12 | 68.854 ms | 131.132 / 131.132 ms |
+
+All four cases retained 10,300 records and 71,100 edges with the same planted failures, redirects, robots exclusions and empty final frontier. Fresh requests totaled 10,301; interrupted requests totaled 10,309 in Memory and 10,308 in SQLite, within the fixture's bounded allowance for requests already in flight at Stop. Peak delayed-handler overlap was seven. Stop occurred at exactly 2,500 records in 3.484 seconds for Memory and 4.365 seconds for SQLite; completed IDs survived resume. The process took 152.59 seconds and peaked at 135,660 KiB RSS (132.48 MiB), including both backends and fixture/verification data. This does not isolate the new metadata cache's memory cost.
+
+The previous 10,000-page observations above were 351.902/348.946 seconds for SQLite, compared with 18.845/17.502 seconds here. These are individual runs of successive builds, not an interleaved unchanged-host distribution: unrelated host work was active, and Memory's unchanged path also varied. No other Ferrous Frog build/test/browser task overlapped this run. Deterministic work-count tests establish removal of full progress-summary rescans; the live fixture establishes retained behavior under concurrent queries. Denser graphs, repeated trials, other devices and actual desktop responsiveness remain open. Log: `/tmp/ff-incremental-summary-10k/run.log`.
+
+The updated working tree passed `make ci`: 636 default workspace tests, formatting, Clippy, version/release guards, frontend/browser checks, complete offline single/follow-up report fixtures, three rendering unit tests and seven serialized real-Chrome fixtures. The embedded-assets debug desktop build and full native crawl/reopen/report/export/quit smoke also passed. Native evidence and platform limits are recorded in [NATIVE_TESTING.md](NATIVE_TESTING.md). These checks ran separately from the timed workloads.
+
+### Three trials with the unchanged crawler executable
+
+Two more serial runs used the same copied executable (SHA-256 `ddb045f851898d7663f1bca2f1847198d06d19cebf32c14337ba6d5a04ebf16b`), fixture, page/query settings and fresh private NVMe database directories. All twelve backend/case combinations across the three runs passed exact record/edge totals, robots and exclusion constraints, bounded queries and completed-ID preservation through Stop/reopen/Resume.
+
+| Backend / case | Run 1 | Run 2 | Run 3 | Median | Range |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Memory, uninterrupted | 49.095 s | 48.852 s | 60.549 s | 49.095 s | 48.852–60.549 s |
+| Memory, stop/resume | 64.913 s | 52.702 s | 69.001 s | 64.913 s | 52.702–69.001 s |
+| SQLite, uninterrupted | 18.845 s | 24.013 s | 19.013 s | 19.013 s | 18.845–24.013 s |
+| SQLite, stop/reopen/resume | 17.502 s | 20.391 s | 25.204 s | 20.391 s | 17.502–25.204 s |
+
+Whole-process peak RSS was 135,660 / 158,172 / 144,708 KiB (132.48 / 154.46 / 141.32 MiB). The runs include verification allocations and both backends, so this range does not isolate cache memory. Host work was uncontrolled and caches were not flushed; the unchanged Memory path demonstrates material timing variation. Three samples document local repeatability without establishing a statistical latency guarantee or a paired before/after speedup distribution. No other Ferrous Frog build, test or browser workload overlapped these timed runs. The extra logs are `/tmp/ff-incremental-summary-10k/run-2.log` and `run-3.log`. Denser graphs, larger live crawls, other devices and desktop frame/input responsiveness remain open.
+
+### One-million-record storage follow-up
+
+The existing `sqlite_large_synthetic_storage_benchmark` passed again with `BENCH_URLS=1000000` after the incremental-summary change. Copied release executable SHA-256: `97774253edab9cd0d850abfcc3c665a697ed86c18db04e55e22cd49ca08d8a4d`. SQLite used another fresh private directory on physical NVMe. The fixture retains planted failures, repeated titles, distinct descriptions/headings, hreflang pairs and canonical targets, and requests ten-row query windows.
+
+| Operation | Observed time | Matching rows where reported |
+| --- | ---: | ---: |
+| Insert 1,000,000 records | 201.70 s | 1,000,000 |
+| First full summary | 13.50 s | 1,000,000 |
+| Last ten rows, cached summary | 59.41 ms | 1,000,000 |
+| Duplicate-title page | 2.60 s | 989,690 |
+| Regex page | 292.09 ms | 500,000 |
+| Hreflang return-link page | 4.76 s | 9,896 |
+| Hreflang canonical-target page | 5.02 s | 9,896 |
+
+The database was 819,830,784 bytes. The complete process took 228.51 seconds with peak RSS 1,337,872 KiB (about 1.276 GiB), including SQLite, progress metadata/group caches, canonical/reference work and hreflang query temporaries. This is not an isolated measure of progress-cache memory or a desktop/live-crawl memory budget. First-summary time includes full reference/exact-duplicate preparation, not just progress counters. Other host activity was uncontrolled; no Ferrous Frog build/browser/test ran concurrently, apart from one read-only fixture-count check during insertion. The private database was removed on success; log: `/tmp/ff-summary-million.log`.
+
+This run verifies the current implementation at the existing one-million-record storage scale; the older measurements near the start of this document used a different feature/schema state, so they are not a paired baseline for this change. Initial hydration and global audit/query costs remain substantial. A million-page live HTTP/desktop crawl, denser graphs, cache-memory isolation and responsiveness on other devices remain unverified.

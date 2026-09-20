@@ -145,9 +145,12 @@ type IssueView =
   | "paginationPrevLoop"
   | "paginationNextNonReciprocal"
   | "paginationPrevNonReciprocal"
+  | "paginationCanonicalToLinkedPage"
   | "paginationMultipleTargets"
   | "ampToError"
   | "ampNonReciprocal"
+  | "ampTargetMissingMarker"
+  | "ampMultipleTargets"
   | "directivesNoindex"
   | "imagesMissingAlt"
   | "imagesAltTooLong"
@@ -165,6 +168,7 @@ type IssueView =
   | "structuredDataInvalid"
   | "structuredDataWarning"
   | "htmlDeprecatedTags"
+  | "htmlMissingDoctype"
   | "htmlDuplicateIds"
   | "renderedDomChanged"
   | "nearDuplicate"
@@ -248,6 +252,9 @@ export type CrawlRecord = {
   xContentTypeOptionsHeader: boolean;
   viewport: boolean;
   amphtml?: string | null;
+  amphtmlTargets?: string[] | null;
+  ampDocument?: boolean | null;
+  htmlDoctype?: boolean | null;
   metaKeywords?: string | null;
   relNext?: string | null;
   relPrev?: string | null;
@@ -362,9 +369,12 @@ type CrawlSummary = {
   paginationPrevLoop: number;
   paginationNextNonReciprocal: number;
   paginationPrevNonReciprocal: number;
+  paginationCanonicalToLinkedPage: number;
   paginationMultipleTargets: number;
   ampToError: number;
   ampNonReciprocal: number;
+  ampTargetMissingMarker: number;
+  ampMultipleTargets: number;
   noindex: number;
   imagesMissingAlt: number;
   imagesAltTooLong: number;
@@ -374,6 +384,7 @@ type CrawlSummary = {
   structuredDataInvalid: number;
   structuredDataWarnings: number;
   deprecatedHtmlTags: number;
+  missingHtmlDoctype: number;
   duplicateIds: number;
   renderedDomChanged: number;
   missingViewport: number;
@@ -1004,9 +1015,12 @@ const emptySummary: CrawlSummary = {
   paginationPrevLoop: 0,
   paginationNextNonReciprocal: 0,
   paginationPrevNonReciprocal: 0,
+  paginationCanonicalToLinkedPage: 0,
   paginationMultipleTargets: 0,
   ampToError: 0,
   ampNonReciprocal: 0,
+  ampTargetMissingMarker: 0,
+  ampMultipleTargets: 0,
   noindex: 0,
   imagesMissingAlt: 0,
   imagesAltTooLong: 0,
@@ -1016,6 +1030,7 @@ const emptySummary: CrawlSummary = {
   structuredDataInvalid: 0,
   structuredDataWarnings: 0,
   deprecatedHtmlTags: 0,
+  missingHtmlDoctype: 0,
   duplicateIds: 0,
   renderedDomChanged: 0,
   missingViewport: 0,
@@ -1337,9 +1352,12 @@ const views: Array<{ id: IssueView; label: string }> = [
   { id: "paginationPrevLoop", label: "Previous URL Loops" },
   { id: "paginationNextNonReciprocal", label: "Next URL Non-Reciprocal" },
   { id: "paginationPrevNonReciprocal", label: "Previous URL Non-Reciprocal" },
+  { id: "paginationCanonicalToLinkedPage", label: "Canonical to Linked Page" },
   { id: "paginationMultipleTargets", label: "Multiple Pagination Declarations" },
   { id: "ampToError", label: "AMP URL to Error" },
   { id: "ampNonReciprocal", label: "AMP Canonical Return Missing" },
+  { id: "ampTargetMissingMarker", label: "AMP Target Missing Marker" },
+  { id: "ampMultipleTargets", label: "Multiple AMP Declarations" },
   { id: "directivesNoindex", label: "Noindex" },
   { id: "imagesMissingAlt", label: "Missing Alt" },
   { id: "imagesAltTooLong", label: "Long Alt" },
@@ -1357,6 +1375,7 @@ const views: Array<{ id: IssueView; label: string }> = [
   { id: "structuredDataInvalid", label: "Structured Errors" },
   { id: "structuredDataWarning", label: "Structured Warnings" },
   { id: "htmlDeprecatedTags", label: "Deprecated HTML" },
+  { id: "htmlMissingDoctype", label: "Missing HTML Doctype" },
   { id: "htmlDuplicateIds", label: "Duplicate IDs" },
   { id: "renderedDomChanged", label: "Rendered Changes" },
   { id: "nearDuplicate", label: "Near Duplicates" },
@@ -1375,25 +1394,28 @@ const issueGroups: Array<{ label: string; tabLabel?: string; views: IssueView[];
   { label: "Headings", views: ["h1Missing", "h1Duplicate", "h1TooLong", "h2Missing", "h2Duplicate", "h2TooLong"], columns: ["h1", "h1Count", "h2", "h2Count", "indexability"] },
   { label: "Canonicals & directives", tabLabel: "Indexing", views: ["canonicalMissing", "canonicalMultiple", "canonicalUncrawled", "canonicalToRedirect", "canonicalToError", "canonicalNonIndexable", "canonicalChain", "canonicalLoop", "directivesNoindex"], columns: ["canonical", "canonicalCount", "metaRobots", "xRobotsTag", "indexability", "indexabilityStatus"] },
   { label: "Images", views: ["imagesMissingAlt", "imagesAltTooLong"], columns: ["imageCount", "imagesMissingAlt", "imagesAltTooLong", "outlinkCount"] },
-  { label: "Pagination", views: ["paginationNextToError", "paginationPrevToError", "paginationNextLoop", "paginationPrevLoop", "paginationNextNonReciprocal", "paginationPrevNonReciprocal", "paginationMultipleTargets"], columns: ["finalUrl", "relNext", "relPrev", "relNextTargets", "relPrevTargets", "indexability"] },
-  { label: "AMP", views: ["ampToError", "ampNonReciprocal"], columns: ["finalUrl", "amphtml", "indexability"] },
+  { label: "Pagination", views: ["paginationNextToError", "paginationPrevToError", "paginationNextLoop", "paginationPrevLoop", "paginationNextNonReciprocal", "paginationPrevNonReciprocal", "paginationCanonicalToLinkedPage", "paginationMultipleTargets"], columns: ["finalUrl", "canonical", "relNext", "relPrev", "relNextTargets", "relPrevTargets", "indexability"] },
+  { label: "AMP", views: ["ampToError", "ampNonReciprocal", "ampTargetMissingMarker", "ampMultipleTargets"], columns: ["finalUrl", "amphtml", "amphtmlTargets", "indexability"] },
   { label: "Security", views: ["securityMixedContent", "securityInsecureForms", "securityMissingHsts", "securityMissingCsp", "securityMissingXFrameOptions", "securityMissingContentTypeOptions"], columns: ["mixedContentCount", "insecureFormCount", "hstsHeader", "contentSecurityPolicyHeader", "xFrameOptionsHeader", "xContentTypeOptionsHeader"] },
   { label: "International", tabLabel: "Hreflang", views: ["hreflangInvalid", "hreflangMissingSelfReference", "hreflangMissingReturnLink", "hreflangNonCanonicalTarget"], columns: ["hreflangCount", "hreflangInvalidCount", "canonical", "indexability"] },
-  { label: "Structured data & HTML", tabLabel: "Markup", views: ["structuredDataInvalid", "structuredDataWarning", "htmlDeprecatedTags", "htmlDuplicateIds"], columns: ["jsonLdInvalidCount", "structuredDataErrorCount", "structuredDataWarningCount", "deprecatedHtmlTagCount", "duplicateIdCount"] },
+  { label: "Structured data & HTML", tabLabel: "Markup", views: ["structuredDataInvalid", "structuredDataWarning", "htmlDeprecatedTags", "htmlMissingDoctype", "htmlDuplicateIds"], columns: ["jsonLdInvalidCount", "structuredDataErrorCount", "structuredDataWarningCount", "deprecatedHtmlTagCount", "htmlDoctype", "duplicateIdCount"] },
   { label: "Content & rendering", tabLabel: "Content", views: ["thinContent", "lowTextRatio", "exactDuplicate", "nearDuplicate", "renderedDomChanged", "mobileMissingViewport"], columns: ["wordCount", "textToCodeRatio", "responseHash", "sizeBytes", "nearDuplicateClusterId", "jsRendered", "renderedWordCountDelta", "renderedLinkCountDelta", "viewport"] },
   { label: "Sitemaps", views: ["sitemapOrphan"], columns: ["inSitemap", "canonical", "indexability", "inlinkCount"] },
 ];
 
 const canonicalSummaryKeys = ["canonicalUncrawled", "canonicalToRedirect", "canonicalToError", "canonicalNonIndexable", "canonicalChain", "canonicalLoop"] as const;
-const querySummaryKeys = [...canonicalSummaryKeys, "exactDuplicates", "paginationNextToError", "paginationPrevToError", "paginationNextLoop", "paginationPrevLoop", "paginationNextNonReciprocal", "paginationPrevNonReciprocal", "ampToError", "ampNonReciprocal"] as const;
+const querySummaryKeys = [...canonicalSummaryKeys, "exactDuplicates", "paginationNextToError", "paginationPrevToError", "paginationNextLoop", "paginationPrevLoop", "paginationNextNonReciprocal", "paginationPrevNonReciprocal", "paginationCanonicalToLinkedPage", "ampToError", "ampNonReciprocal", "ampTargetMissingMarker"] as const;
 const viewSummaryKeys: Partial<Record<IssueView, keyof CrawlSummary>> = {
   ...Object.fromEntries(canonicalSummaryKeys.map((key) => [key, key])),
   paginationNextToError: "paginationNextToError", paginationPrevToError: "paginationPrevToError",
   paginationNextLoop: "paginationNextLoop", paginationPrevLoop: "paginationPrevLoop",
   paginationNextNonReciprocal: "paginationNextNonReciprocal", paginationPrevNonReciprocal: "paginationPrevNonReciprocal",
+  paginationCanonicalToLinkedPage: "paginationCanonicalToLinkedPage",
   paginationMultipleTargets: "paginationMultipleTargets",
   ampToError: "ampToError",
   ampNonReciprocal: "ampNonReciprocal",
+  ampTargetMissingMarker: "ampTargetMissingMarker",
+  ampMultipleTargets: "ampMultipleTargets",
   all: "total", internal: "internal", external: "external", status2xx: "success", status3xx: "redirects",
   status4xx: "clientErrors", status5xx: "serverErrors", noResponse: "noResponse", brokenLinks: "broken",
   titleMissing: "titleMissing", titleDuplicate: "titleDuplicate", metaMissing: "metaMissing", metaDuplicate: "metaDuplicate",
@@ -1404,6 +1426,7 @@ const viewSummaryKeys: Partial<Record<IssueView, keyof CrawlSummary>> = {
   securityInsecureForms: "insecureForms", securityMissingHsts: "missingHsts", mobileMissingViewport: "missingViewport",
   hreflangInvalid: "hreflangInvalid", structuredDataInvalid: "structuredDataInvalid", structuredDataWarning: "structuredDataWarnings",
   htmlDeprecatedTags: "deprecatedHtmlTags", htmlDuplicateIds: "duplicateIds", renderedDomChanged: "renderedDomChanged",
+  htmlMissingDoctype: "missingHtmlDoctype",
   nearDuplicate: "nearDuplicates", exactDuplicate: "exactDuplicates", sitemapOrphan: "sitemapOrphans",
 };
 
@@ -1442,6 +1465,7 @@ const nativeColumns: GridColumn[] = [
   { kind: "native", key: "relNextTargets", label: "Next Targets", width: 125, sortable: false },
   { kind: "native", key: "relPrevTargets", label: "Previous Targets", width: 140, sortable: false },
   { kind: "native", key: "amphtml", label: "AMP URL", width: 300, sortable: true },
+  { kind: "native", key: "amphtmlTargets", label: "AMP Targets", width: 125, sortable: false },
   {
     kind: "native",
     key: "listPosition",
@@ -1702,6 +1726,13 @@ const nativeColumns: GridColumn[] = [
     label: "Dup IDs",
     width: 78,
     sortable: true,
+  },
+  {
+    kind: "native",
+    key: "htmlDoctype",
+    label: "HTML Doctype",
+    width: 130,
+    sortable: false,
   },
   {
     kind: "native",
@@ -2366,7 +2397,7 @@ export default function App() {
   const [fieldFormFactor, setFieldFormFactor] = useState<FieldFormFactor>("phone");
   const [pageSpeedCategories, setPageSpeedCategories] = useState<PageSpeedCategory[]>(["performance", "accessibility", "bestPractices", "seo"]);
   const [pageSpeedBulkStatus, setPageSpeedBulkStatus] = useState<string>();
-  const [pageSpeedActive, setPageSpeedActive] = useState<{ requestId: string; url: string }>();
+  const [pageSpeedActive, setPageSpeedActive] = useState<{ requestId: string; url: string; service?: "PageSpeed" | "CrUX" }>();
   const pageSpeedRequest = useRef<string | undefined>(undefined);
   const [pageSpeedCancelling, setPageSpeedCancelling] = useState(false);
   const [databasePath, setDatabasePath] = useState("");
@@ -3636,22 +3667,27 @@ export default function App() {
       }
     });
   };
-  const runPageSpeedBulk = async () => {
+  const runPageSpeedBulk = async (service: "PageSpeed" | "CrUX" = "PageSpeed") => {
     if (!selected || pageSpeedDisabledReason || selectedRecordIds.length === 0) return;
     const recordIds = [...selectedRecordIds];
     const requestId = crypto.randomUUID();
     await runWorkspaceAction(async () => {
       pageSpeedRequest.current = requestId;
-      setPageSpeedActive({ requestId, url: `${recordIds.length.toLocaleString()} selected rows` });
+      setPageSpeedActive({ requestId, url: `${recordIds.length.toLocaleString()} selected rows`, service });
       setPageSpeedCancelling(false); setNotice(undefined);
-      setPageSpeedBulkStatus(`Measuring 0 of ${recordIds.length.toLocaleString()} selected rows…`);
+      setPageSpeedBulkStatus(`Processing 0 of ${recordIds.length.toLocaleString()} selected rows…`);
       try {
-        const result = await invoke<{ measured: number; skipped: number; failed: { recordId: number; error: string }[]; cancelled: boolean }>("run_page_speed_bulk",
-          { request: { requestId, recordIds, strategy: pageSpeedStrategy, categories: pageSpeedCategories, resume: true } });
-        await loadRows();
+        const result = await invoke<{ measured: number; skipped: number; failed: { recordId: number; error: string }[]; cancelled: boolean }>(
+          service === "CrUX" ? "run_field_vitals_bulk" : "run_page_speed_bulk",
+          { request: service === "CrUX" ? { requestId, recordIds, formFactor: fieldFormFactor, resume: true }
+            : { requestId, recordIds, strategy: pageSpeedStrategy, categories: pageSpeedCategories, resume: true } });
+        // Releasing workspaceBusy refreshes the current query, which may have changed during the run.
         const summary = `${result.measured.toLocaleString()} measured, ${result.skipped.toLocaleString()} already measured, ${result.failed.length.toLocaleString()} failed${result.cancelled ? ", cancelled" : ""}.`;
-        setNotice(`PageSpeed bulk run: ${summary}`);
-        if (result.failed.length) setError(`PageSpeed failed for ${result.failed.length.toLocaleString()} row(s): ${result.failed.slice(0, 3).map((item) => item.error).join("; ")}`);
+        setNotice(`${service} bulk run: ${summary}`);
+        if (result.failed.length) setError(`${service} failed for ${result.failed.length.toLocaleString()} row(s): ${result.failed.slice(0, 3).map((item) => item.error).join("; ")}`);
+      } catch (caught) {
+        if (errorMessage(caught) !== "PageSpeed measurement cancelled") throw caught;
+        setNotice(`${service} bulk run cancelled.`);
       } finally {
         pageSpeedRequest.current = undefined;
         setPageSpeedActive(undefined); setPageSpeedCancelling(false); setPageSpeedBulkStatus(undefined);
@@ -3664,7 +3700,7 @@ export default function App() {
     let unlisten: (() => void) | undefined;
     void listen<{ requestId: string; completed: number; total: number; recordId: number; error?: string | null }>("page-speed-progress", (event) => {
       if (disposed || event.payload.requestId !== pageSpeedRequest.current) return;
-      setPageSpeedBulkStatus(`Measuring ${event.payload.completed.toLocaleString()} of ${event.payload.total.toLocaleString()} selected rows…`);
+      setPageSpeedBulkStatus(`Processing ${event.payload.completed.toLocaleString()} of ${event.payload.total.toLocaleString()} selected rows…`);
       const recordId = event.payload.recordId;
       useAppStore.setState((current) => current.selected?.id === recordId ? { selected: { ...current.selected } } : {});
     }).then((dispose) => { if (disposed) dispose(); else unlisten = dispose; }).catch(() => undefined);
@@ -4376,7 +4412,8 @@ export default function App() {
               <DropdownMenu.Content className="dropdown-content" align="end" sideOffset={8} inert={!exportMenuOpen} onKeyDownCapture={preventClosedMenuKeys}>
                 <DropdownMenu.Item
                   className="dropdown-item"
-                  disabled={filteredExportDisabled}
+                  disabled={filteredExportDisabled || running}
+                  title={running ? "Stop the crawl to export this report" : undefined}
                   onSelect={() => void exportFile("csv")}
                 >
                   CSV
@@ -4411,35 +4448,40 @@ export default function App() {
                 </DropdownMenu.Item>
                 <DropdownMenu.Item
                   className="dropdown-item"
-                  disabled={filteredExportDisabled}
+                  disabled={filteredExportDisabled || running}
+                  title={running ? "Stop the crawl to export this report" : undefined}
                   onSelect={() => void exportFile("sitemap")}
                 >
                   XML Sitemap
                 </DropdownMenu.Item>
                 <DropdownMenu.Item
                   className="dropdown-item"
-                  disabled={exportDisabled}
+                  disabled={exportDisabled || running}
+                  title={running ? "Stop the crawl to export this report" : undefined}
                   onSelect={() => void exportFile("linkEdgesCsv")}
                 >
                   Link Edges CSV
                 </DropdownMenu.Item>
                 <DropdownMenu.Item
                   className="dropdown-item"
-                  disabled={exportDisabled}
+                  disabled={exportDisabled || running}
+                  title={running ? "Stop the crawl to export this report" : undefined}
                   onSelect={() => void exportFile("redirectChainsCsv")}
                 >
                   Redirect Chains CSV
                 </DropdownMenu.Item>
                 <DropdownMenu.Item
                   className="dropdown-item"
-                  disabled={exportDisabled}
+                  disabled={exportDisabled || running}
+                  title={running ? "Stop the crawl to export this report" : undefined}
                   onSelect={() => void exportFile("sitemapValidationCsv")}
                 >
                   Sitemap Validation CSV
                 </DropdownMenu.Item>
                 <DropdownMenu.Item
                   className="dropdown-item"
-                  disabled={exportDisabled}
+                  disabled={exportDisabled || running}
+                  title={running ? "Stop the crawl to export this report" : undefined}
                   onSelect={() => void exportFile("htmlReport")}
                 >
                   HTML Report
@@ -6344,7 +6386,7 @@ export default function App() {
       {!settingsOpen && !linkReportsOpen && !graphOpen && !comparisonOpen && !sessionDeleteOpen ? <FeedbackMessages /> : null}
       {pageSpeedActive ? <div className="notice-bar page-speed-running" role="status">
         <RefreshCw size={15} aria-hidden="true" />
-        <span title={pageSpeedActive.url}>Measuring PageSpeed · {pageSpeedActive.url}</span>
+        <span title={pageSpeedActive.url}>{pageSpeedActive.service === "CrUX" ? "Fetching CrUX" : "Measuring PageSpeed"} · {pageSpeedActive.url}</span>
         <button data-action="cancel-pagespeed" disabled={pageSpeedCancelling} onClick={() => void cancelPageSpeed()}>
           {pageSpeedCancelling ? "Cancelling…" : "Cancel measurement"}
         </button>
@@ -6721,9 +6763,11 @@ export default function App() {
                     disabledReason={pageSpeedDisabledReason} onRun={() => void runPageSpeed()}
                     onConfigure={() => { changeSettingsOpen(true); setSettingsTab("integrations"); }}
                     categories={pageSpeedCategories} onCategories={setPageSpeedCategories}
-                    selectedCount={selectedRecordIds.length} onRunSelected={() => void runPageSpeedBulk()} bulkStatus={pageSpeedBulkStatus} />
+                    selectedCount={selectedRecordIds.length} onRunSelected={() => void runPageSpeedBulk()} bulkStatus={pageSpeedActive?.service === "CrUX" ? undefined : pageSpeedBulkStatus} />
                   <FieldVitalsPanel snapshot={selected.fieldVitals} formFactor={fieldFormFactor} onFormFactor={setFieldFormFactor}
-                    disabledReason={pageSpeedDisabledReason} onRun={() => void runFieldVitals()} />
+                    disabledReason={pageSpeedDisabledReason} onRun={() => void runFieldVitals()}
+                    selectedCount={selectedRecordIds.length} onRunSelected={() => void runPageSpeedBulk("CrUX")}
+                    bulkStatus={pageSpeedActive?.service === "CrUX" ? pageSpeedBulkStatus : undefined} />
                 </div>
               ) : detailTab === "ai" ? (
                 <div className="detail-content ai-panel" id="detail-panel-ai" role="tabpanel" aria-labelledby="detail-tab-ai">
@@ -6844,11 +6888,20 @@ export default function App() {
                     <dd>
                       Next: {selected.relNext || "None"}; Prev: {selected.relPrev || "None"}
                       <div>Pagination audits check every captured target. Next and Prev above show the first declaration.</div>
-                      <PaginationTargetList key={`${selectedSessionId}:${selected.storageKey}:${selected.id}:next`} direction="next" targets={selected.relNextTargets} />
-                      <PaginationTargetList key={`${selectedSessionId}:${selected.storageKey}:${selected.id}:prev`} direction="prev" targets={selected.relPrevTargets} />
+                      <DeclarationTargetList key={`${selectedSessionId}:${selected.storageKey}:${selected.id}:next`} kind="next" targets={selected.relNextTargets} />
+                      <DeclarationTargetList key={`${selectedSessionId}:${selected.storageKey}:${selected.id}:prev`} kind="prev" targets={selected.relPrevTargets} />
                     </dd>
                     <dt>AMP</dt>
-                    <dd>{selected.amphtml || "None"}</dd>
+                    <dd>
+                      {selected.amphtml || "None"}
+                      <div>AMP audits check every captured target. AMP URL above shows the first declaration.</div>
+                      <DeclarationTargetList key={`${selectedSessionId}:${selected.storageKey}:${selected.id}:amp`} kind="amp" targets={selected.amphtmlTargets} />
+                    </dd>
+                    <dt>AMP Marker</dt>
+                    <dd aria-label="AMP marker evidence">
+                      {selected.ampDocument === true ? "Present" : selected.ampDocument === false ? "Missing" : "Not measured"}
+                      <div>Selected page’s original HTML element: amp/⚡ attribute evidence, not full AMP validation.</div>
+                    </dd>
                   </dl>
                 </div>
                 <div id="detail-panel-technical" role="tabpanel" aria-labelledby="detail-tab-technical" tabIndex={0} hidden={detailTab !== "technical"}>
@@ -6895,6 +6948,11 @@ export default function App() {
                     <dd>
                       {selected.deprecatedHtmlTagCount.toLocaleString()} deprecated tag instances,{" "}
                       {selected.duplicateIdCount.toLocaleString()} duplicate id instances
+                    </dd>
+                    <dt>HTML doctype</dt>
+                    <dd aria-label="HTML doctype evidence">
+                      {selected.htmlDoctype === true ? "Present" : selected.htmlDoctype === false ? "Missing" : "Not measured"}
+                      <div>Original HTTP HTML declaration evidence; presence does not establish HTML conformance or browser rendering mode.</div>
                     </dd>
                     <dt>Rendering</dt>
                     <dd>
@@ -7121,15 +7179,15 @@ function handleTabKeys(event: KeyboardEvent<HTMLElement>) {
   tabs[next]?.click();
 }
 
-function PaginationTargetList({ direction, targets }: { direction: "next" | "prev"; targets?: string[] | null }) {
+function DeclarationTargetList({ kind, targets }: { kind: "next" | "prev" | "amp"; targets?: string[] | null }) {
   const [page, setPage] = useState(0);
   const pageSize = 100;
   const total = targets?.length ?? 0;
   const lastPage = Math.max(0, Math.ceil(total / pageSize) - 1);
   const currentPage = Math.min(page, lastPage);
   const visible = targets?.slice(currentPage * pageSize, (currentPage + 1) * pageSize) ?? [];
-  const label = direction === "next" ? "Next" : "Previous";
-  return <section className={`pagination-targets ${direction}`} aria-label={`${label} pagination targets`}>
+  const label = kind === "amp" ? "AMP" : kind === "next" ? "Next" : "Previous";
+  return <section className={`pagination-targets ${kind}`} aria-label={kind === "amp" ? "AMP targets" : `${label} pagination targets`}>
     <div>{label} targets: {targets == null ? "Not captured" : total.toLocaleString()}</div>
     {visible.length > 0 ? <ol className="detail-mini-list" start={currentPage * pageSize + 1}>
       {visible.map((target, index) => <li key={currentPage * pageSize + index}>{target}</li>)}
@@ -8209,12 +8267,15 @@ function OverviewPanel({
   const technicalRows: OverviewRowModel[] = [
     { label: "AMP URL to error", value: summary.ampToError, tone: "danger", view: "ampToError" },
     { label: "AMP canonical return missing", value: summary.ampNonReciprocal, tone: "warning", view: "ampNonReciprocal" },
+    { label: "AMP target missing marker", value: summary.ampTargetMissingMarker, tone: "warning", view: "ampTargetMissingMarker" },
+    { label: "Multiple AMP declarations", value: summary.ampMultipleTargets, tone: "muted", view: "ampMultipleTargets" },
     { label: "Next URL to error", value: summary.paginationNextToError, tone: "danger", view: "paginationNextToError" },
     { label: "Previous URL to error", value: summary.paginationPrevToError, tone: "danger", view: "paginationPrevToError" },
     { label: "Next URL loops", value: summary.paginationNextLoop, tone: "danger", view: "paginationNextLoop" },
     { label: "Previous URL loops", value: summary.paginationPrevLoop, tone: "danger", view: "paginationPrevLoop" },
     { label: "Next URL non-reciprocal", value: summary.paginationNextNonReciprocal, tone: "warning", view: "paginationNextNonReciprocal" },
     { label: "Previous URL non-reciprocal", value: summary.paginationPrevNonReciprocal, tone: "warning", view: "paginationPrevNonReciprocal" },
+    { label: "Pagination canonical to linked page", value: summary.paginationCanonicalToLinkedPage, tone: "warning", view: "paginationCanonicalToLinkedPage" },
     { label: "Multiple pagination declarations", value: summary.paginationMultipleTargets, tone: "muted", view: "paginationMultipleTargets" },
     { label: "Invalid hreflang", value: summary.hreflangInvalid, tone: "warning" as const, view: "hreflangInvalid" },
     {
@@ -8234,6 +8295,12 @@ function OverviewPanel({
       value: summary.deprecatedHtmlTags,
       tone: "warning" as const,
       view: "htmlDeprecatedTags",
+    },
+    {
+      label: "Missing HTML doctype",
+      value: summary.missingHtmlDoctype,
+      tone: "warning" as const,
+      view: "htmlMissingDoctype",
     },
     {
       label: "Duplicate IDs",
@@ -8650,10 +8717,13 @@ function formatCell(row: CrawlRecord, column: GridColumn) {
   }
 
   const value = row[column.key];
+  if (column.key === "htmlDoctype") {
+    return value === true ? "Present" : value === false ? "Missing" : "Not measured";
+  }
   if (column.key === "firstInlinkSourceUrl") {
     return foundFromCell(row);
   }
-  if (column.key === "relNextTargets" || column.key === "relPrevTargets") {
+  if (column.key === "relNextTargets" || column.key === "relPrevTargets" || column.key === "amphtmlTargets") {
     return Array.isArray(value) ? value.length.toLocaleString() : "Unknown";
   }
   if (column.key === "textToCodeRatio") {
@@ -8668,10 +8738,13 @@ function formatCell(row: CrawlRecord, column: GridColumn) {
   }
   if (column.key === "fieldVitals") {
     const field = row.fieldVitals;
-    if (!field) return " ";
-    if (!field.hasData) return `${field.formFactor}: no field data`;
+    if (!field) return "Not measured";
     const ms = (ms?: number | null) => ms == null || !Number.isFinite(ms) ? "–" : `${Math.round(ms)} ms`;
-    return `${field.formFactor} · LCP ${ms(field.lcpMsP75)} · INP ${ms(field.inpMsP75)} · CLS ${field.clsP75 == null ? "–" : field.clsP75}`;
+    const metrics = field.hasData
+      ? `p75 · LCP ${ms(field.lcpMsP75)} · INP ${ms(field.inpMsP75)} · CLS ${field.clsP75 == null || !Number.isFinite(field.clsP75) ? "–" : field.clsP75} · FCP ${ms(field.fcpMsP75)} · TTFB ${ms(field.ttfbMsP75)}`
+      : "no field data";
+    const fetched = new Date(field.completedAtMs);
+    return `${field.formFactor} · ${metrics} · Collection ${field.collectionPeriodStart ?? "unknown"} to ${field.collectionPeriodEnd ?? "unknown"} · URL ${field.requestedUrl} · Fetched ${Number.isFinite(fetched.getTime()) ? fetched.toISOString() : "unknown"}`;
   }
   if (value === null || value === undefined || value === "") {
     return " ";

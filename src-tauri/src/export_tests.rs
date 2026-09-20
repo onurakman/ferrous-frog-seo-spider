@@ -162,7 +162,13 @@ async fn crawl_archive_round_trips_order_unicode_frontier_and_import_seed() {
             row.meta_description_count = Some(3);
             row.content_hash = Some(format!("captured-text-{position}"));
             row.content_hash_context = Some("text-v1:http:fixture".into());
+            row.amp_document = Some(position == 20);
             if position == 20 {
+                row.amphtml_targets = Some(vec![
+                    "https://example.test/amp-1".into(),
+                    "https://example.test/amp-2".into(),
+                    "https://example.test/amp-1".into(),
+                ]);
                 row.rel_next_targets = Some(vec![
                     "https://example.test/page-2".into(),
                     "https://example.test/page-3".into(),
@@ -255,6 +261,15 @@ async fn crawl_archive_round_trips_order_unicode_frontier_and_import_seed() {
             .into_iter()
             .find(|row| row.list_position == Some(20))
             .unwrap();
+        assert_eq!(imported_record.amp_document, Some(true));
+        assert_eq!(
+            imported_record.amphtml_targets.as_ref().unwrap(),
+            &vec![
+                "https://example.test/amp-1".to_string(),
+                "https://example.test/amp-2".to_string(),
+                "https://example.test/amp-1".to_string(),
+            ]
+        );
         assert_eq!(imported_record.rel_next_targets.as_ref().unwrap().len(), 3);
         assert_eq!(imported_record.rel_prev_targets, Some(vec![]));
         assert!(
@@ -579,6 +594,107 @@ fn crawl_archive_write_and_flush_errors_do_not_publish_partial_files() {
         assert_eq!(fs::read_to_string(&path).unwrap(), "previous export");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
+}
+
+#[test]
+fn crawl_archive_streams_frontier_before_late_decode_errors() {
+    for (corruption, emitted_value) in [
+        (
+            "UPDATE crawl_frontier_queue SET depth = 'invalid' WHERE position = 1",
+            "https://example.test/first-queued",
+        ),
+        (
+            "INSERT INTO crawl_frontier_seen(url) VALUES (x'ff')",
+            "https://example.test/first-seen",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("crawl.sqlite3");
+        let store = ActiveStore::sqlite(&database).unwrap();
+        store.save_frontier_state(CrawlFrontierState {
+            queued: ["first-queued", "second-queued"]
+                .map(|path| ferrous_frog_storage::CrawlFrontierItem {
+                    url: format!("https://example.test/{path}"),
+                    depth: 1,
+                    from_sitemap: true,
+                    storage_key: path.into(),
+                    list_position: None,
+                    list_duplicate_index: 0,
+                })
+                .to_vec(),
+            seen: vec!["https://example.test/first-seen".into()],
+            crawled: 42,
+        });
+        Connection::open(&database)
+            .unwrap()
+            .execute_batch(corruption)
+            .unwrap();
+        let path = directory.path().join("archive.json");
+        fs::write(&path, "previous export").unwrap();
+        let error = write_atomic_export(&path, |file| {
+            let mut bytes = Vec::new();
+            let result = write_crawl_archive_stream(&store, 1, &mut bytes);
+            assert!(
+                String::from_utf8_lossy(&bytes).contains(emitted_value),
+                "valid frontier rows must reach the writer before later rows are decoded"
+            );
+            assert!(serde_json::from_slice::<CrawlArchive>(&bytes).is_err());
+            file.write_all(&bytes).unwrap();
+            result
+        })
+        .unwrap_err();
+        assert!(error.contains("sqlite"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "previous export");
+        assert!(!fs::read_dir(directory.path()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".tmp")
+        }));
+        // A failed stream must release its read transaction and storage lock.
+        store.clear_frontier_state();
+        let mut bytes = Vec::new();
+        write_crawl_archive_stream(&store, 2, &mut bytes).unwrap();
+        let archive: CrawlArchive = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(archive.frontier_state, None);
+    }
+}
+
+#[test]
+fn crawl_archive_streams_records_before_late_decode_errors() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("crawl.sqlite3");
+    let store = ActiveStore::sqlite(&database).unwrap();
+    for index in 0..257 {
+        store.upsert(CrawlRecord::pending(
+            format!("https://example.test/record-{index}"),
+            0,
+        ));
+    }
+    Connection::open(database)
+        .unwrap()
+        .execute(
+            "UPDATE crawl_records SET title_len = 'invalid' WHERE id = 257",
+            [],
+        )
+        .unwrap();
+    let path = directory.path().join("archive.json");
+    fs::write(&path, "previous export").unwrap();
+    let error = write_atomic_export(&path, |file| {
+        let mut bytes = Vec::new();
+        let result = write_crawl_archive_stream(&store, 1, &mut bytes);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("https://example.test/record-0"),
+            "early records must stream before later records are decoded"
+        );
+        assert!(serde_json::from_slice::<CrawlArchive>(&bytes).is_err());
+        file.write_all(&bytes).unwrap();
+        result
+    })
+    .unwrap_err();
+    assert!(error.contains("sqlite"), "{error}");
+    assert_eq!(fs::read_to_string(path).unwrap(), "previous export");
 }
 
 #[tokio::test]
@@ -1883,4 +1999,78 @@ async fn webhook_posts_the_summary_and_reports_http_failures() {
     let failure = post_webhook(&url, &payload).await.unwrap_err();
     assert!(failure.contains("500"), "{failure}");
     server.abort();
+}
+
+#[tokio::test]
+async fn basic_stream_exports_require_idle_workers_and_preserve_existing_files() {
+    for kind in [
+        ExportFileKind::Csv,
+        ExportFileKind::Sitemap,
+        ExportFileKind::LinkEdgesCsv,
+        ExportFileKind::RedirectChainsCsv,
+        ExportFileKind::SitemapValidationCsv,
+    ] {
+        let store = ActiveStore::memory();
+        let mut row = CrawlRecord::pending("https://example.test/page".into(), 0);
+        row.status_code = Some(200);
+        row.in_sitemap = true;
+        store.upsert(row);
+        store.add_link_edge(archive_edge(1));
+        let state = state_with_store(store);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing-export");
+        fs::write(&path, "previous export").unwrap();
+        assert!(
+            export_basic_stream_file(&state, path.clone(), kind, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "previous export");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        *state.crawl_task.lock().await = Some(tauri::async_runtime::spawn(std::future::pending()));
+        let error = export_basic_stream_file(&state, path, kind, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("stop"), "{error}");
+        state.crawl_task.lock().await.take().unwrap().abort();
+        let path = directory.path().join("new-export");
+        export_basic_stream_file(&state, path.clone(), kind, None)
+            .await
+            .unwrap();
+        assert!(!fs::read(path).unwrap().is_empty());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+}
+
+#[tokio::test]
+async fn basic_stream_record_storage_errors_preserve_prior_export_and_release_worker() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("crawl.sqlite3");
+    let store = ActiveStore::sqlite(&database).unwrap();
+    store.upsert(CrawlRecord::pending("https://example.test/page".into(), 0));
+    let external = Connection::open(database).unwrap();
+    external
+        .execute("UPDATE crawl_records SET title_len = 'invalid'", [])
+        .unwrap();
+    let state = state_with_store(store);
+    let path = directory.path().join("export.csv");
+    fs::write(&path, "previous export").unwrap();
+    let before = fs::read_dir(directory.path()).unwrap().count();
+    for kind in [
+        ExportFileKind::Csv,
+        ExportFileKind::Sitemap,
+        ExportFileKind::RedirectChainsCsv,
+    ] {
+        let error = export_basic_stream_file(&state, path.clone(), kind, None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("sqlite"), "{error}");
+        assert!(
+            !error.contains("worker failed") && !error.contains("panicked"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "previous export");
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), before);
+        assert!(state.crawl_task.try_lock().is_ok());
+    }
 }

@@ -38,3 +38,6 @@ url.workspace = true
 [[bin]]
 name = "ferrous-frog"
 path = "src/main.rs"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

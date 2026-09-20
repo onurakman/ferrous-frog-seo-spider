@@ -19,6 +19,7 @@ use tokio::sync::watch;
 const CANCELLED: &str = "PageSpeed measurement cancelled";
 const PRE_CANCEL_LIMIT: usize = 32;
 const KEYRING_ACCOUNT: &str = "page-speed-api-key";
+const FIELD_KEY_REQUIRED: &str = "Chrome UX Report needs the Google API key saved in Settings > Integrations (with the Chrome UX Report API enabled)";
 const KEYRING_UNAVAILABLE: &str =
     "The OS credential store is unavailable. Unlock it and try again.";
 
@@ -654,6 +655,206 @@ pub struct RunFieldVitalsRequest {
     form_factor: FieldFormFactor,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunFieldVitalsBulkRequest {
+    record_ids: Vec<u64>,
+    form_factor: FieldFormFactor,
+    request_id: String,
+    #[serde(default)]
+    resume: bool,
+}
+
+/// Fetches at most 500 selected occurrences sequentially under one session guard.
+async fn run_field_vitals_bulk_with_fetcher<F, Fut>(
+    state: &AppState,
+    page_speed: &PageSpeedState,
+    request: RunFieldVitalsBulkRequest,
+    fetch: F,
+    progress: impl Fn(PageSpeedBulkProgress),
+) -> Result<PageSpeedBulkResult, String>
+where
+    F: Fn(String, FieldFormFactor) -> Fut,
+    Fut: Future<Output = Result<FieldVitalsMetrics, String>>,
+{
+    if request.record_ids.is_empty() || request.record_ids.len() > BULK_LIMIT {
+        return Err(format!(
+            "select between 1 and {BULK_LIMIT} rows to fetch field data"
+        ));
+    }
+    let (_active, mut cancel) = page_speed.begin(&request.request_id)?;
+    let task = state
+        .crawl_task
+        .try_lock()
+        .map_err(|_| "The crawl is busy; try field data again after the current operation")?;
+    if state.exit_confirmed.load(Ordering::SeqCst) {
+        return Err("the application is closing".into());
+    }
+    if task
+        .as_ref()
+        .is_some_and(|task| !task.inner().is_finished())
+    {
+        return Err("Stop or complete the active crawl before fetching field data".into());
+    }
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "store lock poisoned")?
+        .clone();
+    let read_store = store.clone();
+    let ids = request.record_ids.clone();
+    let rows = tauri::async_runtime::spawn_blocking(move || selected_records(&read_store, &ids))
+        .await
+        .map_err(|_| "Field data record worker failed")??;
+    let total = rows.len();
+    let mut result = PageSpeedBulkResult {
+        measured: 0,
+        skipped: 0,
+        failed: Vec::new(),
+        cancelled: false,
+    };
+    let mut next_attempt = tokio::time::Instant::now();
+    for (index, row) in rows.into_iter().enumerate() {
+        if *cancel.borrow() {
+            result.cancelled = true;
+            break;
+        }
+        let record_id = row.id;
+        let report = |error| {
+            progress(PageSpeedBulkProgress {
+                request_id: request.request_id.clone(),
+                completed: index + 1,
+                total,
+                record_id,
+                error,
+            })
+        };
+        let url = match page_speed_url(&row) {
+            Ok(url) => url,
+            Err(error) => {
+                report(Some(error.clone()));
+                result
+                    .failed
+                    .push(PageSpeedBulkFailure { record_id, error });
+                continue;
+            }
+        };
+        if request.resume
+            && row.field_vitals.as_ref().is_some_and(|snapshot| {
+                snapshot.form_factor == request.form_factor && snapshot.requested_url == url
+            })
+        {
+            result.skipped += 1;
+            report(None);
+            continue;
+        }
+        let mut attempt = 0;
+        let outcome = loop {
+            // CrUX permits 150 queries/minute/project. Space starts by 500 ms,
+            // including retries; other clients sharing the key may still trigger backoff.
+            tokio::select! {
+                biased;
+                _ = cancel.changed() => break Err(CANCELLED.to_string()),
+                _ = tokio::time::sleep_until(next_attempt) => {}
+            }
+            next_attempt = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            let fetched = tokio::select! {
+                biased;
+                _ = cancel.changed() => Err(CANCELLED.to_string()),
+                result = fetch(url.clone(), request.form_factor) => result,
+            };
+            match fetched {
+                Err(error) if quota_limited(&error) && attempt < QUOTA_BACKOFF_SECS.len() => {
+                    let wait = std::time::Duration::from_secs(QUOTA_BACKOFF_SECS[attempt]);
+                    attempt += 1;
+                    tokio::select! {
+                        biased;
+                        _ = cancel.changed() => break Err(CANCELLED.to_string()),
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+                other => break other,
+            }
+        };
+        let outcome = match outcome {
+            Ok(metrics) => {
+                let snapshot = field_vitals_snapshot(url, request.form_factor, metrics);
+                let save_store = store.clone();
+                let save_cancel = cancel.clone();
+                // Cancellation can race with the last response. Check again before
+                // starting the atomic save and retain the session guard until it finishes.
+                tauri::async_runtime::spawn_blocking(move || {
+                    if *save_cancel.borrow() {
+                        return Err(CANCELLED.to_string());
+                    }
+                    save_store
+                        .try_save_field_vitals(record_id, snapshot)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .map_err(|_| "Field data snapshot worker failed".to_string())
+                .and_then(|inner| inner)
+            }
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Ok(()) => {
+                result.measured += 1;
+                report(None);
+            }
+            Err(error) if error == CANCELLED => {
+                result.cancelled = true;
+                break;
+            }
+            Err(error) if error == FIELD_KEY_REQUIRED || error == KEYRING_UNAVAILABLE => {
+                return Err(error);
+            }
+            Err(error) => {
+                report(Some(error.clone()));
+                result
+                    .failed
+                    .push(PageSpeedBulkFailure { record_id, error });
+            }
+        }
+    }
+    drop(task);
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn run_field_vitals_bulk(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    page_speed: State<'_, PageSpeedState>,
+    request: RunFieldVitalsBulkRequest,
+) -> Result<PageSpeedBulkResult, String> {
+    use tauri::Emitter;
+    run_field_vitals_bulk_with_fetcher(&state, &page_speed, request, fetch_field_vitals, |event| {
+        let _ = app.emit("page-speed-progress", event);
+    })
+    .await
+}
+
+fn field_vitals_snapshot(
+    url: String,
+    form_factor: FieldFormFactor,
+    metrics: FieldVitalsMetrics,
+) -> FieldVitalsSnapshot {
+    FieldVitalsSnapshot {
+        form_factor,
+        requested_url: url,
+        completed_at_ms: now_ms(),
+        has_data: metrics.has_data,
+        lcp_ms_p75: metrics.lcp_ms_p75,
+        cls_p75: metrics.cls_p75,
+        inp_ms_p75: metrics.inp_ms_p75,
+        fcp_ms_p75: metrics.fcp_ms_p75,
+        ttfb_ms_p75: metrics.ttfb_ms_p75,
+        collection_period_start: metrics.collection_period_start,
+        collection_period_end: metrics.collection_period_end,
+    }
+}
+
 /// Fetches Chrome UX Report field data for the selected row and stores the latest snapshot.
 async fn run_field_vitals_with_fetcher<F, Fut>(
     state: &AppState,
@@ -691,19 +892,7 @@ where
     .await
     .map_err(|_| "Field data record worker failed")??;
     let metrics = fetch(url.clone(), request.form_factor).await?;
-    let snapshot = FieldVitalsSnapshot {
-        form_factor: request.form_factor,
-        requested_url: url,
-        completed_at_ms: now_ms(),
-        has_data: metrics.has_data,
-        lcp_ms_p75: metrics.lcp_ms_p75,
-        cls_p75: metrics.cls_p75,
-        inp_ms_p75: metrics.inp_ms_p75,
-        fcp_ms_p75: metrics.fcp_ms_p75,
-        ttfb_ms_p75: metrics.ttfb_ms_p75,
-        collection_period_start: metrics.collection_period_start,
-        collection_period_end: metrics.collection_period_end,
-    };
+    let snapshot = field_vitals_snapshot(url, request.form_factor, metrics);
     let result = tauri::async_runtime::spawn_blocking(move || {
         store
             .try_save_field_vitals(record_id, snapshot.clone())
@@ -725,9 +914,7 @@ async fn fetch_field_vitals(
     })
     .await
     .map_err(|_| "PageSpeed credential worker failed")??
-    .ok_or_else(|| {
-        "Chrome UX Report needs the Google API key saved in Settings > Integrations (with the Chrome UX Report API enabled)".to_string()
-    })?;
+    .ok_or_else(|| FIELD_KEY_REQUIRED.to_string())?;
     let provider = FieldVitalsProvider::new(FieldVitalsConfig {
         api_key,
         form_factor: match form_factor {
@@ -1516,6 +1703,513 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    fn field_bulk_request(ids: Vec<u64>, id: &str) -> RunFieldVitalsBulkRequest {
+        RunFieldVitalsBulkRequest {
+            record_ids: ids,
+            form_factor: FieldFormFactor::Desktop,
+            request_id: id.into(),
+            resume: true,
+        }
+    }
+
+    fn field_snapshot_fixture(url: &str, factor: FieldFormFactor) -> FieldVitalsSnapshot {
+        FieldVitalsSnapshot {
+            form_factor: factor,
+            requested_url: url.into(),
+            completed_at_ms: 1,
+            has_data: false,
+            lcp_ms_p75: None,
+            cls_p75: None,
+            inp_ms_p75: None,
+            fcp_ms_p75: None,
+            ttfb_ms_p75: None,
+            collection_period_start: None,
+            collection_period_end: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn field_bulk_resumes_matching_urls_and_factors_and_saves_exact_occurrences() {
+        for store in [
+            ActiveStore::memory(),
+            ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+        ] {
+            let rows = (0..6)
+                .map(|index| {
+                    let mut row = page();
+                    row.storage_key = format!("list:{index}:{}", row.url);
+                    row.list_position = Some(index + 1);
+                    if index == 3 {
+                        row.status_code = Some(404);
+                    }
+                    if index == 4 {
+                        row.final_url = "https://example.test/no-data".into();
+                    }
+                    store.upsert(row)
+                })
+                .collect::<Vec<_>>();
+            let previous =
+                field_snapshot_fixture("https://example.test/final", FieldFormFactor::Desktop);
+            store
+                .try_save_field_vitals(rows[0].id, previous.clone())
+                .unwrap();
+            store
+                .try_save_field_vitals(
+                    rows[1].id,
+                    field_snapshot_fixture("https://example.test/stale", FieldFormFactor::Desktop),
+                )
+                .unwrap();
+            store
+                .try_save_field_vitals(
+                    rows[2].id,
+                    field_snapshot_fixture("https://example.test/final", FieldFormFactor::Phone),
+                )
+                .unwrap();
+            let state = state(store.clone());
+            let measurement = PageSpeedState::default();
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let observed = attempts.clone();
+            let progress = Arc::new(Mutex::new(Vec::new()));
+            let events = progress.clone();
+            let ids = rows[..5].iter().map(|row| row.id).collect::<Vec<_>>();
+            let result = run_field_vitals_bulk_with_fetcher(
+                &state,
+                &measurement,
+                field_bulk_request(ids.clone(), "field-resume"),
+                move |url, factor| {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((url.clone(), tokio::time::Instant::now()));
+                    async move {
+                        assert_eq!(factor, FieldFormFactor::Desktop);
+                        Ok(if url.ends_with("no-data") {
+                            FieldVitalsMetrics::default()
+                        } else {
+                            FieldVitalsMetrics {
+                                has_data: true,
+                                lcp_ms_p75: Some(0.0),
+                                cls_p75: Some(0.0),
+                                inp_ms_p75: Some(180.0),
+                                fcp_ms_p75: Some(1400.0),
+                                ttfb_ms_p75: Some(0.0),
+                                collection_period_start: Some("2026-08-15".into()),
+                                collection_period_end: Some("2026-09-11".into()),
+                                normalized_url: None,
+                            }
+                        })
+                    }
+                },
+                move |event| events.lock().unwrap().push(event),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (
+                    result.measured,
+                    result.skipped,
+                    result.failed.len(),
+                    result.cancelled
+                ),
+                (3, 1, 1, false)
+            );
+            assert_eq!(result.failed[0].record_id, rows[3].id);
+            {
+                let attempts = attempts.lock().unwrap();
+                assert_eq!(
+                    attempts
+                        .iter()
+                        .map(|(url, _)| url.as_str())
+                        .collect::<Vec<_>>(),
+                    [
+                        "https://example.test/final",
+                        "https://example.test/final",
+                        "https://example.test/no-data"
+                    ]
+                );
+                for pair in attempts.windows(2) {
+                    assert!(
+                        pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(500),
+                        "all requests must be paced"
+                    );
+                }
+            }
+            let saved = store
+                .try_records_by_ids(&rows.iter().map(|row| row.id).collect::<Vec<_>>())
+                .unwrap();
+            assert_eq!(
+                saved[0].field_vitals.as_ref(),
+                Some(&previous),
+                "resume includes completed no-data snapshots"
+            );
+            for row in &saved[1..3] {
+                let snapshot = row.field_vitals.as_ref().unwrap();
+                assert!(snapshot.has_data);
+                assert_eq!(snapshot.form_factor, FieldFormFactor::Desktop);
+                assert_eq!(snapshot.requested_url, "https://example.test/final");
+                assert_eq!(
+                    (
+                        snapshot.lcp_ms_p75,
+                        snapshot.cls_p75,
+                        snapshot.inp_ms_p75,
+                        snapshot.fcp_ms_p75,
+                        snapshot.ttfb_ms_p75
+                    ),
+                    (Some(0.0), Some(0.0), Some(180.0), Some(1400.0), Some(0.0))
+                );
+                assert_eq!(
+                    snapshot.collection_period_start.as_deref(),
+                    Some("2026-08-15")
+                );
+            }
+            assert!(saved[3].field_vitals.is_none());
+            assert!(!saved[4].field_vitals.as_ref().unwrap().has_data);
+            assert!(
+                saved[5].field_vitals.is_none(),
+                "an unselected duplicate occurrence must stay untouched"
+            );
+            {
+                let progress = progress.lock().unwrap();
+                assert_eq!(
+                    progress
+                        .iter()
+                        .map(|event| (
+                            event.record_id,
+                            event.completed,
+                            event.total,
+                            event.request_id.as_str(),
+                            event.error.is_some()
+                        ))
+                        .collect::<Vec<_>>(),
+                    ids.iter()
+                        .enumerate()
+                        .map(|(index, id)| (*id, index + 1, 5, "field-resume", index == 3))
+                        .collect::<Vec<_>>()
+                );
+            }
+            let resumed = run_field_vitals_bulk_with_fetcher(
+                &state,
+                &measurement,
+                field_bulk_request(ids, "field-resumed"),
+                |_, _| async {
+                    panic!("resume must not fetch already completed URL/form-factor pairs")
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (resumed.measured, resumed.skipped, resumed.failed.len()),
+                (0, 4, 1)
+            );
+            assert!(state.crawl_task.try_lock().is_ok());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn field_bulk_retries_only_quota_errors_with_bounded_backoff() {
+        for failures in [
+            vec!["HTTP 429", "HTTP 503"],
+            vec!["HTTP 429"; 4],
+            vec!["HTTP 403"],
+        ] {
+            let store = ActiveStore::memory();
+            let row = store.upsert(page());
+            let previous =
+                field_snapshot_fixture("https://example.test/final", FieldFormFactor::Desktop);
+            store
+                .try_save_field_vitals(row.id, previous.clone())
+                .unwrap();
+            let state = state(store.clone());
+            let measurement = PageSpeedState::default();
+            let attempts = Arc::new(Mutex::new(Vec::new()));
+            let observed = attempts.clone();
+            let responses = failures.clone();
+            let mut request = field_bulk_request(vec![row.id], "field-retry");
+            request.resume = false;
+            let result = run_field_vitals_bulk_with_fetcher(
+                &state,
+                &measurement,
+                request,
+                move |_, _| {
+                    let mut attempts = observed.lock().unwrap();
+                    let attempt = attempts.len();
+                    attempts.push(tokio::time::Instant::now());
+                    let response = responses.get(attempt).copied();
+                    async move {
+                        if let Some(error) = response {
+                            Err(format!("Chrome UX Report returned {error}"))
+                        } else {
+                            Ok(FieldVitalsMetrics::default())
+                        }
+                    }
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+            let attempts = attempts.lock().unwrap();
+            let expected_attempts = if failures.len() == 2 {
+                3
+            } else {
+                failures.len()
+            };
+            assert_eq!(attempts.len(), expected_attempts);
+            for (index, pair) in attempts.windows(2).enumerate() {
+                assert_eq!(
+                    pair[1].duration_since(pair[0]),
+                    Duration::from_secs([2, 8, 30][index])
+                );
+            }
+            assert_eq!(result.measured, usize::from(failures.len() == 2));
+            assert_eq!(result.failed.len(), usize::from(failures.len() != 2));
+            if !result.failed.is_empty() {
+                assert_eq!(
+                    store.try_records_by_ids(&[row.id]).unwrap()[0]
+                        .field_vitals
+                        .as_ref(),
+                    Some(&previous)
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn field_bulk_cancel_interrupts_fetch_pacing_backoff_and_shutdown() {
+        for phase in ["fetch", "pacing", "backoff", "shutdown"] {
+            let store = ActiveStore::memory();
+            let first = store.upsert(page());
+            let mut second = page();
+            second.storage_key = "second-occurrence".into();
+            let second = store.upsert(second);
+            let state = Arc::new(state(store.clone()));
+            let measurement = Arc::new(PageSpeedState::default());
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let worker_state = state.clone();
+            let worker_measurement = measurement.clone();
+            let notify_fetch = ready.clone();
+            let notify_progress = ready.clone();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let fetch_dropped = dropped.clone();
+            let run = tokio::spawn(async move {
+                run_field_vitals_bulk_with_fetcher(
+                    &worker_state,
+                    &worker_measurement,
+                    field_bulk_request(vec![first.id, second.id], "field-cancel"),
+                    move |_, _| {
+                        let notify = notify_fetch.clone();
+                        let dropped = fetch_dropped.clone();
+                        async move {
+                            let _dropped = Dropped(dropped);
+                            if phase != "pacing" {
+                                notify.notify_one();
+                            }
+                            match phase {
+                                "pacing" => Ok(FieldVitalsMetrics::default()),
+                                "backoff" => Err("Chrome UX Report returned HTTP 429".into()),
+                                _ => std::future::pending().await,
+                            }
+                        }
+                    },
+                    move |_| {
+                        if phase == "pacing" {
+                            notify_progress.notify_one();
+                        }
+                    },
+                )
+                .await
+            });
+            ready.notified().await;
+            assert!(state.crawl_task.try_lock().is_err());
+            assert!(state.store.try_lock().is_ok());
+            assert!(!measurement.cancel("unrelated-request").unwrap());
+            let shutdown = if phase == "shutdown" {
+                Some(measurement.begin_shutdown().unwrap())
+            } else {
+                assert!(measurement.cancel("field-cancel").unwrap());
+                None
+            };
+            let result = tokio::time::timeout(Duration::from_millis(100), run)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(result.cancelled, "{phase}");
+            assert_eq!(result.measured, usize::from(phase == "pacing"));
+            assert!(
+                dropped.load(Ordering::SeqCst),
+                "the provider future must be dropped"
+            );
+            assert!(
+                store.try_records_by_ids(&[second.id]).unwrap()[0]
+                    .field_vitals
+                    .is_none()
+            );
+            assert!(state.crawl_task.try_lock().is_ok());
+            drop(shutdown);
+            assert!(measurement.begin("after-field-cancel").is_ok());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn field_bulk_missing_credentials_fail_once_and_release_lifecycle() {
+        for message in [
+            "Chrome UX Report needs the Google API key saved in Settings > Integrations (with the Chrome UX Report API enabled)",
+            KEYRING_UNAVAILABLE,
+        ] {
+            let store = ActiveStore::memory();
+            let ids = (0..500)
+                .map(|index| {
+                    let mut row = page();
+                    row.storage_key = format!("credential-fixture:{index}");
+                    store.upsert(row).id
+                })
+                .collect();
+            let state = state(store.clone());
+            let measurement = PageSpeedState::default();
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let error = run_field_vitals_bulk_with_fetcher(
+                &state,
+                &measurement,
+                field_bulk_request(ids, "missing-field-credentials"),
+                |_, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        state.crawl_task.try_lock().is_err(),
+                        "credential lookup must keep the selected session pinned"
+                    );
+                    async { Err(message.to_string()) }
+                },
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error, message);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "do not traverse 500 rows after a local credential failure"
+            );
+            assert!(store.records().iter().all(|row| row.field_vitals.is_none()));
+            assert!(state.crawl_task.try_lock().is_ok());
+            assert!(measurement.begin("after-credential-error").is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn field_bulk_cancellation_before_save_preserves_previous_snapshot() {
+        let store = ActiveStore::memory();
+        let row = store.upsert(page());
+        let previous =
+            field_snapshot_fixture("https://example.test/previous", FieldFormFactor::Phone);
+        store
+            .try_save_field_vitals(row.id, previous.clone())
+            .unwrap();
+        let state = state(store.clone());
+        let measurement = PageSpeedState::default();
+        let result = run_field_vitals_bulk_with_fetcher(
+            &state,
+            &measurement,
+            field_bulk_request(vec![row.id], "field-save-cancel"),
+            |_, _| async {
+                measurement.cancel("field-save-cancel").unwrap();
+                Ok(FieldVitalsMetrics::default())
+            },
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(result.cancelled);
+        assert_eq!(result.measured, 0);
+        assert_eq!(
+            store.try_records_by_ids(&[row.id]).unwrap()[0]
+                .field_vitals
+                .as_ref(),
+            Some(&previous)
+        );
+    }
+
+    #[tokio::test]
+    async fn field_bulk_rejects_invalid_selection_and_busy_or_closing_lifecycle_before_fetch() {
+        let store = ActiveStore::memory();
+        let row = store.upsert(page());
+        let state = state(store);
+        let measurement = PageSpeedState::default();
+        for ids in [
+            vec![],
+            vec![row.id; 501],
+            vec![row.id, row.id],
+            vec![0],
+            vec![9_007_199_254_740_992],
+            vec![row.id + 99],
+        ] {
+            assert!(
+                run_field_vitals_bulk_with_fetcher(
+                    &state,
+                    &measurement,
+                    field_bulk_request(ids, "field-invalid"),
+                    |_, _| async { panic!("invalid IDs reached provider") },
+                    |_| {}
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert!(!measurement.cancel("field-pre-cancel").unwrap());
+        let error = run_field_vitals_bulk_with_fetcher(
+            &state,
+            &measurement,
+            field_bulk_request(vec![row.id], "field-pre-cancel"),
+            |_, _| async { panic!("pre-cancel reached provider") },
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, CANCELLED);
+        let busy = state.crawl_task.lock().await;
+        assert!(
+            run_field_vitals_bulk_with_fetcher(
+                &state,
+                &measurement,
+                field_bulk_request(vec![row.id], "field-busy"),
+                |_, _| async { panic!("busy workspace reached provider") },
+                |_| {}
+            )
+            .await
+            .unwrap_err()
+            .contains("busy")
+        );
+        drop(busy);
+        let crawl = tauri::async_runtime::spawn(std::future::pending());
+        *state.crawl_task.lock().await = Some(crawl);
+        assert!(
+            run_field_vitals_bulk_with_fetcher(
+                &state,
+                &measurement,
+                field_bulk_request(vec![row.id], "field-running"),
+                |_, _| async { panic!("running crawl reached provider") },
+                |_| {}
+            )
+            .await
+            .unwrap_err()
+            .contains("active crawl")
+        );
+        state.crawl_task.lock().await.take().unwrap().abort();
+        state.exit_confirmed.store(true, Ordering::SeqCst);
+        assert!(
+            run_field_vitals_bulk_with_fetcher(
+                &state,
+                &measurement,
+                field_bulk_request(vec![row.id], "field-closing"),
+                |_, _| async { panic!("closing application reached provider") },
+                |_| {}
+            )
+            .await
+            .unwrap_err()
+            .contains("closing")
         );
     }
 }

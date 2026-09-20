@@ -78,8 +78,120 @@ fn page(path: &str, title: &str, description: &str) -> CrawlRecord {
 }
 
 #[test]
-fn raw_exports_preserve_ordered_pagination_targets_and_unknown_cells() {
+fn field_vitals_exports_preserve_metrics_attribution_and_no_data_status() {
+    use ferrous_frog_storage::{FieldFormFactor, FieldVitalsSnapshot};
+    let mut measured = page("measured", "Measured", "Description");
+    measured.field_vitals = Some(FieldVitalsSnapshot {
+        form_factor: FieldFormFactor::Desktop,
+        requested_url: "https://example.test/query?x=1&y=2".into(),
+        completed_at_ms: 1788940800000,
+        has_data: true,
+        lcp_ms_p75: Some(2100.0),
+        inp_ms_p75: Some(180.0),
+        cls_p75: Some(0.0),
+        fcp_ms_p75: Some(1400.0),
+        ttfb_ms_p75: Some(0.0),
+        collection_period_start: Some("2026-08-15".into()),
+        collection_period_end: Some("2026-09-11".into()),
+    });
+    let mut no_data = page("no-data", "No data", "Description");
+    no_data.field_vitals = measured.field_vitals.clone();
+    no_data.field_vitals.as_mut().unwrap().has_data = false;
+    let mut partial = measured.clone();
+    partial.url = "https://example.test/partial".into();
+    partial.storage_key = partial.url.clone();
+    partial.field_vitals.as_mut().unwrap().fcp_ms_p75 = None;
+    partial.field_vitals.as_mut().unwrap().ttfb_ms_p75 = None;
+    let store = MemoryStore::new();
+    for record in [
+        measured,
+        no_data,
+        page("unmeasured", "Unmeasured", "Description"),
+        partial,
+    ] {
+        store.upsert(record);
+    }
+    let records = store.records();
+    let csv = records_to_csv_string(&records).unwrap();
+    let mut streamed_csv = Vec::new();
+    store_records_to_csv(&store, &mut streamed_csv).unwrap();
+    assert_eq!(streamed_csv, csv.as_bytes());
+    let xlsx = inspect_workbook(&records_to_xlsx_bytes(&records).unwrap());
+    let mut streamed_xlsx = Vec::new();
+    store_records_to_xlsx_writer(&store, &mut streamed_xlsx).unwrap();
+    assert_eq!(inspect_workbook(&streamed_xlsx), xlsx);
+    let mut filtered_xlsx = Vec::new();
+    query_to_xlsx_writer(
+        GridQuery::default(),
+        |mut query| {
+            query.limit = query.limit.min(1);
+            Ok(store.query(query))
+        },
+        &mut filtered_xlsx,
+    )
+    .unwrap();
+    assert_eq!(inspect_workbook(&filtered_xlsx), xlsx);
+    let mut reader = csv::Reader::from_reader(csv.as_bytes());
+    let headers = reader.headers().unwrap().clone();
+    assert_eq!(
+        &headers[113], "amphtml_targets",
+        "existing positions must remain stable"
+    );
+    let rows = reader.records().collect::<Result<Vec<_>, _>>().unwrap();
+    for (name, expected) in [
+        ("field_form_factor", ["desktop", "desktop", "", "desktop"]),
+        ("field_has_data", ["true", "false", "", "true"]),
+        ("field_lcp_ms_p75", ["2100", "", "", "2100"]),
+        ("field_inp_ms_p75", ["180", "", "", "180"]),
+        ("field_cls_p75", ["0", "", "", "0"]),
+        ("field_fcp_ms_p75", ["1400", "", "", ""]),
+        ("field_ttfb_ms_p75", ["0", "", "", ""]),
+        (
+            "field_requested_url",
+            [
+                "https://example.test/query?x=1&y=2",
+                "https://example.test/query?x=1&y=2",
+                "",
+                "https://example.test/query?x=1&y=2",
+            ],
+        ),
+        (
+            "field_completed_at_ms",
+            ["1788940800000", "1788940800000", "", "1788940800000"],
+        ),
+        (
+            "field_collection_period_start",
+            ["2026-08-15", "2026-08-15", "", "2026-08-15"],
+        ),
+        (
+            "field_collection_period_end",
+            ["2026-09-11", "2026-09-11", "", "2026-09-11"],
+        ),
+    ] {
+        let column = headers
+            .iter()
+            .position(|header| header == name)
+            .expect(name);
+        assert_eq!(xlsx[0].1[0][column], name);
+        for (index, value) in expected.into_iter().enumerate() {
+            assert_eq!(&rows[index][column], value, "CSV {name}, row {index}");
+            assert_eq!(
+                xlsx[0].1[index + 1]
+                    .get(column)
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                value,
+                "XLSX {name}, row {index}"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_exports_preserve_ordered_declaration_targets_and_unknown_cells() {
     let mut measured = page("measured", "Measured page", "Measured description");
+    measured.amp_document = Some(true);
+    measured.html_doctype = Some(true);
     measured.rel_next_targets = Some(vec![
         "https://example.test/first".into(),
         "https://example.test/second".into(),
@@ -87,7 +199,16 @@ fn raw_exports_preserve_ordered_pagination_targets_and_unknown_cells() {
     ]);
     measured.rel_prev_targets = Some(vec![]);
     let legacy = page("legacy", "Legacy page", "Legacy description");
-    let records = [measured, legacy];
+    measured.amphtml_targets = Some(vec![
+        "https://example.test/amp-first".into(),
+        "https://example.test/amp-second".into(),
+        "https://example.test/amp-first".into(),
+    ]);
+    let mut absent = page("absent", "Absent", "Absent description");
+    absent.amp_document = Some(false);
+    absent.html_doctype = Some(false);
+    absent.amphtml_targets = Some(vec![]);
+    let records = [measured, legacy, absent];
     let csv = records_to_csv_string(&records).unwrap();
     let mut reader = csv::Reader::from_reader(csv.as_bytes());
     let headers = reader.headers().unwrap().clone();
@@ -99,8 +220,23 @@ fn raw_exports_preserve_ordered_pagination_targets_and_unknown_cells() {
             "[\"https://example.test/first\",\"https://example.test/second\",\"https://example.test/first\"]",
         ),
         ("rel_prev_targets", "[]"),
+        ("amp_document", "true"),
+        ("html_doctype", "true"),
+        (
+            "amphtml_targets",
+            "[\"https://example.test/amp-first\",\"https://example.test/amp-second\",\"https://example.test/amp-first\"]",
+        ),
     ] {
         let column = headers.iter().position(|header| header == name).unwrap();
+        assert_eq!(xlsx[0].1[0][column], name);
+        if name == "amphtml_targets" {
+            assert_eq!(&rows[2][column], "[]");
+            assert_eq!(xlsx[0].1[3][column], "[]");
+        }
+        if matches!(name, "amp_document" | "html_doctype") {
+            assert_eq!(&rows[2][column], "false");
+            assert_eq!(xlsx[0].1[3][column], "false");
+        }
         assert_eq!(&rows[0][column], expected);
         assert_eq!(xlsx[0].1[1][column], expected);
         assert_eq!(&rows[1][column], "");
@@ -414,7 +550,11 @@ fn audit_workbook_contains_complete_crawl_and_typed_issue_tabs() {
             "canonical",
             "canonical_count",
             "indexability",
-            "indexability_status"
+            "indexability_status",
+            "rel_next",
+            "rel_prev",
+            "rel_next_targets",
+            "rel_prev_targets"
         ]
     );
     for (sheet, expected) in [
@@ -737,7 +877,7 @@ fn filtered_xlsx_stream_matches_legacy_columns_and_preserves_filters_and_order()
         assert_eq!(sheets.len(), 1);
         assert_eq!(sheets[0].0, "Crawl Results");
         let rows = &sheets[0].1;
-        assert_eq!(rows[0].len(), 113);
+        assert_eq!(rows[0].len(), 123);
         assert_eq!(
             &rows[0][89..93],
             [
@@ -750,7 +890,10 @@ fn filtered_xlsx_stream_matches_legacy_columns_and_preserves_filters_and_order()
         assert_eq!(rows[0][103], "field_cls_p75");
         assert_eq!(rows[0][107], "analytics_revenue");
         assert_eq!(rows[0][110], "backlink_authority");
-        assert_eq!(&rows[0][111..113], ["rel_next_targets", "rel_prev_targets"]);
+        assert_eq!(
+            &rows[0][111..114],
+            ["rel_next_targets", "rel_prev_targets", "amphtml_targets"]
+        );
         assert_eq!(
             &rows[0][..5],
             ["id", "url", "final_url", "classification", "status_code"]
@@ -902,4 +1045,315 @@ fn filtered_xlsx_keeps_advanced_groups_across_pages_and_rejects_invalid_rules_be
     );
     assert!(!fetched);
     assert!(bytes.is_empty());
+}
+
+#[test]
+fn basic_file_exports_match_snapshots_for_empty_and_list_crawls() {
+    use ferrous_frog_storage::ActiveStore;
+    let directory = std::env::temp_dir().join(format!(
+        "ferrous-basic-export-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let kinds = [
+        ExportKind::Csv,
+        ExportKind::Xlsx,
+        ExportKind::Sitemap,
+        ExportKind::RedirectsCsv,
+    ];
+    for store in [
+        ActiveStore::memory(),
+        ActiveStore::Sqlite(SqliteStore::in_memory().unwrap()),
+    ] {
+        for populated in [false, true] {
+            if populated {
+                for (index, position) in [40, 1, 7, 3].into_iter().enumerate() {
+                    let mut record = page(
+                        "repeated?x=1&y=<test>",
+                        "Quote, \"résumé\"\n🐸",
+                        "Description",
+                    );
+                    record.storage_key = format!("list:{position}:{}", record.url);
+                    record.list_position = Some(position);
+                    record.list_duplicate_index = index as u32;
+                    record.amphtml_targets = Some(vec!["https://example.test/amp".into(); 2]);
+                    if index == 2 {
+                        record.status_code = Some(404);
+                    }
+                    if index == 3 {
+                        record.indexability = "Non-Indexable".into();
+                    }
+                    record.redirect_chain.push(RedirectHop {
+                        url: format!("https://example.test/old-{position}"),
+                        status_code: 301,
+                        location: Some(record.final_url.clone()),
+                        dns_lookup_time_ms: Some(2),
+                        tcp_connect_time_ms: Some(3),
+                        tls_handshake_time_ms: None,
+                        ttfb_ms: Some(5),
+                        elapsed_ms: Some(8),
+                    });
+                    store.upsert(record);
+                }
+                store.add_link_edge(LinkEdge {
+                    id: 0,
+                    source_url: "https://example.test/source".into(),
+                    target_url: "https://example.test/repeated?x=1&y=<test>".into(),
+                    anchor_text: "First discovery, 🐸".into(),
+                    rel: String::new(),
+                    rel_nofollow: false,
+                    link_type: LinkType::Internal,
+                    source_status_code: Some(200),
+                    target_status_code: Some(200),
+                    source_depth: 0,
+                    target_depth: Some(1),
+                    source_position: 9,
+                    discovery_order: 0,
+                });
+            }
+            let records = store.records();
+            if populated {
+                assert_eq!(
+                    records
+                        .iter()
+                        .map(|record| record.list_position.unwrap())
+                        .collect::<Vec<_>>(),
+                    if matches!(&store, ActiveStore::Memory(_)) {
+                        [40, 1, 7, 3]
+                    } else {
+                        [1, 3, 7, 40]
+                    }
+                );
+            }
+            let files = write_export_files(&store, &AuditThresholds::default(), &kinds, &directory)
+                .unwrap();
+            assert_eq!(
+                files,
+                kinds
+                    .iter()
+                    .map(|kind| directory.join(kind.file_name()))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.join("crawl.csv")).unwrap(),
+                records_to_csv_string(&records).unwrap()
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.join("redirects.csv")).unwrap(),
+                redirect_chains_to_csv_string(&records).unwrap()
+            );
+            let sitemap = std::fs::read_to_string(directory.join("sitemap.xml")).unwrap();
+            assert_eq!(sitemap, records_to_sitemap_xml(&records));
+            assert_eq!(
+                sitemap.matches("<loc>").count(),
+                if populated { 2 } else { 0 }
+            );
+            if populated {
+                assert!(sitemap.contains("?x=1&amp;y=&lt;test&gt;"));
+            }
+            assert_eq!(
+                inspect_workbook(&std::fs::read(directory.join("crawl.xlsx")).unwrap()),
+                inspect_workbook(&records_to_xlsx_bytes(&records).unwrap())
+            );
+        }
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn basic_stream_writers_propagate_output_failures() {
+    let store = MemoryStore::new();
+    let mut record = page("one", "One", "Description");
+    record.redirect_chain.push(RedirectHop {
+        url: "https://example.test/old".into(),
+        status_code: 301,
+        location: Some(record.final_url.clone()),
+        dns_lookup_time_ms: None,
+        tcp_connect_time_ms: None,
+        tls_handshake_time_ms: None,
+        ttfb_ms: None,
+        elapsed_ms: None,
+    });
+    store.upsert(record);
+    let mut buffer = [0_u8; 10];
+    assert!(store_records_to_csv(&store, buffer.as_mut_slice()).is_err());
+    assert!(store_redirect_chains_to_csv(&store, buffer.as_mut_slice()).is_err());
+    assert!(store_records_to_sitemap_writer(&store, buffer.as_mut_slice()).is_err());
+    assert!(store_records_to_xlsx_writer(&store, buffer.as_mut_slice()).is_err());
+
+    let mut record = store.records().remove(0);
+    record.amphtml_targets = Some(vec!["x".repeat(32_768)]);
+    store.upsert(record);
+    let mut output = Vec::new();
+    let error = store_records_to_xlsx_writer(&store, &mut output).unwrap_err();
+    assert!(error.contains("XLSX row 1"), "{error}");
+    assert!(
+        output.is_empty(),
+        "An oversized cell must fail before saving the workbook"
+    );
+}
+
+#[derive(Clone, Default)]
+struct ExportCursorTestStore {
+    changing: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+// These exports need only the fallible record cursor. Any snapshot would hide its read failure.
+macro_rules! unused_export_store_methods {
+    ($(fn $name:ident(&self $(, $arg:ident: $ty:ty)*) $(-> $ret:ty)?;)*) => {
+        $(fn $name(&self $(, $arg: $ty)*) $(-> $ret)? {
+            $(let _ = $arg;)*
+            panic!("unexpected store operation: {}", stringify!($name))
+        })*
+    };
+}
+
+impl CrawlStore for ExportCursorTestStore {
+    unused_export_store_methods! {
+        fn clear(&self);
+        fn upsert(&self, record: CrawlRecord) -> CrawlRecord;
+        fn add_inlink(&self, target_url: &str);
+        fn mark_sitemap_urls(&self, urls: &[String]);
+        fn add_link_edge(&self, edge: LinkEdge) -> LinkEdge;
+        fn add_image_assets(&self, page_url: &str, images: Vec<ferrous_frog_storage::ImageAsset>);
+        fn add_page_references(&self, source_storage_key: &str, references: Vec<ferrous_frog_storage::PageReference>);
+        fn replace_page_capture(&self, source_storage_key: &str, capture: Option<ferrous_frog_storage::PageCapture>);
+        fn merge_search_console_metrics(&self, metrics: Vec<ferrous_frog_storage::SearchConsoleMetricRow>) -> usize;
+        fn merge_analytics_metrics(&self, metrics: Vec<ferrous_frog_storage::AnalyticsMetricRow>) -> usize;
+        fn merge_backlink_metrics(&self, metrics: Vec<ferrous_frog_storage::BacklinkMetricRow>) -> usize;
+        fn records(&self) -> Vec<CrawlRecord>;
+        fn query(&self, query: GridQuery) -> GridResponse;
+        fn link_edges(&self, query: LinkEdgeQuery) -> ferrous_frog_storage::LinkEdgeResponse;
+        fn image_assets(&self, query: ferrous_frog_storage::ImageAssetQuery) -> ferrous_frog_storage::ImageAssetResponse;
+        fn page_references(&self, query: ferrous_frog_storage::PageReferenceQuery) -> ferrous_frog_storage::PageReferenceResponse;
+        fn page_captures(&self, query: ferrous_frog_storage::PageCaptureQuery) -> ferrous_frog_storage::PageCaptureResponse;
+        fn anchor_texts(&self, query: LinkEdgeQuery) -> ferrous_frog_storage::AnchorTextResponse;
+        fn save_frontier_state(&self, state: ferrous_frog_storage::CrawlFrontierState);
+        fn load_frontier_state(&self) -> Option<ferrous_frog_storage::CrawlFrontierState>;
+        fn clear_frontier_state(&self);
+    }
+
+    fn try_visit_records(
+        &self,
+        visitor: &mut dyn FnMut(CrawlRecord) -> std::io::Result<()>,
+    ) -> Result<usize, ferrous_frog_storage::StorageError> {
+        if let Some(pass) = &self.changing {
+            let changed = pass.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0;
+            visitor(page(
+                "one",
+                if changed { "Changed" } else { "Original" },
+                "Description",
+            ))?;
+            return Ok(1);
+        }
+        visitor(page("one", "One", "Description"))?;
+        Err(std::io::Error::other("record cursor read failed").into())
+    }
+}
+
+#[test]
+fn basic_file_exports_propagate_cursor_failures_without_snapshotting() {
+    let directory =
+        std::env::temp_dir().join(format!("ferrous-export-failure-{}", std::process::id()));
+    for kind in [
+        ExportKind::HtmlReport,
+        ExportKind::Csv,
+        ExportKind::Xlsx,
+        ExportKind::Sitemap,
+        ExportKind::RedirectsCsv,
+    ] {
+        let error = write_export_files(
+            &ExportCursorTestStore::default(),
+            &AuditThresholds::default(),
+            &[kind],
+            &directory,
+        )
+        .unwrap_err();
+        assert!(error.contains("record cursor read failed"), "{error}");
+        assert!(error.contains(kind.file_name()), "{error}");
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn html_stream_rejects_same_count_record_changes_before_writing() {
+    let store = ExportCursorTestStore {
+        changing: Some(Default::default()),
+    };
+    let mut output = Vec::new();
+    let error =
+        store_to_html_report_writer(&store, &AuditThresholds::default(), &mut output).unwrap_err();
+    assert!(error.contains("crawl changed"), "{error}");
+    assert!(
+        output.is_empty(),
+        "changed records must not publish an inconsistent report"
+    );
+}
+
+#[test]
+fn file_export_read_failures_preserve_previous_files_and_remove_temporary_output() {
+    let directory =
+        std::env::temp_dir().join(format!("ferrous-export-atomic-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    for kind in [
+        ExportKind::Csv,
+        ExportKind::Xlsx,
+        ExportKind::Sitemap,
+        ExportKind::RedirectsCsv,
+        ExportKind::HtmlReport,
+    ] {
+        let path = directory.join(kind.file_name());
+        std::fs::write(&path, "previous successful export").unwrap();
+        let error = write_export_files(
+            &ExportCursorTestStore::default(),
+            &AuditThresholds::default(),
+            &[kind],
+            &directory,
+        )
+        .unwrap_err();
+        assert!(error.contains("record cursor read failed"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "previous successful export"
+        );
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn audit_workbook_pagination_canonical_advisory_retains_declared_evidence() {
+    let store = MemoryStore::new();
+    let mut source = page("page-2", "Second page", "Second description");
+    source.canonical = Some("https://example.test/page-1".into());
+    source.rel_prev_targets = Some(vec![
+        "https://example.test/other".into(),
+        "https://example.test/page-1".into(),
+    ]);
+    store.upsert(source);
+    store.upsert(page("page-1", "First page", "First description"));
+    let mut bytes = Vec::new();
+    audit_workbook_to_writer(|query| Ok(store.query(query)), &mut bytes).unwrap();
+    let sheets = inspect_workbook(&bytes);
+    let canonical = &sheets
+        .iter()
+        .find(|(name, _)| name == "Canonicals")
+        .unwrap()
+        .1;
+    assert_eq!(canonical.len(), 2);
+    for (name, expected) in [
+        ("issue", "Pagination canonical to linked page"),
+        ("canonical", "https://example.test/page-1"),
+        (
+            "rel_prev_targets",
+            "[\"https://example.test/other\",\"https://example.test/page-1\"]",
+        ),
+    ] {
+        let column = canonical[0].iter().position(|value| value == name).unwrap();
+        assert_eq!(canonical[1][column], expected);
+    }
 }

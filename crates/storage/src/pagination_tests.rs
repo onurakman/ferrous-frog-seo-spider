@@ -1459,6 +1459,7 @@ fn pagination_summary_fields_default_for_older_saved_summaries() {
         PREV_LOOP,
         NEXT_NON_RECIPROCAL,
         PREV_NON_RECIPROCAL,
+        "paginationCanonicalToLinkedPage",
     ] {
         value.as_object_mut().unwrap().remove(name);
     }
@@ -1471,6 +1472,7 @@ fn pagination_summary_fields_default_for_older_saved_summaries() {
     assert_eq!(value[NEXT_NON_RECIPROCAL], 0);
     assert_eq!(value[PREV_NON_RECIPROCAL], 0);
     assert_eq!(value[MULTIPLE_TARGETS], 0);
+    assert_eq!(value["paginationCanonicalToLinkedPage"], 0);
 }
 
 #[test]
@@ -1609,6 +1611,208 @@ fn pagination_cache_observes_external_target_and_source_edits_and_reopen() {
         .execute("DELETE FROM crawl_records WHERE url = ?1", [url("target")])
         .unwrap();
     assert_eq!(store.try_summary().unwrap().pagination_prev_to_error, 0);
+    drop(store);
+    drop(writer);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn pagination_canonical_to_linked_page_requires_observed_distinct_targets_with_store_parity() {
+    const VIEW: &str = "paginationCanonicalToLinkedPage";
+    let canonical = |path: &str, next: Option<&str>, prev: Option<&str>, target: &str| {
+        let mut row = source(path, next, prev);
+        row.canonical = Some(url(target));
+        row
+    };
+    let mut later = canonical("later", Some("other"), None, "target#canonical");
+    later.rel_next_targets = Some(vec![url("other"), url("target#next"), url("target")]);
+    let mut empty = canonical("empty", Some("target"), None, "target");
+    empty.rel_next_targets = Some(vec![]);
+    let mut incomplete = canonical("incomplete-source", None, Some("target"), "target");
+    incomplete.indexability_status = "Response body incomplete".into();
+    let mut incomplete_target = page("incomplete-target");
+    incomplete_target.indexability_status = "Response body incomplete".into();
+    let mut non_html = page("non-html");
+    non_html.content_type = Some("application/pdf".into());
+    let mut blocked = CrawlRecord::pending(url("blocked"), 0);
+    blocked.status_text = "Blocked by robots.txt".into();
+    let mut malformed = canonical("malformed", Some("target"), None, "target");
+    malformed.canonical = Some("mailto:target@example.test".into());
+    let mut self_alias = redirect(
+        canonical("self-alias", Some("self-route"), None, "self-route"),
+        "self-final",
+        &["self-alias"],
+    );
+    self_alias.rel_next_targets = Some(vec![url("self-route")]);
+    let mut failed_source = canonical("source-error", Some("target"), None, "target");
+    failed_source.status_code = Some(404);
+    let mut non_html_source = canonical("source-pdf", Some("target"), None, "target");
+    non_html_source.content_type = Some("application/pdf".into());
+    let mut pending_source = canonical("source-pending", Some("target"), None, "target");
+    pending_source.status_code = None;
+    let rows = vec![
+        failed_source,
+        non_html_source,
+        pending_source,
+        later,
+        empty,
+        incomplete,
+        incomplete_target,
+        non_html,
+        blocked,
+        malformed,
+        self_alias,
+        page("target"),
+        page("other"),
+        redirect(page("alias"), "target", &["alias"]),
+        redirect(page("self-route"), "self-final", &["self-route"]),
+        canonical("previous", None, Some("target"), "target"),
+        canonical("canonical-alias", Some("target"), None, "alias"),
+        canonical("relation-alias", Some("alias"), None, "target"),
+        canonical("self", Some("target"), None, "self"),
+        canonical("unlinked", Some("target"), None, "other"),
+        canonical("unknown", Some("missing"), None, "missing"),
+        canonical("pending-source", Some("pending"), None, "pending"),
+        CrawlRecord::pending(url("pending"), 0),
+        canonical("blocked-source", Some("blocked"), None, "blocked"),
+        canonical("non-html-source", Some("non-html"), None, "non-html"),
+        canonical(
+            "incomplete-target-source",
+            Some("incomplete-target"),
+            None,
+            "incomplete-target",
+        ),
+        canonical("failed-source", Some("failed"), None, "failed"),
+        failed("failed", Some(404)),
+        occurrence(canonical("list", Some("target"), None, "target"), 1),
+        occurrence(canonical("list", Some("target"), None, "list"), 2),
+        occurrence(canonical("list", Some("target"), None, "target"), 3),
+    ];
+    let memory = MemoryStore::new();
+    let sqlite = SqliteStore::in_memory().unwrap();
+    for row in rows {
+        memory.upsert(row.clone());
+        sqlite.try_upsert(row).unwrap();
+    }
+    let expected = [
+        "canonical-alias",
+        "later",
+        "list",
+        "list",
+        "previous",
+        "relation-alias",
+    ]
+    .map(url);
+    let left = memory.query(query(VIEW));
+    let right = sqlite.try_query(query(VIEW)).unwrap();
+    assert_eq!(
+        left.rows.iter().map(|row| &row.url).collect::<Vec<_>>(),
+        expected.iter().collect::<Vec<_>>()
+    );
+    assert_eq!(keys(&left), keys(&right));
+    assert_eq!(left.total, 6);
+    assert_eq!(right.total, 6);
+    assert_eq!(serde_json::to_value(&left.summary).unwrap()[VIEW], 6);
+    assert_eq!(serde_json::to_value(&right.summary).unwrap()[VIEW], 6);
+    for offset in 0..6 {
+        let page = GridQuery {
+            offset,
+            limit: 1,
+            ..query(VIEW)
+        };
+        let left = memory.query(page.clone());
+        let right = sqlite.try_query(page).unwrap();
+        assert_eq!(keys(&left), keys(&right));
+        assert_eq!(left.rows.len(), 1);
+        assert_eq!(right.total, 6);
+    }
+    let updated = canonical("previous", None, Some("target"), "previous");
+    memory.upsert(updated.clone());
+    sqlite.try_upsert(updated).unwrap();
+    assert_eq!(memory.query(query(VIEW)).total, 5);
+    assert_eq!(sqlite.try_query(query(VIEW)).unwrap().total, 5);
+}
+
+#[test]
+fn pagination_canonical_to_linked_page_cache_is_bounded_and_observes_external_changes() {
+    const VIEW: &str = "paginationCanonicalToLinkedPage";
+    let path = std::env::temp_dir().join(format!(
+        "ferrous-frog-pagination-canonical-{}-{}.sqlite3",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = SqliteStore::open(&path).unwrap();
+    let writer = SqliteStore::open(&path).unwrap();
+    let mut row = source("a", Some("b"), None);
+    row.canonical = Some(url("b"));
+    store.try_upsert(row).unwrap();
+    store.try_upsert(page("b")).unwrap();
+    writer
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE crawl_records SET response_time_ms = 'invalid off-page payload' WHERE url = ?1",
+            [url("b")],
+        )
+        .unwrap();
+    URL_ALIAS_EXPANSIONS.with(|count| count.set(0));
+    assert_eq!(
+        serde_json::to_value(store.try_progress_summary().unwrap()).unwrap()[VIEW],
+        0
+    );
+    assert_eq!(URL_ALIAS_EXPANSIONS.with(|count| count.get()), 0);
+    assert!(store.try_records().is_err());
+    let response = store
+        .try_query(GridQuery {
+            limit: 1,
+            ..query(VIEW)
+        })
+        .unwrap();
+    assert_eq!(response.total, 1);
+    assert_eq!(response.rows[0].url, url("a"));
+    URL_ALIAS_EXPANSIONS.with(|count| count.set(0));
+    assert_eq!(
+        serde_json::to_value(store.try_summary().unwrap()).unwrap()[VIEW],
+        1
+    );
+    assert_eq!(URL_ALIAS_EXPANSIONS.with(|count| count.get()), 0);
+    writer
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE crawl_records SET canonical = url WHERE url = ?1",
+            [url("a")],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .try_query(GridQuery {
+                limit: 0,
+                ..query(VIEW)
+            })
+            .unwrap()
+            .total,
+        0
+    );
+    assert!(URL_ALIAS_EXPANSIONS.with(|count| count.get()) > 0);
+    writer
+        .connection()
+        .unwrap()
+        .execute(
+            "UPDATE crawl_records SET canonical = ?1 WHERE url = ?2",
+            [url("b"), url("a")],
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(store.try_summary().unwrap()).unwrap()[VIEW],
+        1
+    );
+    drop(store);
+    let store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.try_query(query(VIEW)).unwrap().total, 1);
     drop(store);
     drop(writer);
     std::fs::remove_file(path).unwrap();

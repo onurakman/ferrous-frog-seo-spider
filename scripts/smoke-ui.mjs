@@ -21,9 +21,9 @@ function setupFixture(mockIPC, emit) {
     metaDuplicate metaMultiple h1Missing h1Duplicate h2Missing h2Duplicate canonicalMissing canonicalMultiple noindex
     canonicalUncrawled canonicalToRedirect canonicalToError canonicalNonIndexable canonicalChain canonicalLoop
     paginationNextToError paginationPrevToError paginationNextLoop paginationPrevLoop
-    paginationNextNonReciprocal paginationPrevNonReciprocal paginationMultipleTargets ampToError ampNonReciprocal
+    paginationNextNonReciprocal paginationPrevNonReciprocal paginationCanonicalToLinkedPage paginationMultipleTargets ampToError ampNonReciprocal ampMultipleTargets ampTargetMissingMarker
     imagesMissingAlt imagesAltTooLong mixedContent insecureForms hreflangInvalid structuredDataInvalid
-    structuredDataWarnings deprecatedHtmlTags duplicateIds renderedDomChanged missingViewport missingHsts
+    structuredDataWarnings deprecatedHtmlTags missingHtmlDoctype duplicateIds renderedDomChanged missingViewport missingHsts
     sitemapOrphans`.split(/\s+/).map((key) => [key, 0]));
   Object.assign(summary, { total: 1205, internal: 1205, success: 1205, indexable: 1205 });
   const numericFields = `titleLen titlePixelWidth metaDescriptionLen metaDescriptionPixelWidth h1Len h1Count
@@ -48,6 +48,8 @@ function setupFixture(mockIPC, emit) {
     ...Array.from({ length: 202 }, (_, index) => `https://example.test/extra-next-${index + 1}`)];
   records[0].relPrevTargets = ["https://example.test/missing-previous"];
   records[0].amphtml = "https://example.test/missing-amp";
+  records[0].amphtmlTargets = ["https://example.test/missing-amp", "https://example.test/other-amp", "https://example.test/missing-amp",
+    ...Array.from({ length: 202 }, (_, index) => `https://example.test/extra-amp-${index + 1}`)];
   window.testQueries = [];
   window.testLinkQueries = [];
   window.testLinkDelays = {};
@@ -100,6 +102,7 @@ function setupFixture(mockIPC, emit) {
     status: "running", crawled: 1205, queued, discovered: 1205 + queued, elapsedMs: 1000, pagesPerSecond: 10, summary,
   } });
   window.testRequestQuit = () => emit("quit-requested");
+  window.testMeasurementProgress = (payload) => emit("page-speed-progress", payload);
   mockIPC(async (cmd, args) => {
     if (window.testHeldQueries?.[cmd]) {
       const response = window.testHeldQueries[cmd];
@@ -166,10 +169,19 @@ function setupFixture(mockIPC, emit) {
       if (query.view === "paginationNextNonReciprocal" || query.view === "paginationPrevNonReciprocal") matching = window.testPaginationReturns
         ? records.slice(0, query.view === "paginationNextNonReciprocal" ? 2 : 1).map((row) => ({ ...row,
           relNext: 'https://example.test/next-without-return', relPrev: 'https://example.test/prev-without-return' })) : [];
+      if (query.view === "paginationCanonicalToLinkedPage") matching = window.testPaginationCanonical
+        ? records.slice(0, 1).map((row) => ({ ...row, canonical: 'https://example.test/linked-canonical',
+          relNext: 'https://example.test/linked-canonical' })) : [];
       if (query.view === "paginationMultipleTargets") matching = window.testPaginationMultiple ? records.slice(0, 1) : [];
+      if (query.view === "htmlMissingDoctype") matching = window.testHtmlDoctype
+        ? records.slice(0, 1).map((row) => ({ ...row, htmlDoctype: false })) : [];
+      if (query.view === "ampMultipleTargets") matching = window.testAmpMultiple ? records.slice(0, 1) : [];
       if (query.view === "ampToError") matching = window.testAmpError ? records.slice(0, 1) : [];
       if (query.view === "ampNonReciprocal") matching = window.testAmpReturns
         ? records.slice(0, 1).map((row) => ({ ...row, amphtml: 'https://example.test/amp-without-return' })) : [];
+      if (query.view === "ampTargetMissingMarker") matching = window.testAmpMarker
+        ? records.slice(0, 1).map((row) => ({ ...row, amphtml: 'https://example.test/amp-without-marker',
+          amphtmlTargets: ['https://example.test/amp-without-marker'], ampDocument: window.testAmpDocument ?? null })) : [];
       if (query.view === "titleMultiple" || query.view === "metaMultiple") matching = window.testMultipleMetadata
         ? [{ ...records[0], titleCount: 3, metaDescriptionCount: 2 }] : [];
       if (window.testEmptyDataset) matching = [];
@@ -188,8 +200,12 @@ function setupFixture(mockIPC, emit) {
           paginationNextToError: window.testPaginationErrors ? 2 : 0, paginationPrevToError: window.testPaginationErrors ? 1 : 0,
           paginationNextLoop: window.testPaginationLoops ? 2 : 0, paginationPrevLoop: window.testPaginationLoops ? 1 : 0,
           paginationNextNonReciprocal: window.testPaginationReturns ? 2 : 0, paginationPrevNonReciprocal: window.testPaginationReturns ? 1 : 0,
+          paginationCanonicalToLinkedPage: window.testPaginationCanonical ? 1 : 0,
           paginationMultipleTargets: window.testPaginationMultiple ? 1 : 0,
+          missingHtmlDoctype: window.testHtmlDoctype ? 1 : 0,
+          ampMultipleTargets: window.testAmpMultiple ? 1 : 0,
           ampToError: window.testAmpError ? 1 : 0, ampNonReciprocal: window.testAmpReturns ? 1 : 0,
+          ampTargetMissingMarker: window.testAmpMarker ? 1 : 0,
           titleMultiple: window.testMultipleMetadata ? 1 : 0, metaMultiple: window.testMultipleMetadata ? 1 : 0 } };
       await new Promise((resolve) => setTimeout(resolve, window.testSearchDelays[query.globalSearch] ?? 15));
       return response;
@@ -541,15 +557,35 @@ function setupFixture(mockIPC, emit) {
       }
       return { measured, skipped, failed: [], cancelled: false };
     }
+    if (cmd === "run_field_vitals_bulk") {
+      window.testFieldVitalsBulkRequest = args.request;
+      if (window.testHoldFieldVitalsBulk) return new Promise((resolve) => {
+        window.testCancelFieldVitalsBulk = () => resolve({ measured: 0, skipped: 0, failed: [], cancelled: true });
+      });
+      let measured = 0, skipped = 0;
+      for (const id of args.request.recordIds) {
+        const row = records.find((record) => record.id === id);
+        if (args.request.resume && row.fieldVitals?.formFactor === args.request.formFactor && row.fieldVitals.requestedUrl === row.finalUrl) { skipped++; continue; }
+        row.fieldVitals = { formFactor: args.request.formFactor, requestedUrl: row.finalUrl, completedAtMs: 1788940800000, hasData: true, lcpMsP75: 1900, clsP75: 0, inpMsP75: 120 };
+        measured++;
+      }
+      return { measured, skipped, failed: [], cancelled: false };
+    }
     if (cmd === "run_field_vitals") {
       window.testFieldVitalsRequest = args.request;
       if (window.testFieldVitalsFailure) throw new Error("Chrome UX Report returned HTTP 403");
       const row = records.find((record) => record.id === args.request.recordId);
       row.fieldVitals = { formFactor: args.request.formFactor, requestedUrl: row.finalUrl, completedAtMs: 1788940800000, hasData: !window.testFieldVitalsEmpty,
-        lcpMsP75: 2100, clsP75: 0.05, inpMsP75: 180, fcpMsP75: 1400, ttfbMsP75: 600, collectionPeriodStart: "2026-08-15", collectionPeriodEnd: "2026-09-11" };
+        lcpMsP75: 2100, clsP75: 0, inpMsP75: 180, fcpMsP75: 1400, ttfbMsP75: 0, collectionPeriodStart: "2026-08-15", collectionPeriodEnd: "2026-09-11" };
       return row.fieldVitals;
     }
     if (cmd === "cancel_page_speed") {
+      if (window.testFieldVitalsBulkRequest?.requestId === args.requestId && window.testCancelFieldVitalsBulk) {
+        window.testCancelledFieldVitalsBulk = args.requestId;
+        window.testCancelFieldVitalsBulk();
+        window.testCancelFieldVitalsBulk = undefined;
+        return true;
+      }
       if (window.testPageSpeedRequest?.requestId !== args.requestId || !window.testCancelPageSpeed) return false;
       window.testCancelledPageSpeed = args.requestId;
       window.testCancelPageSpeed();
@@ -1309,6 +1345,13 @@ try {
     assert.equal(await evaluate(`document.querySelector('[data-view="${view}"] .issue-count').textContent`), count, 'Progress must preserve query-owned pagination return-link counts');
   }
   await evaluate("window.testPaginationReturns = false");
+  await evaluate("window.testPaginationCanonical = true");
+  await click('[data-view="paginationCanonicalToLinkedPage"]');
+  await until("testQueries.at(-1).view === 'paginationCanonicalToLinkedPage' && document.querySelector('[data-view=\"paginationCanonicalToLinkedPage\"] .issue-count')?.textContent === '1'", "Pagination canonical advisories must query storage and count source pages");
+  assert.ok(await evaluate("document.querySelector('.data-table thead').textContent.includes('Canonical') && document.querySelector('.data-table tbody').textContent.includes('https://example.test/linked-canonical')"), "The advisory must expose canonical evidence beside pagination declarations");
+  await evaluate('testEmitProgress(0)');
+  assert.equal(await evaluate("document.querySelector('[data-view=\"paginationCanonicalToLinkedPage\"] .issue-count').textContent"), "1", "Progress must preserve query-owned pagination canonical counts");
+  await evaluate("window.testPaginationCanonical = false");
   await evaluate("window.testPaginationMultiple = true");
   await click('[data-view="paginationMultipleTargets"]');
   await until("testQueries.at(-1).view === 'paginationMultipleTargets' && document.querySelector('[data-view=\"paginationMultipleTargets\"] .issue-count')?.textContent === '1'", "Multiple pagination declarations must query storage and count source pages");
@@ -1325,6 +1368,22 @@ try {
   await until("document.querySelector('[data-view=\"paginationMultipleTargets\"] .issue-count')?.textContent === '0'", "Live progress must replace stale pagination declaration counts");
   await click('#detail-tab-page');
   await evaluate("window.testPaginationMultiple = false");
+  await evaluate("window.testAmpMultiple = true");
+  await click('[data-view="ampMultipleTargets"]');
+  await until("testQueries.at(-1).view === 'ampMultipleTargets' && document.querySelector('[data-view=\"ampMultipleTargets\"] .issue-count')?.textContent === '1'", "Multiple AMP declarations must query storage and count source pages");
+  assert.ok(await evaluate("document.querySelector('.data-table thead').textContent.includes('AMP Targets') && document.querySelector('.data-table tbody').textContent.includes('205')"), "AMP inventory must show the measured declaration count");
+  await evaluate("document.querySelector('.data-table tbody tr:not(.virtual-spacer)').click()");
+  await click('#detail-tab-links');
+  await until("document.querySelector('[aria-label=\"AMP targets\"]')?.textContent.includes('https://example.test/other-amp') && document.querySelectorAll('[aria-label=\"AMP targets\"] li').length === 100", "The inspector must show a bounded first page of AMP declarations");
+  assert.equal(await evaluate("Array.from(document.querySelectorAll('[aria-label=\"AMP targets\"] li')).filter((item) => item.textContent === 'https://example.test/missing-amp').length"), 2, "AMP declaration evidence must preserve repeated targets");
+  await click('[aria-label="AMP targets"] [aria-label="Last page"]');
+  await until("document.querySelectorAll('[aria-label=\"AMP targets\"] li').length === 5 && document.querySelector('[aria-label=\"AMP targets\"]')?.textContent.includes('https://example.test/extra-amp-202')", "The final AMP declaration must remain inspectable");
+  await evaluate("testSetSummary({ ampMultipleTargets: 1 }); testEmitProgress(0)");
+  assert.equal(await evaluate("document.querySelector('[data-view=\"ampMultipleTargets\"] .issue-count').textContent"), "1", "Progress must include measured AMP declaration counts");
+  await evaluate("testSetSummary({ ampMultipleTargets: 0 }); testEmitProgress(0)");
+  await until("document.querySelector('[data-view=\"ampMultipleTargets\"] .issue-count')?.textContent === '0'", "Live progress must replace stale AMP declaration counts");
+  await click('#detail-tab-page');
+  await evaluate("window.testAmpMultiple = false");
   await evaluate("window.testAmpError = true");
   await click('[data-view="ampToError"]');
   await until("testQueries.at(-1).view === 'ampToError' && document.querySelector('[data-view=\"ampToError\"] .issue-count')?.textContent === '1'", "AMP target errors must query storage and count source rows");
@@ -1339,6 +1398,42 @@ try {
   await evaluate('testEmitProgress(0)');
   assert.equal(await evaluate("document.querySelector('[data-view=\"ampNonReciprocal\"] .issue-count').textContent"), '1', "Progress must retain query-owned AMP reciprocity counts");
   await evaluate("window.testAmpReturns = false");
+  await evaluate("window.testAmpMarker = true; window.testAmpDocument = false");
+  await click('[data-view="ampTargetMissingMarker"]');
+  await until("testQueries.at(-1).view === 'ampTargetMissingMarker' && document.querySelector('[data-view=\"ampTargetMissingMarker\"] .issue-count')?.textContent === '1'", "AMP marker warnings must query storage and count measured source rows");
+  assert.ok(await evaluate("document.querySelector('.data-table tbody').textContent.includes('https://example.test/amp-without-marker')"), "AMP marker warnings must expose the captured target");
+  await evaluate("document.querySelector('.data-table tbody tr:not(.virtual-spacer)').click()");
+  await click('#detail-tab-links');
+  await until("document.querySelector('[aria-label=\"AMP marker evidence\"]')?.textContent.includes('Missing')", "Inspector must distinguish measured missing markers");
+  assert.ok(await evaluate("document.querySelector('[aria-label=\"AMP marker evidence\"]').textContent.includes('not full AMP validation')"), "Marker evidence must not claim AMP conformance");
+  await evaluate("testEmitProgress(0)");
+  assert.equal(await evaluate("document.querySelector('[data-view=\"ampTargetMissingMarker\"] .issue-count').textContent"), '1', "Progress must retain query-owned marker diagnostics");
+  for (const [marker, label] of [[true, 'Present'], [null, 'Not measured']]) {
+    await evaluate(`window.testAmpDocument = ${JSON.stringify(marker)}`);
+    await click('[data-view="all"]');
+    await click('[data-view="ampTargetMissingMarker"]');
+    await until("testQueries.at(-1).view === 'ampTargetMissingMarker' && document.querySelector('.data-table tbody')?.textContent.includes('https://example.test/amp-without-marker')", "Marker fixture must reload");
+    await evaluate("document.querySelector('.data-table tbody tr:not(.virtual-spacer)').click()");
+    await until(`document.querySelector('[aria-label="AMP marker evidence"]')?.textContent.includes(${JSON.stringify(label)})`, "Inspector must preserve all marker evidence states");
+  }
+  await click('#detail-tab-page');
+  await evaluate("window.testAmpMarker = false");
+  await evaluate("window.testHtmlDoctype = true");
+  await click('[data-view="htmlMissingDoctype"]');
+  await until("testQueries.at(-1).view === 'htmlMissingDoctype' && document.querySelector('[data-view=\"htmlMissingDoctype\"] .issue-count')?.textContent === '1'", "Missing doctype warnings must query storage and count affected records");
+  assert.ok(await evaluate("document.querySelector('.data-table thead').textContent.includes('HTML Doctype') && document.querySelector('.data-table tbody').textContent.includes('Missing')"), "Markup audits must show measured doctype evidence");
+  await evaluate("document.querySelector('.data-table tbody tr:not(.virtual-spacer)').click()");
+  await click('#detail-tab-technical');
+  await until("document.querySelector('[aria-label=\"HTML doctype evidence\"]')?.textContent.includes('Missing')", "The inspector must show original-source declaration evidence");
+  await evaluate("testSetSummary({ missingHtmlDoctype: 1 }); testEmitProgress(0)");
+  assert.equal(await evaluate("document.querySelector('[data-view=\"htmlMissingDoctype\"] .issue-count').textContent"), "1", "Cheap progress includes doctype counts");
+  await evaluate("testSetSummary({ missingHtmlDoctype: 0 }); testEmitProgress(0); window.testHtmlDoctype = false");
+  await until("document.querySelector('[data-view=\"htmlMissingDoctype\"] .issue-count')?.textContent === '0'", "Progress must replace stale doctype counts");
+  await click('[data-view="all"]');
+  await until("testQueries.at(-1).view === 'all' && document.querySelectorAll('.data-table tbody tr:not(.virtual-spacer)').length > 1", "Restore rows without doctype measurements");
+  await evaluate("document.querySelector('.data-table tbody tr:not(.virtual-spacer)').click()");
+  await until("document.querySelector('[aria-label=\"HTML doctype evidence\"]')?.textContent.includes('Not measured')", "Legacy unknown doctype must not display as missing");
+  await click('#detail-tab-page');
   await evaluate("testExactDuplicates = 3");
   await click('[data-view="exactDuplicate"]');
   await until("testQueries.at(-1).view === 'exactDuplicate' && document.querySelector('.data-table thead').textContent.includes('Response hash')", "Exact duplicate audits must query storage and show full-response hash evidence");
@@ -1506,6 +1601,7 @@ try {
   assert.equal(await evaluate("[...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === 'XLSX').getAttribute('aria-disabled')"), "true", "Paged XLSX reports require a stable stopped crawl");
   assert.equal(await evaluate("[...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === 'Image Alt Text CSV').getAttribute('aria-disabled')"), "true", "Paged image reports require a stable stopped crawl");
   assert.ok(await evaluate("['Response Headers CSV', 'Raw HTML CSV', 'Rendered HTML CSV', 'Visible Text CSV'].every((label) => [...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === label).getAttribute('aria-disabled') === 'true')"), "Captured evidence exports require a stopped crawl");
+  assert.ok(await evaluate("['CSV', 'XML Sitemap', 'Link Edges CSV', 'Redirect Chains CSV', 'Sitemap Validation CSV', 'HTML Report'].every((label) => [...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === label)?.getAttribute('aria-disabled') === 'true')"), "Bulk report controls must match the native idle requirement");
 
   assert.equal(await evaluate("[...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === 'Crawl Archive').getAttribute('aria-disabled')"), "true", "Archives require a stopped or completed crawl");
   await pressKey("Escape");
@@ -1514,6 +1610,7 @@ try {
   await evaluate("document.querySelector('.export-trigger').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))");
   await until("document.querySelector('[role=\"menuitem\"]')", "The export menu must remain accessible while paused");
   assert.equal(await evaluate("[...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === 'Crawl Archive').getAttribute('aria-disabled')"), "true", "Paused workers must not overlap an archive snapshot");
+  assert.ok(await evaluate("['CSV', 'XML Sitemap', 'Link Edges CSV', 'Redirect Chains CSV', 'Sitemap Validation CSV', 'HTML Report'].every((label) => [...document.querySelectorAll('[role=\"menuitem\"]')].find((item) => item.textContent.trim() === label)?.getAttribute('aria-disabled') === 'true')"), "Paused crawls must retain the bulk report idle requirement");
   await pressKey("Escape");
   await click('[title="Resume crawl"]');
   await until("document.querySelector('[title=\"Pause crawl\"]')", "The paused crawl must remain resumable");
@@ -1863,14 +1960,30 @@ try {
   assert.ok(await evaluate("document.querySelector('[data-action=\"run-field-vitals\"]').disabled"), "Field data must not start while crawling");
   await evaluate("testEmit({ kind: 'finished' })");
   await until("document.querySelector('.field-vitals-panel')?.textContent.includes('No field data fetched yet')", "Rows without field data must show an actionable empty state");
+  const beforeFieldColumns = await evaluate(`document.querySelector('[aria-label="Visible columns"]').value`);
+  await select("Visible columns", "all");
+  const fieldCellTitle = "(() => { const column = [...document.querySelectorAll('.data-table th')].findIndex(cell => cell.textContent.trim() === 'Field data (CrUX)'); return document.querySelector('.data-table tbody tr[aria-selected=true]')?.children[column]?.getAttribute('title'); })()";
+  await until(`${fieldCellTitle} === 'Not measured'`, "Unmeasured rows must have an explicit field-data state in the grid");
+  assert.ok(await evaluate("[...document.querySelectorAll('.data-table th')].find(cell => cell.textContent.trim() === 'Field data (CrUX)').querySelector('button').disabled"), "CrUX must not promise unsupported server-side sorting");
   await select("Field data form factor", "desktop");
   await click('[data-action="run-field-vitals"]');
   await until("document.querySelector('.field-vitals-panel')?.textContent.includes('Desktop · Field data') && document.querySelector('.field-vitals-panel').textContent.includes('2,100 ms')", "Field data must render p75 metrics for the chosen form factor");
   assert.deepEqual(await evaluate("testFieldVitalsRequest"), { recordId: await evaluate("testFieldVitalsRequest.recordId"), formFactor: "desktop" }, "Field data requests must carry the selected form factor");
   assert.ok(await evaluate("document.querySelector('.field-vitals-panel').textContent.includes('2026-08-15 to 2026-09-11')"), "Field data must show its collection period");
+  const measuredFieldTitle = await evaluate(fieldCellTitle);
+  for (const evidence of ["desktop", "p75", "LCP 2100 ms", "INP 180 ms", "CLS 0", "FCP 1400 ms", "TTFB 0 ms", "2026-08-15 to 2026-09-11", "URL https://example.test/"]) {
+    assert.ok(measuredFieldTitle.includes(evidence), `Grid field-data tooltip must preserve ${evidence}`);
+  }
+  assert.ok(measuredFieldTitle.includes(`Fetched ${new Date(1788940800000).toISOString()}`), "Grid field-data tooltip must retain the fetch timestamp");
   await evaluate("testFieldVitalsEmpty = true");
   await click('[data-action="run-field-vitals"]');
   await until("document.querySelector('.field-vitals-panel')?.textContent.includes('no field data for this URL')", "Missing CrUX records must be explained instead of showing blanks");
+  const emptyFieldTitle = await evaluate(fieldCellTitle);
+  for (const evidence of ["desktop", "no field data", "URL https://example.test/", `Fetched ${new Date(1788940800000).toISOString()}`]) {
+    assert.ok(emptyFieldTitle.includes(evidence), `No-data grid tooltip must preserve ${evidence}`);
+  }
+  assert.ok(!/LCP|INP|CLS|FCP|TTFB/.test(emptyFieldTitle), "No-data grid cells must suppress every stale metric");
+  await select("Visible columns", beforeFieldColumns);
   await evaluate("testFieldVitalsEmpty = false; testFieldVitalsFailure = true");
   await click('[data-action="run-field-vitals"]');
   await until("document.querySelector('[role=\"alert\"]')?.textContent.includes('HTTP 403')", "Field data failures must stay visible");
@@ -1884,6 +1997,34 @@ try {
   await until("document.querySelector('.notice-bar')?.textContent.includes('PageSpeed bulk run: 1 measured, 1 already measured, 0 failed.')", "Bulk PageSpeed must summarize measured, skipped and failed rows");
   assert.deepEqual(await evaluate("({ count: testPageSpeedBulkRequest.recordIds.length, strategy: testPageSpeedBulkRequest.strategy, categories: testPageSpeedBulkRequest.categories, resume: testPageSpeedBulkRequest.resume })"),
     { count: 2, strategy: "desktop", categories: ["performance", "bestPractices", "seo"], resume: true }, "Bulk requests must carry the selection, device, chosen categories and resume flag");
+  assert.ok(await evaluate("document.querySelector('[data-action=\"run-field-vitals-selected\"]')?.textContent.includes('2 selected')"), "Bulk CrUX must expose the current selection");
+  await evaluate("testHoldFieldVitalsBulk = true");
+  await click('[data-action="run-field-vitals-selected"]');
+  await until("document.querySelector('.page-speed-running')?.textContent.includes('CrUX') && window.testCancelFieldVitalsBulk", "Bulk field data must have its own service label and shared cancellation");
+  assert.ok(await evaluate("document.querySelector('[aria-label=\"Crawl library\"]').disabled && document.querySelector('[data-action=\"run-pagespeed\"]').disabled && document.querySelector('[data-action=\"run-field-vitals\"]').disabled"), "A bulk field request must preserve the active session and exclude competing measurements");
+  await evaluate("testMeasurementProgress({ requestId: testFieldVitalsBulkRequest.requestId, completed: 1, total: 2, recordId: 1 })");
+  await until("document.querySelector('.field-vitals-panel .page-speed-caption')?.textContent.includes('1 of 2')", "CrUX progress must appear in the field-data panel");
+  await evaluate("testMeasurementProgress({ requestId: 'stale-field-run', completed: 99, total: 99, recordId: 1 })");
+  assert.ok(await evaluate("document.querySelector('.field-vitals-panel .page-speed-caption').textContent.includes('1 of 2')"), "An earlier request must not replace current CrUX progress");
+  const beforeBulkQueryChange = await evaluate("testQueries.length");
+  await search("page-2");
+  await click('#detail-tab-page');
+  await click('[data-action="cancel-pagespeed"]');
+  await until("!document.querySelector('.page-speed-running') && !document.querySelector('[aria-label=\"Crawl library\"]').disabled", "Bulk field cancellation must work outside the measurement tab and release its session");
+  assert.equal(await evaluate("testCancelledFieldVitalsBulk"), await evaluate("testFieldVitalsBulkRequest.requestId"));
+  await until("testQueries.at(-1).globalSearch === 'page-2'", "Bulk completion must refresh the current search");
+  assert.ok(await evaluate(`testQueries.slice(${beforeBulkQueryChange}).every(query => query.globalSearch === 'page-2')`), "Bulk completion must never query its stale starting filter");
+  await search("");
+  await until("testQueries.at(-1).globalSearch === '' && document.querySelectorAll('.data-table tbody tr:not(.virtual-spacer)').length > 1", "Restore the original row selection after changing the query");
+  await selectGridRow(0);
+  await selectGridRow(1, { ctrlKey: true });
+  await evaluate("testHoldFieldVitalsBulk = false");
+  await click('#detail-tab-pagespeed');
+  await click('[data-action="run-field-vitals-selected"]');
+  await until("document.querySelector('.notice-bar')?.textContent.includes('CrUX bulk run: 1 measured, 1 already measured, 0 failed.')", "Bulk CrUX must preserve saved no-data rows and measure remaining rows");
+  assert.deepEqual(await evaluate("({ recordIds: testFieldVitalsBulkRequest.recordIds, formFactor: testFieldVitalsBulkRequest.formFactor, resume: testFieldVitalsBulkRequest.resume })"),
+    { recordIds: await evaluate("testPageSpeedBulkRequest.recordIds"), formFactor: "desktop", resume: true }, "Bulk field requests must preserve exact selected IDs and form factor");
+  await until("document.querySelector('.field-vitals-panel')?.textContent.includes('1,900 ms')", "Bulk snapshots must refresh the selected row after completion");
   await evaluate("[...document.querySelectorAll('.page-speed-categories input')].find((input) => input.nextSibling.textContent === 'Accessibility').click()");
   await click('.data-table tbody tr:not(.virtual-spacer)');
   await until("!document.querySelector('[data-action=\"run-pagespeed\"]').disabled", "PageSpeed must become available again after crawl completion");

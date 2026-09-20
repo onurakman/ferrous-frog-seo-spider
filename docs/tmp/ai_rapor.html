@@ -1,0 +1,870 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Etiya Kurumsal Web Sitesi — Yayın Öncesi Denetim Raporu</title>
+<style>
+:root{
+  --bg:#0f1424; --bg2:#171d33; --card:#1c2340; --line:#2b3358;
+  --tx:#e8ecf7; --tx2:#9aa4c4; --tx3:#6f7899;
+  --k:#ff5f6d; --y:#ffa63d; --o:#4fc3f7; --d:#7986cb; --g:#3ddc97;
+  --acc:#00c2d1;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px 80px}
+header{background:linear-gradient(135deg,#141a2e 0%,#1b2547 55%,#0f2f3d 100%);border-bottom:1px solid var(--line)}
+header .wrap{padding-top:48px;padding-bottom:40px}
+.eyebrow{font-size:12px;letter-spacing:.16em;text-transform:uppercase;color:var(--acc);font-weight:600;margin:0 0 12px}
+h1{font-size:34px;line-height:1.2;margin:0 0 12px;font-weight:700}
+.sub{color:var(--tx2);margin:0;max-width:760px}
+.meta{margin-top:22px;display:flex;flex-wrap:wrap;gap:10px}
+.pill{background:rgba(255,255,255,.06);border:1px solid var(--line);border-radius:999px;padding:5px 13px;font-size:12.5px;color:var(--tx2)}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:32px 0 8px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.stat b{display:block;font-size:26px;font-weight:700;line-height:1.15}
+.stat span{font-size:12.5px;color:var(--tx2);display:block;margin-top:4px}
+.stat.k b{color:var(--k)} .stat.y b{color:var(--y)} .stat.o b{color:var(--o)} .stat.d b{color:var(--d)} .stat.g b{color:var(--g)}
+
+h2{font-size:20px;margin:44px 0 14px;font-weight:650;letter-spacing:-.01em}
+h2 .n{color:var(--tx3);font-weight:400;font-size:15px;margin-left:8px}
+.note{background:var(--bg2);border:1px solid var(--line);border-left:3px solid var(--acc);border-radius:8px;padding:14px 18px;color:var(--tx2);font-size:14px;margin:18px 0}
+
+.bar{display:flex;flex-wrap:wrap;gap:8px;margin:22px 0 18px;position:sticky;top:0;background:var(--bg);padding:14px 0;z-index:20;border-bottom:1px solid var(--line)}
+.bar .lbl{font-size:12px;color:var(--tx3);align-self:center;margin-right:2px;text-transform:uppercase;letter-spacing:.08em}
+button.f{background:var(--card);border:1px solid var(--line);color:var(--tx2);border-radius:8px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit;transition:.15s}
+button.f:hover{border-color:var(--acc);color:var(--tx)}
+button.f.on{background:var(--acc);border-color:var(--acc);color:#062026;font-weight:600}
+.sep{width:1px;background:var(--line);margin:2px 6px}
+
+.item{background:var(--card);border:1px solid var(--line);border-radius:12px;margin-bottom:10px;overflow:hidden}
+.item.k{border-left:4px solid var(--k)} .item.y{border-left:4px solid var(--y)}
+.item.o{border-left:4px solid var(--o)} .item.d{border-left:4px solid var(--d)}
+.hd{padding:15px 18px;cursor:pointer;display:flex;gap:12px;align-items:flex-start}
+.hd:hover{background:rgba(255,255,255,.025)}
+.id{font-size:12px;color:var(--tx3);font-variant-numeric:tabular-nums;min-width:26px;padding-top:2px}
+.ttl{flex:1;font-weight:600;font-size:15px}
+.tags{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.tag{font-size:11px;padding:3px 9px;border-radius:6px;white-space:nowrap;font-weight:600;letter-spacing:.02em}
+.t-k{background:rgba(255,95,109,.15);color:var(--k)} .t-y{background:rgba(255,166,61,.15);color:var(--y)}
+.t-o{background:rgba(79,195,247,.15);color:var(--o)} .t-d{background:rgba(121,134,203,.15);color:var(--d)}
+.t-dep{background:rgba(255,255,255,.07);color:var(--tx2)}
+.arw{color:var(--tx3);transition:.2s;font-size:12px;padding-top:3px}
+.item.open .arw{transform:rotate(90deg)}
+.bd{display:none;padding:0 18px 18px 56px;border-top:1px solid var(--line);margin-top:-1px;padding-top:16px}
+.item.open .bd{display:block}
+.bd h4{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--tx3);font-weight:600}
+.bd p{margin:0 0 16px;color:var(--tx2);font-size:14.5px}
+.bd .fix{background:rgba(61,220,151,.07);border:1px solid rgba(61,220,151,.2);border-radius:8px;padding:12px 15px;margin-bottom:4px}
+.bd .fix h4{color:var(--g)}
+.bd .fix p{margin:0;color:var(--tx);font-size:14px}
+ul.ev{margin:0 0 16px;padding:0;list-style:none}
+ul.ev li{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px;color:var(--tx2);padding:4px 0 4px 16px;position:relative;word-break:break-all}
+ul.ev li:before{content:"";position:absolute;left:2px;top:13px;width:5px;height:5px;border-radius:50%;background:var(--tx3)}
+code{background:rgba(255,255,255,.07);padding:1.5px 6px;border-radius:4px;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:#ffd9a0}
+
+table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line)}
+th{color:var(--tx3);font-size:12px;text-transform:uppercase;letter-spacing:.07em;font-weight:600}
+td:first-child{color:var(--tx2)}
+.ok{color:var(--g)}
+
+.good{background:rgba(61,220,151,.06);border:1px solid rgba(61,220,151,.18);border-radius:12px;padding:18px 22px}
+.good ul{margin:0;padding-left:18px;color:var(--tx2)}
+.good li{margin:5px 0}
+footer{margin-top:56px;padding-top:22px;border-top:1px solid var(--line);color:var(--tx3);font-size:13px}
+.empty{text-align:center;color:var(--tx3);padding:40px;display:none}
+@media(max-width:640px){h1{font-size:26px}.bd{padding-left:18px}.bar{position:static}}
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <p class="eyebrow">Yayın Öncesi Denetim</p>
+    <h1>Etiya Kurumsal Web Sitesi — Teknik &amp; Pazarlama Bulgu Raporu</h1>
+    <p class="sub">int-web-test.etiya.com test ortamının tamamı tarandı. Sitemap'teki 279 sayfanın hepsi çekildi; meta veriler, bağlantılar, görseller, formlar, performans ve içerik otomatik olarak analiz edildi, kritik bulgular tarayıcıda tek tek doğrulandı.</p>
+    <div class="meta">
+      <span class="pill">Tarama tarihi: 17 Ağustos 2026</span>
+      <span class="pill">279 sayfa (140 EN · 139 TR)</span>
+      <span class="pill">33.998 bağlantı</span>
+      <span class="pill">4.137 görsel</span>
+      <span class="pill">5 kırılma noktası: 320 · 360 · 390 · 768 · 1024 px</span>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<div class="stats">
+  <div class="stat k"><b>8</b><span>Yayın engeli</span></div>
+  <div class="stat y"><b>9</b><span>Yüksek öncelik</span></div>
+  <div class="stat o"><b>17</b><span>Orta öncelik</span></div>
+  <div class="stat d"><b>4</b><span>Düşük öncelik</span></div>
+  <div class="stat g"><b>9</b><span>İyi durumda</span></div>
+</div>
+
+<div class="note">
+  <strong>Özet yargı:</strong> Site altyapısı sağlam — güvenlik başlıkları, yapısal veri, hreflang kurgusu ve 404 deneyimi beklenenin üzerinde. Ancak <strong>bu haliyle yayına alınmamalı</strong>. Canlıda görünen lorem ipsum metinleri, onay kutusunda 404'e giden KVKK aydınlatma metni, her sayfada tekrarlanan kırık menü bağlantıları, yayında duran bir taslak sayfa, hiç çalışmayan Google Analytics kurulumu ve bozuk canonical etiketleri lansmanın ilk gününden itibaren hem marka algısını hem de organik trafiği doğrudan zedeler. Bulgular önem sırasına göre listelenmiştir; ilk sekiz madde yayın engeli sayılmalı ve bunların büyük kısmı bir–iki günlük içerik ve konfigürasyon işi.
+</div>
+
+<h2>Bulgular <span class="n">önem sırasına göre · 1–8 yayın engeli, 9–17 yüksek, 18–35 orta, 36–39 düşük</span></h2>
+
+<div class="bar">
+  <span class="lbl">Önem</span>
+  <button class="f on" data-g="sev" data-v="all">Tümü</button>
+  <button class="f" data-g="sev" data-v="k">Yayın engeli</button>
+  <button class="f" data-g="sev" data-v="y">Yüksek</button>
+  <button class="f" data-g="sev" data-v="o">Orta</button>
+  <button class="f" data-g="sev" data-v="d">Düşük</button>
+  <div class="sep"></div>
+  <span class="lbl">Departman</span>
+  <button class="f on" data-g="dep" data-v="all">Tümü</button>
+  <button class="f" data-g="dep" data-v="tek">Teknik</button>
+  <button class="f" data-g="dep" data-v="paz">Pazarlama</button>
+  <div class="sep"></div>
+  <button class="f" id="exp">Hepsini aç</button>
+</div>
+
+<div id="list"></div>
+<div class="empty" id="empty">Bu filtreyle eşleşen bulgu yok.</div>
+
+<h2>Ölçüm özeti</h2>
+<table>
+<thead><tr><th>Kontrol</th><th>Sonuç</th><th>Durum</th></tr></thead>
+<tbody>
+<tr><td>Sitemap'teki sayfaların HTTP durumu</td><td>279/279 → 200</td><td class="ok">Temiz</td></tr>
+<tr><td>Kırık iç bağlantı (404)</td><td>22 benzersiz hedef — sitede 632 kez tekrarlanıyor</td><td style="color:var(--k)">Kritik</td></tr>
+<tr><td>Yönlendirmesi 404'te biten bağlantı</td><td>3 hedef — 46 kez tekrarlanıyor</td><td style="color:var(--y)">Sorunlu</td></tr>
+<tr><td>Soft 404 — sunucu yanıtı (SSR)</td><td>0 — 279 sayfa + 267 bağlantı hedefi tarandı</td><td class="ok">Temiz</td></tr>
+<tr><td>Soft 404 — sayfa içi geçiş (<code>/_serverFn</code>)</td><td>Kırık rotalarda 200 dönüyor, ekranda 404 gösteriliyor</td><td style="color:var(--o)">İyileştirilmeli</td></tr>
+<tr><td>404 dönüp gerçek içerik gösteren sayfa</td><td>0</td><td class="ok">Temiz</td></tr>
+<tr><td>Boş bağlantı (<code>href="#"</code>)</td><td>286 adet</td><td style="color:var(--y)">Sorunlu</td></tr>
+<tr><td>Bağlantısız (orphan) sayfa</td><td>4 sayfa — yalnızca sitemap'ten erişilebilir</td><td style="color:var(--y)">Sorunlu</td></tr>
+<tr><td>alt metni olmayan görsel</td><td>2.080 / 4.137 (%50)</td><td style="color:var(--y)">Sorunlu</td></tr>
+<tr><td>og:image eksik sayfa</td><td>266 / 279 (%95)</td><td style="color:var(--y)">Sorunlu</td></tr>
+<tr><td>Meta description eksik</td><td>0 — ancak 32'si 404 metni</td><td style="color:var(--y)">Sorunlu</td></tr>
+<tr><td>65 karakteri aşan title</td><td>~100 sayfa (en uzunu 113)</td><td style="color:var(--o)">İyileştirilmeli</td></tr>
+<tr><td>H1 olmayan sayfa</td><td>6</td><td style="color:var(--o)">İyileştirilmeli</td></tr>
+<tr><td>Birden fazla H1 içeren sayfa</td><td>16</td><td style="color:var(--o)">İyileştirilmeli</td></tr>
+<tr><td>Yapısal veri (JSON-LD)</td><td>279/279</td><td class="ok">Temiz</td></tr>
+<tr><td>hreflang doğruluğu</td><td>277/279</td><td class="ok">Neredeyse temiz</td></tr>
+<tr><td>Ana sayfa toplam ağırlık</td><td>22,7 MB / 250 istek</td><td style="color:var(--k)">Kritik</td></tr>
+<tr><td>TTFB / FCP</td><td>98 ms / 164 ms</td><td class="ok">Çok iyi</td></tr>
+<tr><td>Yatay taşma — 360 / 390 / 768 / 1024 px</td><td>14 sayfa, 0 taşma</td><td class="ok">Temiz</td></tr>
+<tr><td>Yatay taşma — 320 px (WCAG 1.4.10)</td><td>2 sayfa kalıbı taşıyor (+7 px ve +39 px)</td><td style="color:var(--o)">İyileştirilmeli</td></tr>
+<tr><td>24 px altı dokunma hedefi (WCAG 2.5.8)</td><td>Sayfa başına 6–37 adet — ağırlıkla karusel noktaları</td><td style="color:var(--o)">İyileştirilmeli</td></tr>
+<tr><td>Mobil menü, form alanı boyutları</td><td>52 px menü / 48–50 px alan</td><td class="ok">Temiz</td></tr>
+<tr><td>12 px altı yazı tipi</td><td>0</td><td class="ok">Temiz</td></tr>
+<tr><td>Analitik (GTM/GA4)</td><td>Yüklenmiyor</td><td style="color:var(--k)">Kritik</td></tr>
+</tbody>
+</table>
+
+<h2>İyi durumda olanlar</h2>
+<div class="good">
+<ul>
+  <li><strong>Güvenlik başlıkları:</strong> CSP, HSTS, X-Content-Type-Options, Referrer-Policy ve Permissions-Policy eksiksiz tanımlı. Bu seviyede bir CSP kurumsal sitelerde nadir.</li>
+  <li><strong>Yapısal veri:</strong> 279 sayfanın tamamında JSON-LD var (Organization şeması dahil).</li>
+  <li><strong>hreflang mimarisi:</strong> EN/TR karşılıklı eşleşme ve x-default 2 istisna dışında doğru kurulmuş.</li>
+  <li><strong>404 deneyimi:</strong> Marka diliyle yazılmış, arama ve ana sayfa yönlendirmesi olan iyi bir 404 sayfası.</li>
+  <li><strong>Sunucu hızı:</strong> TTFB 98 ms, FCP 164 ms — altyapı tarafı çok iyi.</li>
+  <li><strong>Çerez izin merkezi:</strong> Kategori bazlı (zorunlu / işlevsel / analitik / pazarlama) ve tercih kalıcı saklanıyor.</li>
+  <li><strong>Responsive düzen:</strong> 360, 390, 768 ve 1024 px'te test edilen 14 sayfanın hiçbirinde yatay taşma, üst üste binme veya 12 px altında yazı tipi yok. Kırılma noktaları temiz çalışıyor; sorun yalnızca 320 px'te ve iki yerde (bkz. 33).</li>
+  <li><strong>Mobil menü ve formlar:</strong> Hamburger menü 40×48 px, menü öğeleri 52 px yüksekliğinde ve tam genişlikte; kapatma butonu ve "Book a Demo" CTA'sı yerinde. Form alanları 48–50 px, onay kutusunun tıklanabilir alanı 289×35 px — mobilde rahat kullanılıyor.</li>
+  <li><strong>Sitemap &amp; robots:</strong> Düzgün üretilmiş, tüm URL'ler canlı, <code>/api/</code> dışlanmış.</li>
+  <li><strong>Sunucu tarafı durum kodları:</strong> 279 sayfa ve 267 bağlantı hedefinin doğrudan istenmesinde tek bir tutarsızlık yok — HTTP 200 dönüp “sayfa bulunamadı” gösteren ya da 404 dönüp gerçek içerik gösteren sayfa bulunmadı. Arama motorunun gördüğü katman doğru kurgulanmış. <em>Not: sayfa içi geçişlerde durum farklı — bkz. 18.</em></li>
+</ul>
+</div>
+
+<h2>Önerilen yayın sırası</h2>
+<table>
+<thead><tr><th style="width:90px">Aşama</th><th>Yapılacak</th><th style="width:130px">Sorumlu</th></tr></thead>
+<tbody>
+<tr><td><strong>Yayından önce</strong></td><td><strong>1–8 (yayın engeli):</strong> lorem ipsum temizliği, KVKK aydınlatma metni bağlantısı, menüdeki iki kırık slug, <code>/tr/alternatif</code> yayından kaldırma, GTM doğrulaması, canonical düzeltmeleri, test domaini değişimi, test ortamına <code>noindex</code></td><td>İçerik + Web ekibi</td></tr>
+<tr><td><strong>Yayınla birlikte</strong></td><td><strong>9–17 (yüksek):</strong> dil öneki yönlendirmeleri, "Bilgi Toplumu Hizmetleri" bağlantısı, 404 metni kalan meta description'lar, og:image, ana sayfa title'ı, çevrilmemiş TR sayfalar, bağlantısız sayfalar, alt metinleri, ana sayfa video ağırlığı ve cache header</td><td>Web ekibi</td></tr>
+<tr><td><strong>İlk 2 hafta</strong></td><td><strong>18–35 (orta):</strong> sayfa içi geçişlerde 404 ölçümü, title şablonu, kopya içerikler, hreflang düzeltmeleri, yüzde formatı, form alan sayısı, başlık hiyerarşisi, 320 px taşması, karusel dokunma hedefleri, görsel optimizasyonu</td><td>Pazarlama + Web</td></tr>
+<tr><td><strong>Sürekli</strong></td><td><strong>36–39 (düşük):</strong> kod hijyeni, güvenlik başlığı tamamlama, dış bağlantı nitelikleri, sosyal medya bağlantı standardı</td><td>Web ekibi</td></tr>
+</tbody>
+</table>
+
+<footer>
+  Rapor otomatik tarama + manuel doğrulama ile hazırlandı. Tüm bulgular <code>int-web-test.etiya.com</code> üzerinde 17 Ağustos 2026 tarihinde teyit edildi. Yüzdeler tarama anındaki içerik durumunu yansıtır.
+</footer>
+</div>
+
+<script>
+const D=[
+ {
+  "id": 1,
+  "sev": "k",
+  "dep": [
+   "paz",
+   "tek"
+  ],
+  "t": "Yayında görünen lorem ipsum metinleri (10 sayfa)",
+  "what": "Ziyaretçinin ekranında okunabilir haldeki dolgu metinler. En görünür olanı İngilizce Success Stories sayfasındaki <em>“Why choose Etiya? Lorem Ipsum is simply dummy text of the printing and typesetting industry.”</em> cümlesi — bir referans sayfasında, tam da ikna edilmesi gereken noktada duruyor.",
+  "ev": [
+   "/en/content-hub/success-stories — “Why choose Etiya? Lorem Ipsum is simply dummy text…”",
+   "/en/our-company/news-and-media — “…Etiya's role in industry developments lorem ipsum here.”",
+   "/en/content-hub/webinar/cloud-native-approach-in-customer-experience — 3 ayrı blokta lorem ipsum (üstelik İngilizce sayfada Türkçe başlıklar: “Benzersiz Olun”, “Viral Olun”)",
+   "/tr/portfolyo/urunler/agentic-ai — “…sat down with Fahri Kerçek Lorem Lorem”",
+   "/tr/icerik-merkezi/roportaj/agentic-bssin-yukselisi… — röportaj özeti tamamen lorem ipsum",
+   "/tr/icerik-merkezi/etkinlik/mvnos-world-2026 ve /etiya-dtw-ignite-2026-da — “…katılarak lorem ipsum sektör hakkında…”",
+   "/tr/sirketimiz/haber-ve-medya, /tr/icerik-merkezi/webinar/musteri-deneyiminde-cloud-native-yaklasimi, /tr/alternatif"
+  ],
+  "fix": "Tüm sayfalarda <code>lorem</code>, <code>ipsum</code>, <code>consectetur</code> ve <code>dummy</code> kelimeleri için CMS araması yapıp gerçek metinlerle değiştirin. Yayın öncesi kabul kriteri olarak bu aramanın sıfır sonuç dönmesi şart koşulmalı."
+ },
+ {
+  "id": 2,
+  "sev": "k",
+  "dep": [
+   "tek",
+   "paz"
+  ],
+  "t": "KVKK aydınlatma metni bağlantısı 38 sayfada 404'e gidiyor",
+  "what": "Formlardaki zorunlu onay kutusunda “I have read and understood <u>Disclosure Text</u>” yazıyor ve kullanıcı bunu onaylamadan formu gönderemiyor. Ancak bağlantı tıklandığında 404 sayfası açılıyor. Yani kullanıcıdan, kendisine gösterilmeyen bir metni okuduğunu beyan etmesi isteniyor — bu bir kırık link meselesi olmanın ötesinde KVKK açık rıza geçerliliği sorunu. Demo talep formlarının ikisinde de (EN ve TR) durum aynı.",
+  "ev": [
+   "/yasal/aydinlatma-metni — 38 sayfada kullanılıyor → /en/yasal/aydinlatma-metni adresine yönleniyor → 404",
+   "Etkilenen formlar: /en/book-a-demo ve /tr/demo-talep-et onay kutuları",
+   "/yasal-sozlesmeler/aydinlatma-metni — 4 sayfada (ürün sayfaları) → aynı şekilde 404",
+   "Aynı belge için sitede üç farklı adres kullanılıyor: /yasal/aydinlatma-metni (404), /yasal-sozlesmeler/aydinlatma-metni (404), /legal/disclosure-text (çalışıyor)",
+   "Çalışan sürüm yalnızca /en/our-company/contact-us ve /tr/sirketimiz/bize-ulasin formlarında"
+  ],
+  "fix": "Üç varyantı tek bir kaynağa indirin ve onay metnindeki bağlantıyı dile göre çözülen tek bir bileşenden üretin: TR için /tr/yasal/aydinlatma-metni, EN için /en/legal/disclosure-text. Yayın öncesi her formdaki onay bağlantısı tek tek tıklanarak doğrulanmalı; hukuk ekibinin de teyit etmesi önerilir."
+ },
+ {
+  "id": 3,
+  "sev": "k",
+  "dep": [
+   "tek",
+   "paz"
+  ],
+  "t": "Kırık iç bağlantılar sitede 632 kez tekrarlanıyor",
+  "what": "Sitedeki 267 benzersiz iç bağlantı hedefinin 22'si 404 dönüyor. Asıl mesele bunların <strong>kaç yerde tekrarlandığı</strong>: iki tanesi global menüde olduğu için 279 sayfanın tamamında, bir tanesi de 45 blog sayfasındaki dönüşüm bandında yer alıyor. Toplamda kullanıcının karşısına çıkan kırık bağlantı sayısı 632.",
+  "ev": [
+   "/en/content-hub/success-story — 278 sayfada (Content Hub menüsü). Çalışan adres: /en/content-hub/case-study",
+   "/en/content-hub/e-book — 278 sayfada (Content Hub menüsü). Çalışan adres: /en/content-hub/ebook",
+   "/en/demo-talep-et — 45 blog sayfasındaki “Three brands, millions of customers, zero disruption” CTA bandı 404'e gidiyor",
+   "/tr/portfolyo/%C3%BCr%C3%BCnler/… — 6 ürün bağlantısı (Türkçe karakterli eski slug), /tr/cozumler/musteri-yonetimi-operasyonlarini-sadelestirin sayfasından",
+   "/tr/icerik-merkezi/basari-hikayesi/fizz-videotron ve /turk-telekom-cozum-merkezi — “Başarı Hikâyesini Okuyun” butonları",
+   "/tr/demo-talep-edin (doğrusu demo-talep-et), /tr/tr/icerik-merkezi/… (çift dil öneki), /tr/legal, /tr/our-company/who-we-are",
+   "/en/legal/corporatel-management-system — yazım hatası (fazladan “l”)",
+   "Benzersiz kırık hedef: 22 · toplam tekrar: 632 · kontrol edilen hedef: 267"
+  ],
+  "fix": "Menüdeki iki slug'ı düzeltmek tek başına 556 kırık bağlantıyı kapatıyor — en yüksek getirili tek düzeltme. Ardından 45 blog sayfasındaki CTA bandını ve TR ürün bağlantılarını düzeltin. Eski slug'lar için 301 tanımlayın, CMS'te dahili linkin serbest metin yerine sayfa seçiciyle girilmesini zorunlu kılın ve yayın öncesi kontrol listesine link taraması ekleyin."
+ },
+ {
+  "id": 4,
+  "sev": "k",
+  "dep": [
+   "paz",
+   "tek"
+  ],
+  "t": "Taslak sayfa yayında: /tr/alternatif",
+  "what": "Çalışma adı “alternatif” olarak kalmış bir taslak sayfa hem erişilebilir hem de sitemap'te. İçeriği İngilizce, referans kartındaki kişinin ünvanı literal olarak <code>Title</code> yazıyor, erkek isme kadın avatarı atanmış, “Devamını Oku” butonu <code>href=\"#\"</code>. Üstelik hreflang bu sayfayı İngilizce Success Stories sayfasının Türkçe karşılığı olarak işaretliyor — yani TR tarafında düzgün bir başarı hikayeleri sayfası hiç yok.",
+  "ev": [
+   "/tr/alternatif — sitemap'te listeli, HTTP 200",
+   "Referans kartı: “Mustafa Taha BAYRI / Title” (ünvan doldurulmamış)",
+   "İçerik İngilizce: “Thanks to the innovative technology…”, “%18 Increase in call center resolution rates”",
+   "hreflang: en → /en/content-hub/success-stories, tr → /tr/alternatif"
+  ],
+  "fix": "Sayfayı yayından kaldırın veya <code>/tr/icerik-merkezi/basari-hikayeleri</code> gibi doğru bir slug'a taşıyıp içeriği Türkçeleştirin, ünvanı ve görseli düzeltin. Sitemap ve hreflang'i buna göre güncelleyin."
+ },
+ {
+  "id": 5,
+  "sev": "k",
+  "dep": [
+   "paz"
+  ],
+  "t": "Google Analytics / Tag Manager hiç çalışmıyor",
+  "what": "GTM konteyner kimliği (<code>GTM-K62S2NW</code>) sunucudan gelen HTML'de tanımlı, CSP de googletagmanager.com'a izin veriyor. Ancak çerez izni “tümünü kabul et” olarak kayıtlı olmasına rağmen script hiç enjekte edilmiyor: <code>window.dataLayer</code> tanımsız, googletagmanager.com'a tek bir ağ isteği bile gitmiyor. Bu haliyle lansman günü hiçbir trafik, dönüşüm veya kampanya verisi toplanmayacak.",
+  "ev": [
+   "window.dataLayer → undefined",
+   "window.google_tag_manager → undefined",
+   "DOM'da googletagmanager script etiketi → 0 adet",
+   "Ağ isteklerinde google* eşleşmesi → 0",
+   "localStorage etiya-cookie-consent → {choice:\"all\", analytical:true, marketing:true}"
+  ],
+  "fix": "Consent Mode ile GTM enjeksiyonu arasındaki bağın kırıldığı nokta tespit edilmeli. Düzeltmeden sonra GTM Preview + GA4 DebugView ile en az bir sayfa görüntüleme ve bir form gönderimi olayının aktığı doğrulanmalı. Bu yayın öncesi kabul kriteri olmalı."
+ },
+ {
+  "id": 6,
+  "sev": "k",
+  "dep": [
+   "tek"
+  ],
+  "t": "Canonical etiketleri bozuk — bir kısmı 404'e işaret ediyor",
+  "what": "Canonical alanları CMS'te elle doldurulmuş ve birçok yerde hatalı. En ciddisi: ~40 içerik sayfası kendi URL'i yerine kök dizindeki karşılığına canonical veriyor; o URL'ler mevcut değil. Google bu sayfaları indeksten düşürür. Ayrıca bir sayfada canonical alanına ham HTML etiketi yapıştırılmış.",
+  "ev": [
+   "/en/book-a-demo → https://int-web-test.etiya.com/%3Clink%20rel=%22canonical%22%20href=%22https://www.etiya.com/book-a-demo%22%20/%3E",
+   "/en/portfolio/products/digital-twin → https://int-web-test.etiya.com/www.etiya.com/en/portfolio/products/digital-twin (protokol eksik)",
+   "/en/content-hub/blog/consent-management-… → https://int-web-test.etiya.com/consent-management-… (404) — bu kalıpta ~40 sayfa",
+   "/en/legal/privacy → https://www.etiya.com/legal (yanlış sayfa)",
+   "Aynı sitede iki farklı canonical domaini: www.etiya.com ve int-web-test.etiya.com"
+  ],
+  "fix": "Canonical'ı elle doldurulan bir alan olmaktan çıkarıp sayfanın kendi URL'inden otomatik üretin (self-referencing). İstisna gereken sayfalar için ayrı bir alan bırakın ve URL formatı doğrulaması ekleyin."
+ },
+ {
+  "id": 7,
+  "sev": "k",
+  "dep": [
+   "tek"
+  ],
+  "t": "Test domaini her katmanda sabit kodlanmış",
+  "what": "Canonical, hreflang, og:url, CSP direktifleri, preload edilen görseller ve içerik içindeki bağlantılar <code>int-web-test.etiya.com</code> adresini içeriyor. Prod'a alınırken bunların tamamı güncellenmezse sayfalar canlıdan test ortamına link verir, CSP çalışmaz ve arama motorlarına test domaini bildirilir.",
+  "ev": [
+   "CSP: frame-ancestors 'self' https://int-web-test.etiya.com; connect-src / img-src aynı şekilde",
+   "&lt;link rel=preload&gt; görselleri: https://int-web-test.etiya.com/api/media/file/…",
+   "İçerik içi 7 bağlantı: /en/legal/terms-of-use, /tr/yasal/aydinlatma-metni, /en/content-hub/blog/democratizing-ai… vb.",
+   "Tüm hreflang ve sitemap kayıtları test domaininde"
+  ],
+  "fix": "Domaini ortam değişkenine (env) taşıyın. Yayın öncesi son kontrol olarak prod build içinde <code>int-web-test</code> araması yapılıp sıfır sonuç dönmesi doğrulanmalı."
+ },
+ {
+  "id": 8,
+  "sev": "k",
+  "dep": [
+   "tek",
+   "paz"
+  ],
+  "t": "Test ortamı arama motorlarına tamamen açık",
+  "what": "<code>robots.txt</code> dosyası <code>Allow: /</code> diyor, hiçbir sayfada <code>noindex</code> yok ve <code>X-Robots-Tag</code> başlığı da gönderilmiyor. Test ortamı indekslenirse prod site ile birebir kopya içerik oluşur; hangisinin sıralanacağına Google karar verir.",
+  "ev": [
+   "robots.txt: User-agent: * / Allow: / — sadece /api/ dışlanmış",
+   "279 sayfanın hiçbirinde meta robots etiketi yok",
+   "X-Robots-Tag yanıt başlığı yok",
+   "sitemap.xml test domainindeki 279 URL'i bildiriyor"
+  ],
+  "fix": "Test ortamına HTTP kimlik doğrulaması veya sunucu seviyesinde <code>X-Robots-Tag: noindex, nofollow</code> ekleyin. Prod'da ise <code>/en/search</code>, <code>/tr/arama</code> ve filtreli liste sayfalarına noindex verin."
+ },
+ {
+  "id": 9,
+  "sev": "y",
+  "dep": [
+   "tek"
+  ],
+  "t": "Dil öneki hatası: yönlendirme kullanıcıyı 404'e taşıyor",
+  "what": "Dil öneki olmayan bağlantılar (<code>/yasal/…</code>, <code>/sirketimiz/…</code>) yönlendirme katmanı tarafından otomatik <code>/en</code> önekiyle tamamlanıyor. Sonuçta İngilizce önek ile Türkçe yol birleşip var olmayan melez adresler doğuyor. Kullanıcı açısından davranış kafa karıştırıcı: bağlantı çalışıyormuş gibi yönlendirme yapıyor, sonra 404 sayfası çıkıyor. Bu, raporun geri kalanındaki düz 404'lerden farklı bir hata sınıfı — bu yüzden ayrı izlenmeli.",
+  "ev": [
+   "/yasal/aydinlatma-metni → /en/yasal/aydinlatma-metni → 404 (38 kez)",
+   "/yasal-sozlesmeler/aydinlatma-metni → /en/yasal-sozlesmeler/aydinlatma-metni → 404 (4 kez)",
+   "/sirketimiz/bize-ulasin → /en/sirketimiz/bize-ulasin → 404 (4 kez, TR blog sayfalarındaki CTA)",
+   "Aynı mekanizma doğru çalıştığında sorun yok: /legal/disclosure-text → /en/legal/disclosure-text → 200",
+   "Ayrıca her sayfadaki footer “Legal / Yasal” bağlantısı yönlendirmeden geçiyor: /en/legal → /en/legal/privacy (144 kez) — çalışıyor ama gereksiz ek adım"
+  ],
+  "fix": "Yönlendirme katmanında dil önekini yolun diline göre belirleyin: Türkçe yol geldiğinde <code>/tr</code>, İngilizce yol geldiğinde <code>/en</code> eklensin; eşleşmeyen kombinasyonlar 404 yerine ilgili dilin ana sayfasına gitsin. İçerikteki dil öneksiz bağlantıları da tam yollarla değiştirin. Footer'daki Legal bağlantısını doğrudan hedefe (<code>/en/legal/privacy</code>) bağlayarak yönlendirme adımını kaldırın."
+ },
+ {
+  "id": 10,
+  "sev": "y",
+  "dep": [
+   "tek",
+   "paz"
+  ],
+  "t": "286 adet boş bağlantı — biri yasal zorunluluk",
+  "what": "Footer'daki <strong>“Bilgi Toplumu Hizmetleri / Information Society Services”</strong> bağlantısı sitedeki her sayfada <code>href=\"#\"</code>. Bu bağlantı e-ticaret ve bilgi toplumu hizmetleri mevzuatı kapsamında şirket bilgilerine yönlendirmek zorunda. Ayrıca İletişim sayfasındaki “Get Directions” ve Success Stories'teki “Read More” butonları da hiçbir yere gitmiyor.",
+  "ev": [
+   "“Information Society Services” / “Bilgi Toplumu Hizmetleri” → 279 sayfanın tamamında href=\"#\"",
+   "/en/our-company/contact-us → “Get Directions” href=\"#\"",
+   "/en/content-hub/success-stories → “Read More” href=\"#\"",
+   "/tr/alternatif → “Devamını Oku” href=\"#\"",
+   "Toplam boş bağlantı sayısı: 286"
+  ],
+  "fix": "Bilgi Toplumu Hizmetleri sayfasını oluşturup bağlayın (hukuk ekibiyle içerik teyidi). “Get Directions” için Google Maps bağlantısını ekleyin — sitede zaten <code>maps.app.goo.gl</code> bağlantısı mevcut."
+ },
+ {
+  "id": 11,
+  "sev": "y",
+  "dep": [
+   "paz",
+   "tek"
+  ],
+  "t": "32 sayfanın meta description'ı 404 hata metni",
+  "what": "Bu sayfalar HTTP 200 dönüyor ve içerikleri var, ancak meta description alanı doldurulmadığı için sistem 404 sayfasının metnini yazıyor. Google arama sonuçlarında bu sayfaların altında <em>“The page you requested may have moved, been removed…”</em> yazacak — kullanıcı sayfanın kırık olduğunu düşünüp tıklamayacak.",
+  "ev": [
+   "EN (16): /en/content-hub, /en/our-company/career, /en/our-company/contact-us, /en/our-awards, /en/search, /en/content-hub/success-stories, /en/our-company/partnership/become-a-partner, /en/legal/cookies, /en/legal/corporate-management-system ve 5 haber/basın odası sayfası",
+   "TR (16): /tr/icerik-merkezi, /tr/odullerimiz, /tr/sirketimiz/bize-ulasin, /tr/sirketimiz/kariyer, /tr/sirketimiz/haber-ve-medya, /tr/arama, /tr/alternatif ve karşılık gelen haber sayfaları",
+   "Metin: “The page you requested may have moved…” / “Aradığınız sayfa taşınmış, silinmiş ya da bu dilde mevcut değil…”"
+  ],
+  "fix": "Her sayfaya 120–160 karakterlik özgün açıklama yazın. Kısa vadede varsayılanı 404 metni yerine sayfanın ilk paragrafından türetin — böylece bir daha aynı hata oluşmaz."
+ },
+ {
+  "id": 12,
+  "sev": "y",
+  "dep": [
+   "paz"
+  ],
+  "t": "Sosyal paylaşım görseli 279 sayfanın 266'sında yok",
+  "what": "og:image eksik olduğunda LinkedIn, X veya WhatsApp'ta paylaşılan her bağlantı görselsiz, düz bir metin bloğu olarak görünür. B2B'de trafiğin önemli bölümü LinkedIn'den geldiği için bu doğrudan tıklama kaybı demek. Görseli olan 13 sayfada ise sayfaya özel görsel değil, Etiya logosu kullanılmış.",
+  "ev": [
+   "og:image eksik: 266 / 279 sayfa (%95)",
+   "Etkilenenler: ana sayfa, tüm ürün ve çözüm sayfaları, blogların büyük kısmı",
+   "Mevcut 13 sayfada og:image = /api/media/file/etiya-logo-2.svg",
+   "twitter:card tanımlı ama twitter:image olmadığı için etkisiz"
+  ],
+  "fix": "og:image'ı içeriğin kapak görselinden otomatik türetin, kapak yoksa markalı bir varsayılan görsele düşün. 1200×630 px ve mutlak URL kullanın; og:image:width / height ekleyin."
+ },
+ {
+  "id": 13,
+  "sev": "y",
+  "dep": [
+   "paz"
+  ],
+  "t": "Ana sayfanın &lt;title&gt; etiketi sadece “ETIYA”",
+  "what": "Ana sayfa, sitenin en çok arama görünürlüğü olan sayfası ve başlığında tek bir marka kelimesi var. “BSS”, “AI-native”, “telekom” gibi hiçbir konumlandırma sinyali yok — marka dışı hiçbir sorguda görünme şansı yok.",
+  "ev": [
+   "/en → &lt;title&gt;ETIYA&lt;/title&gt;",
+   "/tr → &lt;title&gt;ETIYA&lt;/title&gt;",
+   "/tr/icerik-merkezi/blog/how-agentic-bss-and-digital-twin… → &lt;title&gt;ETIYA&lt;/title&gt;"
+  ],
+  "fix": "Örnek: “Etiya — AI-Native BSS ve Müşteri Deneyimi Platformları” (55–60 karakter). Hedef anahtar kelimeleri pazarlama ekibiyle birlikte belirleyin."
+ },
+ {
+  "id": 14,
+  "sev": "y",
+  "dep": [
+   "paz"
+  ],
+  "t": "İki Türkçe blog sayfası tamamen İngilizce yayında",
+  "what": "<code>lang=\"tr\"</code> işaretli sayfalarda başlık, gövde ve meta veri İngilizce. Türkçe okuyucu için sayfa kullanılamaz; arama motoru için de dil sinyali ile içerik çelişiyor.",
+  "ev": [
+   "/tr/icerik-merkezi/blog/the-importance-of-ai-in-improving-customer-experience — H1: “The Importance of AI in Improving Customer Experience”",
+   "/tr/icerik-merkezi/blog/how-agentic-bss-and-digital-twin-are-reshaping-telecom-operations — H1 İngilizce, üstelik &lt;title&gt; sadece “ETIYA”",
+   "/tr/icerik-merkezi/blog/powering-next-level-cx-with-digital-twins — içerik Türkçe ama slug İngilizce",
+   "/en/content-hub/webinar/cloud-native-approach-in-customer-experience — İngilizce sayfada Türkçe başlıklar (“Benzersiz Olun”, “Viral Olun”)"
+  ],
+  "fix": "İki sayfayı çevirin, slug'ları Türkçeleştirip eskisinden 301 verin. Yayın öncesi her dil sürümünün dil kontrolünden geçtiği bir kabul adımı ekleyin."
+ },
+ {
+  "id": 15,
+  "sev": "y",
+  "dep": [
+   "tek",
+   "paz"
+  ],
+  "t": "Dört sayfaya sitede hiçbir yerden bağlantı yok (orphan)",
+  "what": "Bu sayfalar yayında ve 200 dönüyor, ancak 279 sayfanın tamamı tarandığında onlara giden <strong>tek bir bağlantı bile</strong> bulunamadı — ne menüde, ne footer'da, ne gövde içinde. Yalnızca sitemap.xml üzerinden erişilebiliyorlar. Kullanıcı gezinerek bulamıyor, Google da iç bağlantı sinyali olmadığı için düşük değerli sayıyor. Türkçe menüde karşılık gelen bağlantılar doğru çalıştığına göre, İngilizce tarafta menü güncellemesi atlanmış (bkz. 3).",
+  "ev": [
+   "/en/content-hub/success-stories — gelen bağlantı: 0 (bu, 1 numaralı bulgudaki lorem ipsum içeren sayfa)",
+   "/en/our-awards — gelen bağlantı: 0 (ana sayfada “Recognized Across the Industry” bölümü olmasına rağmen)",
+   "/tr/odullerimiz — gelen bağlantı: 0",
+   "/tr/alternatif — gelen bağlantı: 0 (4 numaralı bulgudaki taslak sayfa)",
+   "Karşılaştırma: TR menüsündeki /tr/icerik-merkezi/basari-hikayesi → 200, sorunsuz bağlı"
+  ],
+  "fix": "Ödüller ve Başarı Hikayeleri sayfalarını menüye ya da ilgili sayfalardan gövde bağlantılarıyla site yapısına dahil edin — aksi halde yayına alınmalarının bir anlamı yok. Yayın öncesi kontrol listesine “sitemap'te olup hiçbir yerden linklenmeyen sayfa” taraması ekleyin."
+ },
+ {
+  "id": 16,
+  "sev": "y",
+  "dep": [
+   "tek"
+  ],
+  "t": "Görsellerin yarısında alt metni yok",
+  "what": "4.137 görselin 2.080'inde alt metni boş. Bu hem WCAG 2.1 A seviyesi (1.1.1) ihlali hem de görsel aramada kayıp. Kurumsal erişilebilirlik taahhüdü olan bir şirket için denetimde ilk çıkacak madde.",
+  "ev": [
+   "Toplam: 2.080 / 4.137 görsel alt metinsiz (%50,3)",
+   "/en/our-company/career ve /tr/sirketimiz/kariyer: 22/37",
+   "/en/solutions/autonomize-orchestrate-operations: 22/26",
+   "/en/solutions/drive-ai-powered-growth: 22/26",
+   "/en (ana sayfa): 20/81",
+   "/en/sustainability: 14/41"
+  ],
+  "fix": "CMS'te medya yüklerken alt metnini zorunlu alan yapın. Dekoratif görsellere <code>alt=\"\"</code> verin (boş bırakmak değil, açıkça boş atamak). Mevcut 2.080 görsel için öncelik sırası: ana sayfa → çözüm → ürün → içerik."
+ },
+ {
+  "id": 17,
+  "sev": "y",
+  "dep": [
+   "tek"
+  ],
+  "t": "Ana sayfa 22,7 MB — videolar önbelleğe alınmıyor",
+  "what": "Tek bir ana sayfa ziyareti 250 istek ve 22,7 MB indiriyor; bunun 16 MB'ı video. Sunucu <code>cache-control</code> başlığı göndermediği için aynı hero videosu tek oturumda 10'dan fazla kez yeniden indiriliyor. Mobil veri üzerinden gelen bir ziyaretçi için bu ciddi bir maliyet ve LCP kaybı.",
+  "ev": [
+   "Toplam transfer: 22.693 KB / 250 istek",
+   "Video: 16.006 KB (3LayerContinuousGrowth_Lights_Animation-1.mp4 tek başına 1 MB)",
+   "Hero_Animation_02/03_200kb-2.mp4 aynı oturumda 10+ kez indirilmiş",
+   "cache-control yanıt başlığı: yok",
+   "81 görselin sadece 13'ü lazy-load; 45 PNG'ye karşılık 8 WebP"
+  ],
+  "fix": "Statik medyaya uzun ömürlü <code>Cache-Control: public, max-age=31536000, immutable</code> verin. Videolara poster görseli ekleyip <code>preload=\"none\"</code> yapın, mobilde videoyu tamamen devre dışı bırakın. PNG'leri WebP/AVIF'e çevirin."
+ },
+ {
+  "id": 18,
+  "sev": "o",
+  "dep": [
+   "tek",
+   "paz"
+  ],
+  "t": "Sayfa içi geçişlerde 404’ler 200 olarak raporlanıyor",
+  "what": "Site iki katmanlı çalışıyor ve bu iki katman aynı adres için farklı cevap veriyor. Adresi tarayıcıya doğrudan yazdığınızda ya da arama motoru istediğinde sunucu dürüstçe <strong>404</strong> dönüyor. Ancak kullanıcı menüden tıklayıp sayfa içi geçişle gittiğinde uygulama <code>/_serverFn/…</code> veri isteği yapıyor ve bu istek <strong>HTTP 200</strong> dönüyor; ekranda ise “We couldn’t find that page.” yazıyor. Yani gerçek kullanım senaryosunda durum kodu ile içerik çelişiyor. Arama motoru açısından zarar yok — Google ilk belge yanıtını, yani 404’ü görüyor. Asıl sorun görünürlükte: izleme araçları, hata takibi ve (çalışır hale geldiğinde) GA4 bu tıklamaları başarılı sayfa görüntüleme olarak kaydedecek. Ekip, kullanıcıların kırık bağlantılara kaç kez düştüğünü hiçbir raporda göremeyecek.",
+  "ev": [
+   "/en/content-hub/success-story — doğrudan istek: 404 · menüden tıklama: /_serverFn isteği 200, ekranda “We couldn’t find that page.”",
+   "/en/content-hub/e-book — aynı davranış, tekrarlanabilir şekilde doğrulandı",
+   "RSC/veri varyantları doğrudan istendiğinde (?_rsc=1, .data) 404 dönüyor — sorun yalnızca uygulama içi geçiş yolunda",
+   "Sonuç: SEO tarafı doğru kurgulanmış, ölçüm ve izleme tarafı kör",
+   "Bu davranış 3 numaralı bulgudaki 632 kırık bağlantının tamamını etkiliyor — menü bağlantıları zaten sayfa içi geçişle çalışıyor"
+  ],
+  "fix": "Veri katmanının bulunamayan rotalar için 404 dönmesini sağlayın; en azından yanıtta açık bir <code>notFound</code> bayrağı taşısın. Uygulama 404 ekranını gösterdiğinde GA4’e ayrı bir olay (ör. <code>page_not_found</code>) ve yönlendiren sayfanın adresi gönderilsin — böylece hangi kırık bağlantıya kaç kez tıklandığı ölçülebilir ve bir daha bu tür hatalar aylarca fark edilmeden kalmaz."
+ },
+ {
+  "id": 19,
+  "sev": "o",
+  "dep": [
+   "paz",
+   "tek"
+  ],
+  "t": "Title şablonunda çift marka eki",
+  "what": "Sayfa başlıkları “… | Etiya” ile bitiyor, sonra şablon bir kez daha “| ETIYA” ekliyor. Sonuç: her başlıkta 8 karakterlik gereksiz tekrar ve ~100 sayfada Google'ın kesme sınırının aşılması.",
+  "ev": [
+   "“Book a Demo | AI-Native Business Platforms | Etiya | ETIYA”",
+   "“Who We Are | AI-Native Platforms for Intelligent Growth | ETIYA”",
+   "65+ karakter: ~100 sayfa; en uzunu 113 karakter (/en/content-hub/pressroom/etiya-achieves-34-operational-efficiency…)",
+   "Ayrıca ayırıcı hatası: “Smarter CX for Telecom I Etiya” — dikey çizgi yerine büyük İ harfi"
+  ],
+  "fix": "Şablondaki otomatik son eki tek bir yerde bırakın ve CMS'te girilen başlıklardan marka adını kaldırın. Başlık alanına 60 karakter uyarısı ekleyin."
+ },
+ {
+  "id": 20,
+  "sev": "o",
+  "dep": [
+   "paz",
+   "tek"
+  ],
+  "t": "Kopya içerik: aynı konuda iki ayrı sayfa",
+  "what": "Birbirinin neredeyse aynısı içerikler farklı URL'lerde yayında. Google hangisinin asıl olduğuna kendi karar verir ve ikisinin de sıralaması düşer.",
+  "ev": [
+   "/en/content-hub/webinar/future-bss-building-new-customer-focused ile /en/content-hub/report/future-bss-building-new-customer-focused-strategies — birebir aynı title",
+   "/en/content-hub/blog/the-importance-of-ai-in-improving-customer-experience ile /…/the-importance-of-ai-in-improving-cx — aynı konu, iki URL",
+   "/en/content-hub/interview/a-new-chapter-with-new-opportunities-in-digital-transformation ile /…/a-new-chapter-in-digital-transformation",
+   "/en/content-hub/blog/the-experience-driven-economy… ile /…/agents-of-change-the-twin-led-transformation… — aynı meta description"
+  ],
+  "fix": "Her çift için birini asıl seçip diğerinden 301 verin ya da içerikleri belirgin biçimde farklılaştırın. Meta description'ları sayfaya özgü hale getirin."
+ },
+ {
+  "id": 21,
+  "sev": "o",
+  "dep": [
+   "tek"
+  ],
+  "t": "Arama ve filtre sayfaları indekslenmeye açık",
+  "what": "Site içi arama sayfaları ve içerik listelerinin filtreli sürümleri indekslenirse düşük değerli, birbirinin kopyası çok sayıda sayfa oluşur ve tarama bütçesi boşa gider. Ayrıca bu sayfalarda H1 ve özgün açıklama da yok.",
+  "ev": [
+   "/en/search ve /tr/arama — sitemap'te listeli, noindex yok, H1 yok, meta description 404 metni",
+   "İçerik merkezi kategori sayfaları (/en/content-hub/blog, /podcast, /report vb.) sitemap dışı ama taranabilir"
+  ],
+  "fix": "Arama sayfalarına <code>noindex, follow</code> verin ve sitemap'ten çıkarın. Kategori sayfalarını ise özgün açıklama ve H1 ile indekslenebilir bırakın."
+ },
+ {
+  "id": 22,
+  "sev": "o",
+  "dep": [
+   "tek"
+  ],
+  "t": "İki sayfada hreflang kendine referans vermiyor",
+  "what": "Yasal ana sayfaları kendi URL'leri yerine gizlilik sayfasını gösteriyor. hreflang kümesinin geçerli olması için her sayfanın kendini de listelemesi gerekir; aksi halde Google kümenin tamamını yok sayabilir.",
+  "ev": [
+   "/en/legal → en: /en/legal/privacy, tr: /tr/yasal/gizlilik, x-default: /en/legal/privacy",
+   "/tr/yasal → aynı hatalı küme",
+   "Kalan 277 sayfada hreflang doğru"
+  ],
+  "fix": "Bu iki sayfada hreflang kümesini kendi URL'leriyle düzeltin."
+ },
+ {
+  "id": 23,
+  "sev": "o",
+  "dep": [
+   "tek",
+   "paz"
+  ],
+  "t": "Eski siteye giden bağlantılar",
+  "what": "Blog içeriklerinde eski site yapısına ait bağlantılar kalmış. Biri şifresiz HTTP üzerinden; diğerleri artık var olmayan <code>/en/insight/</code> ve <code>/en/solutions/digital-business-platforms</code> yollarına gidiyor.",
+  "ev": [
+   "/en/content-hub/blog/redefining-the-telco-sales-experience… → http://www.etiya.com/ (HTTP)",
+   "… → https://www.etiya.com/en/insight/recognized-in-the-2025-gartner-magic-quadrant… (yeni yapıda /content-hub)",
+   "… → https://www.etiya.com/en/insight/sales-enablement-for-process-excellence…",
+   "/en/content-hub/blog/building-better-customer-bonds → https://www.etiya.com/en/solutions/digital-business-platforms"
+  ],
+  "fix": "Bu bağlantıları yeni içerik merkezi URL'lerine güncelleyin ve göreli yol kullanın. Eski yapı için kapsamlı bir 301 haritası hazırlanmalı."
+ },
+ {
+  "id": 24,
+  "sev": "o",
+  "dep": [
+   "paz"
+  ],
+  "t": "URL'de yazım hatası: “expnsion”",
+  "what": "Basın odası sayfasının kalıcı adresinde harf eksik. Bu URL basın bültenlerinde ve dış kaynaklarda paylaşıldığında hata görünür ve sonradan düzeltmek 301 gerektirir — şimdi düzeltmek bedava.",
+  "ev": [
+   "/en/content-hub/pressroom/etiya-accelerates-global-expnsion (doğrusu: expansion)"
+  ],
+  "fix": "Slug'ı düzeltin. Yayın öncesi olduğu için yönlendirme bile gerekmez."
+ },
+ {
+  "id": 25,
+  "sev": "o",
+  "dep": [
+   "paz"
+  ],
+  "t": "TR ve EN içerik envanteri eşit değil",
+  "what": "İki dil arasında sayfa sayıları birebir örtüşmüyor. Dil değiştiren kullanıcı bazı içeriklerde 404'e veya taslak sayfaya düşüyor.",
+  "ev": [
+   "Rapor: EN 6, TR 5 — bir rapor Türkçeye çevrilmemiş",
+   "EN'de /en/content-hub/success-stories liste sayfası var; TR karşılığı taslak /tr/alternatif",
+   "Toplam: 140 EN sayfaya karşılık 139 TR sayfa"
+  ],
+  "fix": "Eksik çeviriyi tamamlayın. Çevirisi olmayan içerikler için dil değiştirme davranışını belirleyin (ilgili liste sayfasına düşür ya da bilgilendirme göster)."
+ },
+ {
+  "id": 26,
+  "sev": "o",
+  "dep": [
+   "paz"
+  ],
+  "t": "İngilizce sayfalarda Türkçe yüzde formatı",
+  "what": "İngilizce sayfalarda sayılar <code>%100</code> şeklinde yazılmış; İngilizcede doğrusu <code>100%</code>. Ana sayfadaki en görünür iki istatistik dahil. Uluslararası bir müşteriye ilk bakışta çeviri kalitesi sorunu sinyali verir.",
+  "ev": [
+   "/en (ana sayfa): %100 Digital Experience, %90 Reduction in CSR Intervention",
+   "/en/content-hub/success-stories: %18, %37",
+   "/en/our-company/who-we-are: %40",
+   "/en/sustainability: %40, %6, %37, %44"
+  ],
+  "fix": "İngilizce içerikte yüzde biçimini <code>100%</code> olarak düzeltin. İstatistik bileşenine dil bazlı biçimlendirme ekleyin ki içerik editörünün formatı elle yazması gerekmesin."
+ },
+ {
+  "id": 27,
+  "sev": "o",
+  "dep": [
+   "paz"
+  ],
+  "t": "Kullanıcıya iç kullanım talimatı gösteriliyor",
+  "what": "Ödüller sayfasının açıklama metninde arayüz kullanım talimatı yer alıyor. Bu tür metinler tasarım notu olarak kalmış olup son kullanıcıya gösterilmemeli — iyi tasarlanmış bir kart zaten kendini anlatır.",
+  "ev": [
+   "/en/our-awards: “We shape the future with awards earned worldwide. Use the \"+\" icon in the upper-right corner of each card to open the details.”"
+  ],
+  "fix": "Talimat cümlesini kaldırın; “+” ikonuna anlamlı bir aria-label ekleyin (ör. “Ödül detaylarını göster”)."
+ },
+ {
+  "id": 28,
+  "sev": "o",
+  "dep": [
+   "paz"
+  ],
+  "t": "Kariyer sayfası başlığında kelime tekrarı",
+  "what": "Marka mottosu (“Exceed Everyday”) cümleye ikinci kez sızmış ve başlık kulağa hatalı geliyor. Kariyer sayfası aday deneyiminin ilk temas noktası.",
+  "ev": [
+   "/en/our-company/career → H1: “Exceed Everyday in Your Career Everyday With Us”"
+  ],
+  "fix": "Örnek: “Exceed Everyday in Your Career With Us” ya da “Build Your Career with Etiya”."
+ },
+ {
+  "id": 29,
+  "sev": "o",
+  "dep": [
+   "paz"
+  ],
+  "t": "Sürdürülebilirlik raporu indirme bağlantısı boş",
+  "what": "Kullanıcıyı indirmeye davet eden bir CTA'nın <code>href</code> değeri sadece <code>https://</code>. Tıklayan hiçbir yere gitmez — üstelik bu, indirilebilir içerik yoluyla potansiyel müşteri toplama noktalarından biri.",
+  "ev": [
+   "/tr/icerik-merkezi/rapor/etiya-da-surdurulebilirlik-daha-iyi-bir-gelecege-yon-veren-adimlar → “Etiya'nın 2023 Sürdürülebilirlik Raporu'nu indirmek için tıklayın” href=\"https://\""
+  ],
+  "fix": "Bağlantıyı sitedeki PDF'e yönlendirin — <code>/api/media/file/ETIYA-SUSTAINABILITY-REPORT.pdf</code> zaten mevcut."
+ },
+ {
+  "id": 30,
+  "sev": "o",
+  "dep": [
+   "paz"
+  ],
+  "t": "İletişim formunda 10 zorunlu alan",
+  "what": "Ad, soyad, e-posta, telefon, ülke, sektör, şirket, ünvan, talep tipi, mesaj ve onay — hepsi zorunlu. B2B'de telefon numarası zorunluluğu tek başına form tamamlama oranını belirgin düşüren bir faktör. Demo talep formunda da aynı yapı var, üstelik bir alan daha ekli.",
+  "ev": [
+   "/en/our-company/contact-us: firstName*, lastName*, email*, phone*, country_region*, industrysector*, company*, jobtitle*, purpose_of_inquiry*, message*, terms*",
+   "/en/book-a-demo: yukarıdakilere ek olarak select_your_need*"
+  ],
+  "fix": "Zorunlu alanları ad, soyad, iş e-postası, şirket ve mesaj ile sınırlayın; telefon, ünvan ve sektörü isteğe bağlı yapın. Kalan bilgiyi satış ekibi ilk temasta toplayabilir. A/B testiyle ölçmeye değer."
+ },
+ {
+  "id": 31,
+  "sev": "o",
+  "dep": [
+   "tek"
+  ],
+  "t": "Form alanlarında görünür etiket yok",
+  "what": "Alanlar yalnızca placeholder ve aria-label ile tanımlanmış; görünür <code>&lt;label&gt;</code> yok. Kullanıcı yazmaya başlayınca alanın ne olduğu ekrandan kayboluyor — özellikle uzun formlarda hata oranını artırır. WCAG 3.3.2 kapsamında.",
+  "ev": [
+   "11 form alanının 10'unda labels.length = 0",
+   "Sadece onay kutusunda gerçek label var",
+   "Tanımlama yalnızca placeholder + aria-label ile yapılmış"
+  ],
+  "fix": "Floating label kullanın: alan boşken placeholder gibi görünüp, yazmaya başlayınca yukarı çıkan görünür bir etiket. Hem erişilebilirlik hem kullanılabilirlik açısından çözer."
+ },
+ {
+  "id": 32,
+  "sev": "o",
+  "dep": [
+   "tek"
+  ],
+  "t": "Başlık hiyerarşisi tutarsız",
+  "what": "6 sayfada hiç H1 yok — bu sayfalarda görsel olarak başlık gibi duran metinler aslında düz div. 16 sayfada birden fazla H1 var (bir Türkçe blogda 8 adet). Ayrıca H1'den H3'e, H2'den H4'e atlamalar yaygın. Ekran okuyucular sayfayı gezinilemez hale getirir.",
+  "ev": [
+   "H1 yok: /en/search, /en/our-awards, /en/content-hub/success-stories, /tr/arama, /tr/odullerimiz, /tr/alternatif",
+   "Çoklu H1: /en (2), /en/our-company/who-we-are (3), /en/sustainability (3), /tr/icerik-merkezi/blog/agentic-ai-ve-digital-twin… (8)",
+   "Atlama örnekleri: /en → 1→3, 2→4 · /en/content-hub → 1→4 · /en/our-company/career → 2→4, 2→5",
+   "/en/portfolio/products/agentic-ai sayfası H3 ile başlıyor, H1 ondan sonra geliyor"
+  ],
+  "fix": "Her sayfada tam bir H1 kuralı koyun ve bileşenlerdeki başlık seviyelerini içerik sırasına göre düzeltin. Bunu bileşen kütüphanesi seviyesinde çözmek tek tek sayfa düzeltmekten hızlı olur."
+ },
+ {
+  "id": 33,
+  "sev": "o",
+  "dep": [
+   "tek"
+  ],
+  "t": "320 px genişlikte yatay taşma (küçük telefonlar)",
+  "what": "Site 360 px ve üzerinde temiz davranıyor, ancak 320 px'te iki yerde içerik ekrandan taşıyor ve yatay kaydırma çubuğu çıkıyor. WCAG 1.4.10 (Reflow, AA) 320 px CSS genişliğinde yatay kaydırma olmamasını şart koşuyor. Etkilenen cihazlar: iPhone SE (1. nesil), Galaxy Fold kapalı ekran ve tarayıcıda %200 yakınlaştırma yapan kullanıcılar — yani erişilebilirlik için ekranı büyüten ziyaretçiler.",
+  "ev": [
+   "/tr/cozumler/musteri-yonetimi-operasyonlarini-sadelestirin — 39 px taşma, 10 öğe. Bir bölüm 343 px'e sabitlenmiş: başlık, paragraf ve “Daha Fazlasını Keşfedin” butonu sağdan kesiliyor. İngilizce karşılığı (/en/solutions/simplify-bss-operations) temiz — sorun yalnızca TR tarafında.",
+   "/en ve /tr ana sayfa — 7 px taşma. Hero karuselinin ilerleme çubuğu <code>w-[70vw]</code> ile birlikte sabit <code>mr-8</code> boşluk kullanıyor; ikisi toplandığında 320 px'i aşıyor.",
+   "Kontrol edilen diğer sayfalar 320 px'te temiz: iletişim, gizlilik, diğer 4 çözüm sayfası, FlowE ürün sayfası",
+   "360 / 390 / 768 / 1024 px'te hiçbir sayfada taşma yok"
+  ],
+  "fix": "TR çözüm sayfasındaki sabit genişlikli bölümü akışkan hale getirin (<code>max-width:100%</code>). Hero ilerleme çubuğunda <code>w-[70vw]</code> + <code>mr-8</code> kombinasyonunu <code>flex-1</code> ile değiştirin. Yayın öncesi kontrol listesine 320 px testi ekleyin."
+ },
+ {
+  "id": 34,
+  "sev": "o",
+  "dep": [
+   "tek"
+  ],
+  "t": "Karusel noktaları 6–8 px — dokunma hedefi çok küçük",
+  "what": "Swiper karusellerinin sayfalama noktaları 6×6 ile 8×8 piksel arasında. WCAG 2.2'nin 2.5.8 (Target Size Minimum, AA) kriteri 24×24 px şart koşuyor; Google'ın mobil kullanılabilirlik önerisi 48 px. Kaydırma hareketi çalıştığı için karusel tamamen kullanılamaz değil, ancak belirli bir slayda gitmek isteyen kullanıcı için pratikte imkânsız. Kariyer sayfasında bu noktalardan 5 ayrı karuselde toplam 33 adet var.",
+  "ev": [
+   "/en/our-company/career @360 px — “Go to slide 1…9” butonları 6×6 px, 5 karusel, toplam 33 adet",
+   "/en ana sayfa @390 px — “Launch a Digital Brand” bölümünde 8×8 ve 7×7 px",
+   "/en/portfolio/products/agentic-ai, /tr/portfolyo/urunler/musteri-iliskileri-yonetimi — aynı kalıp",
+   "Breadcrumb (“Home” 39×17) ve footer bağlantıları (“Legal” 35×20) da 24 px eşiğinin altında",
+   "Karşılaştırma: mobil menü öğeleri 52 px, form alanları 48–50 px, hamburger 40×48 — bunlar sorunsuz"
+  ],
+  "fix": "Noktaların görsel boyutunu değiştirmeden dokunma alanını büyütün: butona şeffaf <code>padding</code> verip nokta görselini iç içe bir öğe olarak çizin (görsel 8 px kalır, tıklanabilir alan 24–44 px olur). Breadcrumb ve footer bağlantılarına dikey padding ekleyin."
+ },
+ {
+  "id": 35,
+  "sev": "o",
+  "dep": [
+   "tek"
+  ],
+  "t": "Görseller optimize edilmemiş",
+  "what": "Modern format kullanımı düşük, lazy-load neredeyse hiç yok ve bazı görseller gösterildikleri boyutun 15 katı çözünürlükte indiriliyor.",
+  "ev": [
+   "Ana sayfa: 45 PNG'ye karşılık yalnızca 8 WebP",
+   "81 görselin sadece 13'ü loading=\"lazy\"",
+   "Piori Bonin.jpeg: 800 px indiriliyor, 48 px alanda gösteriliyor",
+   "Fizz.png: 165 px indiriliyor, 47 px'de gösteriliyor",
+   "Dosya adında yazım hatası: “Piori Bonin.jpeg” (doğrusu Pierre)"
+  ],
+  "fix": "Medya API'sinde otomatik WebP/AVIF dönüşümü ve <code>srcset</code> ile boyut varyantları üretin. İlk ekran dışındaki tüm görsellere lazy-load verin."
+ },
+ {
+  "id": 36,
+  "sev": "d",
+  "dep": [
+   "tek"
+  ],
+  "t": "Form input'larında “undefined” CSS sınıfı",
+  "what": "Koşullu sınıf ataması boş kaldığında React <code>class</code> değerine literal “undefined” yazıyor. Şu an görsel bir etkisi yok ama ileride aynı adda bir sınıf tanımlanırsa beklenmedik stil hatası doğurur.",
+  "ev": [
+   "48 sayfada: class=\"… transition-all  undefined focus:ring-2 …\"",
+   "Etkilenen: tüm form içeren sayfalar (iletişim, demo, iş ortaklığı)"
+  ],
+  "fix": "Sınıf birleştirmede <code>clsx</code> / <code>classnames</code> gibi bir yardımcı kullanın ya da tanımsız değeri boş dizeye düşürün."
+ },
+ {
+  "id": 37,
+  "sev": "d",
+  "dep": [
+   "tek"
+  ],
+  "t": "X-Frame-Options başlığı yok",
+  "what": "CSP'deki <code>frame-ancestors</code> direktifi modern tarayıcılarda bu korumayı zaten sağlıyor, dolayısıyla gerçek risk düşük. Yine de bazı güvenlik denetim araçları eski başlığın yokluğunu bulgu olarak raporlar.",
+  "ev": [
+   "X-Frame-Options: tanımsız",
+   "CSP frame-ancestors: 'self' https://int-web-test.etiya.com (korumayı sağlıyor)"
+  ],
+  "fix": "Denetim raporlarını temiz tutmak için <code>X-Frame-Options: SAMEORIGIN</code> ekleyin."
+ },
+ {
+  "id": 38,
+  "sev": "d",
+  "dep": [
+   "tek"
+  ],
+  "t": "Bazı dış bağlantılarda rel=\"noopener\" eksik",
+  "what": "Yeni sekmede açılan dış bağlantılarda <code>rel=\"noopener\"</code> bulunmuyor. Güncel tarayıcılar bunu varsayılan olarak uyguladığı için pratik risk düşük.",
+  "ev": [
+   "developingtelecoms.com, youtu.be, linkedin.com, youtube.com bağlantıları target=\"_blank\" + rel yok"
+  ],
+  "fix": "Dış bağlantı bileşenine <code>rel=\"noopener noreferrer\"</code> ekleyin."
+ },
+ {
+  "id": 39,
+  "sev": "d",
+  "dep": [
+   "paz"
+  ],
+  "t": "Sosyal medya bağlantıları tutarsız",
+  "what": "Aynı hesaplara farklı biçimlerde bağlanılıyor. İşlevsel bir sorun değil ama gereksiz yönlendirme adımı ekliyor ve X/Twitter geçişinin sitede tamamlanmadığını gösteriyor.",
+  "ev": [
+   "linkedin.com/company/etiya ve www.linkedin.com/company/etiya (iki farklı biçim)",
+   "twitter.com/etiya ve x.com/etiya birlikte kullanılıyor"
+  ],
+  "fix": "Tek bir kanonik biçim belirleyip footer ve iletişim sayfası bileşeninde standartlaştırın."
+ }
+];
+
+const SEV={k:["Yayın engeli","t-k"],y:["Yüksek","t-y"],o:["Orta","t-o"],d:["Düşük","t-d"]};
+const DEP={tek:"Teknik",paz:"Pazarlama"};
+const st={sev:"all",dep:"all"};
+
+function render(){
+  const el=document.getElementById('list');
+  const rows=D.filter(d=>(st.sev==="all"||d.sev===st.sev)&&(st.dep==="all"||d.dep.includes(st.dep)));
+  document.getElementById('empty').style.display=rows.length?'none':'block';
+  el.innerHTML=rows.map(d=>`
+    <div class="item ${d.sev}" data-id="${d.id}">
+      <div class="hd">
+        <span class="id">${String(d.id).padStart(2,'0')}</span>
+        <span class="ttl">${d.t}</span>
+        <span class="tags">
+          <span class="tag ${SEV[d.sev][1]}">${SEV[d.sev][0]}</span>
+          ${d.dep.map(x=>`<span class="tag t-dep">${DEP[x]}</span>`).join('')}
+        </span>
+        <span class="arw">&#9654;</span>
+      </div>
+      <div class="bd">
+        <h4>Sorun</h4><p>${d.what}</p>
+        <h4>Kanıt</h4><ul class="ev">${d.ev.map(e=>`<li>${e}</li>`).join('')}</ul>
+        <div class="fix"><h4>Öneri</h4><p>${d.fix}</p></div>
+      </div>
+    </div>`).join('');
+  el.querySelectorAll('.hd').forEach(h=>h.onclick=()=>h.parentElement.classList.toggle('open'));
+}
+
+document.querySelectorAll('button.f[data-g]').forEach(b=>{
+  b.onclick=()=>{
+    const g=b.dataset.g;
+    document.querySelectorAll(`button.f[data-g="${g}"]`).forEach(x=>x.classList.remove('on'));
+    b.classList.add('on'); st[g]=b.dataset.v; render();
+  };
+});
+let open=false;
+document.getElementById('exp').onclick=function(){
+  open=!open;
+  document.querySelectorAll('.item').forEach(i=>i.classList.toggle('open',open));
+  this.textContent=open?'Hepsini kapat':'Hepsini aç';
+  this.classList.toggle('on',open);
+};
+render();
+</script>
+</body>
+</html>

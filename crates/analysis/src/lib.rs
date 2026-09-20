@@ -78,6 +78,20 @@ pub fn analyze_records(records: &[CrawlRecord], thresholds: &AuditThresholds) ->
                 ),
             ));
         }
+        if let Some(targets) = &record.amphtml_targets
+            && targets.len() > 1
+        {
+            issues.push(issue(
+                "amp.multiple_targets",
+                IssueView::AmpMultipleTargets,
+                Severity::Info,
+                record,
+                format!(
+                    "Multiple captured AMP declarations: {} targets",
+                    targets.len()
+                ),
+            ));
+        }
         image_issues(record, &mut issues);
         content_issues(record, thresholds, &mut issues);
         mobile_issues(record, &mut issues);
@@ -450,6 +464,15 @@ fn reference_target_issues(
 ) {
     for (matches, rule, label, view, target, targets, severity) in [
         (
+            diagnostic.pagination_canonical_to_linked_page,
+            "pagination.canonical_to_linked_page",
+            "Captured canonical resolves to a different observed HTML page linked by a captured next or previous declaration",
+            IssueView::PaginationCanonicalToLinkedPage,
+            &record.canonical,
+            None,
+            Severity::Warning,
+        ),
+        (
             diagnostic.pagination_next_to_error,
             "pagination.next_to_error",
             "Pagination next target has a response or fetch error",
@@ -473,7 +496,7 @@ fn reference_target_issues(
             "AMP target has a response or fetch error",
             IssueView::AmpToError,
             &record.amphtml,
-            None,
+            record.amphtml_targets.as_ref(),
             Severity::Error,
         ),
         (
@@ -482,7 +505,16 @@ fn reference_target_issues(
             "Observed AMP target does not canonically return to the declaring page",
             IssueView::AmpNonReciprocal,
             &record.amphtml,
-            None,
+            record.amphtml_targets.as_ref(),
+            Severity::Warning,
+        ),
+        (
+            diagnostic.amp_target_missing_marker,
+            "amp.target_missing_marker",
+            "Observed complete HTML target lacks an amp/⚡ attribute on its original HTML element; this is necessary marker evidence, not full AMP validation",
+            IssueView::AmpTargetMissingMarker,
+            &record.amphtml,
+            record.amphtml_targets.as_ref(),
             Severity::Warning,
         ),
         (
@@ -751,6 +783,15 @@ fn structured_data_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
 }
 
 fn html_validation_issues(record: &CrawlRecord, issues: &mut Vec<Issue>) {
+    if record.html_doctype == Some(false) {
+        issues.push(issue(
+            "html.missing_doctype",
+            IssueView::HtmlMissingDoctype,
+            Severity::Warning,
+            record,
+            "No HTML doctype was observed in the original HTTP HTML".into(),
+        ));
+    }
     if record.deprecated_html_tag_count > 0 {
         issues.push(issue(
             "html.deprecated_tags",
@@ -929,6 +970,42 @@ mod tests {
     }
 
     #[test]
+    fn amp_target_missing_marker_warns_only_on_measured_absence_without_claiming_validation() {
+        let mut source = CrawlRecord::pending("https://example.test/source".into(), 0);
+        source.status_code = Some(200);
+        source.content_type = Some("text/html".into());
+        source.amphtml = Some("https://example.test/healthy".into());
+        source.amphtml_targets = Some(vec![
+            source.amphtml.clone().unwrap(),
+            "https://example.test/later".into(),
+        ]);
+        let mut target = CrawlRecord::pending("https://example.test/later".into(), 0);
+        target.status_code = Some(200);
+        target.content_type = Some("text/html".into());
+        for (marker, expected) in [(Some(false), 1), (Some(true), 0), (None, 0)] {
+            target.amp_document = marker;
+            let warnings = analyze_records(
+                &[source.clone(), target.clone()],
+                &AuditThresholds::default(),
+            )
+            .into_iter()
+            .filter(|issue| issue.rule_id == "amp.target_missing_marker")
+            .collect::<Vec<_>>();
+            assert_eq!(warnings.len(), expected);
+            if let Some(warning) = warnings.first() {
+                assert_eq!(format!("{:?}", warning.view), "AmpTargetMissingMarker");
+                assert_eq!(warning.severity, Severity::Warning);
+                assert_eq!(warning.url, source.url);
+                assert!(warning.message.contains("original HTML"));
+                assert!(warning.message.contains("amp") && warning.message.contains('⚡'));
+                assert!(warning.message.contains("not full AMP validation"));
+                assert!(warning.message.contains("2 captured targets"));
+                assert!(!warning.message.contains("https://example.test/healthy"));
+            }
+        }
+    }
+
+    #[test]
     fn amp_reciprocity_emits_a_warning_only_for_measured_missing_return() {
         let mut source = CrawlRecord::pending("https://example.test/source".into(), 0);
         source.status_code = Some(200);
@@ -960,6 +1037,37 @@ mod tests {
         target.status_code = Some(404);
         target.canonical = None;
         assert!(warnings(target).is_empty());
+    }
+
+    #[test]
+    fn amp_multiple_declarations_report_later_errors_without_blaming_first_target() {
+        let mut source = CrawlRecord::pending("https://example.test/source".into(), 0);
+        source.status_code = Some(200);
+        source.content_type = Some("text/html".into());
+        source.amphtml = Some("https://example.test/healthy".into());
+        source.amphtml_targets = Some(vec![
+            source.amphtml.clone().unwrap(),
+            "https://example.test/broken".into(),
+        ]);
+        let mut broken = CrawlRecord::pending("https://example.test/broken".into(), 0);
+        broken.status_code = Some(404);
+        let mut incomplete = source.clone();
+        incomplete.url = "https://example.test/incomplete".into();
+        incomplete.indexability_status = "Response body incomplete".into();
+        let issues = analyze_records(&[source, broken, incomplete], &AuditThresholds::default());
+        let multiple: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.rule_id == "amp.multiple_targets")
+            .collect();
+        assert_eq!(multiple.len(), 1);
+        assert_eq!(multiple[0].view, IssueView::AmpMultipleTargets);
+        assert_eq!(multiple[0].severity, Severity::Info);
+        let error = issues
+            .iter()
+            .find(|issue| issue.rule_id == "amp.to_error")
+            .unwrap();
+        assert!(error.message.contains("2 captured targets"));
+        assert!(!error.message.contains("https://example.test/healthy"));
     }
 
     #[test]
@@ -1090,6 +1198,79 @@ mod tests {
                 &row.rel_prev
             };
             assert!(issue.message.contains(target.as_deref().unwrap()));
+        }
+    }
+
+    #[test]
+    fn pagination_canonical_advisory_exposes_canonical_and_declared_relation_evidence() {
+        let mut source = CrawlRecord::pending("https://example.test/page-2".into(), 0);
+        source.status_code = Some(200);
+        source.content_type = Some("text/html".into());
+        source.canonical = Some("https://example.test/page-1#canonical".into());
+        source.rel_prev_targets = Some(vec![
+            "https://example.test/other".into(),
+            "https://example.test/page-1#previous".into(),
+        ]);
+        let mut target = CrawlRecord::pending("https://example.test/page-1".into(), 0);
+        target.status_code = Some(200);
+        target.content_type = Some("text/html".into());
+        let mut self_canonical = source.clone();
+        self_canonical.url = "https://example.test/self".into();
+        self_canonical.final_url = self_canonical.url.clone();
+        self_canonical.canonical = Some(self_canonical.url.clone());
+        let issues = analyze_records(
+            &[source.clone(), target, self_canonical],
+            &AuditThresholds::default(),
+        );
+        let warnings = issues
+            .iter()
+            .filter(|issue| issue.rule_id == "pagination.canonical_to_linked_page")
+            .collect::<Vec<_>>();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            format!("{:?}", warnings[0].view),
+            "PaginationCanonicalToLinkedPage"
+        );
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(warnings[0].url, source.url);
+        assert!(
+            warnings[0]
+                .message
+                .contains("https://example.test/page-1#canonical")
+        );
+        assert!(warnings[0].message.contains("next or previous"));
+        assert!(warnings[0].message.contains("captured"));
+    }
+
+    #[test]
+    fn html_doctype_warning_requires_measured_absence_on_complete_successful_html() {
+        for (doctype, status, content_type, incomplete, expected) in [
+            (Some(false), Some(200), "text/html", false, 1),
+            (Some(true), Some(200), "text/html", false, 0),
+            (None, Some(200), "text/html", false, 0),
+            (Some(false), Some(404), "text/html", false, 0),
+            (Some(false), None, "text/html", false, 0),
+            (Some(false), Some(200), "application/pdf", false, 0),
+            (Some(false), Some(200), "text/html", true, 0),
+        ] {
+            let mut row = CrawlRecord::pending("https://example.test/page".into(), 0);
+            row.status_code = status;
+            row.content_type = Some(content_type.into());
+            row.html_doctype = doctype;
+            if incomplete {
+                row.indexability_status = "Response body incomplete".into();
+            }
+            let issues = analyze_records(&[row], &AuditThresholds::default());
+            let warnings = issues
+                .iter()
+                .filter(|issue| issue.rule_id == "html.missing_doctype")
+                .collect::<Vec<_>>();
+            assert_eq!(warnings.len(), expected);
+            if let Some(warning) = warnings.first() {
+                assert_eq!(warning.view, IssueView::HtmlMissingDoctype);
+                assert_eq!(warning.severity, Severity::Warning);
+                assert!(warning.message.contains("original HTTP HTML"));
+            }
         }
     }
 

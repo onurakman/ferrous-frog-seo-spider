@@ -91,6 +91,8 @@ Published releases become visible to the app only after the all-platform build g
 
 ## Signing and validation limits
 
+Windows signing is currently blocked on a validated signing-service account/certificate. See the [prepared SignPath application details](WINDOWS_SIGNING.md) for the external setup and the complete application/uninstaller/installer signing requirements. The release workflow has not been changed to claim signed output without that prerequisite.
+
 Windows installers are unsigned. macOS bundles use Tauri's ad-hoc signing identity (`-`) so Apple Silicon code has a signature, but they are not Developer ID signed or notarized. Operating-system trust prompts are expected. Before distributing trusted signed installers, configure [macOS signing and notarization](https://v2.tauri.app/distribute/sign/macos/) or [Windows signing](https://v2.tauri.app/distribute/sign/windows/) with your own certificates; replace the ad-hoc macOS identity when doing so. Checksums detect changed downloads and do not establish publisher identity.
 
 CI runs Rust tests and the real React screen with synthetic Tauri IPC on Linux. Installer builds prove compilation and bundling for each target, not native GUI operation. Test installation, the splash window, system appearance and native quit confirmation on each supported desktop before announcing the first release. The first hosted matrix run remains to be verified after this repository is pushed.

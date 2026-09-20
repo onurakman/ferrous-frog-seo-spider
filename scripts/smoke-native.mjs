@@ -282,7 +282,9 @@ try {
         const status = request.url === "/" || request.url === "/ok" ? 200 : 404;
         response.writeHead(status, { "content-type": "text/html; charset=utf-8" });
         const links = request.url === "/" ? '<a href="/ok">Good page</a><a href="/missing">Broken page</a><a href="/private">Blocked page</a>' : "";
-        response.end(`<!doctype html><html><head><title>Native smoke ${request.url}</title><meta name="description" content="Local native smoke fixture"></head><body><h1>Native smoke</h1>${links}</body></html>`);
+        const references = request.url === "/" ? '<link rel="amphtml" href="/ok"><link rel="next" href="/ok"><link rel="canonical" href="/ok">' : "";
+        const doctype = request.url === "/ok" ? "" : "<!doctype html>";
+        response.end(`${doctype}<html><head><title>Native smoke ${request.url}</title><meta name="description" content="Local native smoke fixture">${references}</head><body><h1>Native smoke</h1>${links}</body></html>`);
       }
     });
     await new Promise((resolve, reject) => { fixture.once("error", reject); fixture.listen(0, "127.0.0.1", resolve); });
@@ -302,6 +304,25 @@ try {
     const before = savedRecords();
     assert.ok(before.rows.some((row) => row.url === `${origin}/missing` && row.status_code === 404));
     assert.ok(before.rows.some((row) => row.url === `${origin}/private` && row.status_text === "Blocked by robots.txt"));
+    const verifyMarkupAudits = async () => {
+      if (await evaluate('return document.querySelector(\'[aria-label="Toggle audit views"]\').getAttribute("aria-expanded") !== "true"')) await click('[aria-label="Toggle audit views"]');
+      for (const [view, url] of [["paginationCanonicalToLinkedPage", `${origin}/`], ["ampTargetMissingMarker", `${origin}/`], ["htmlMissingDoctype", `${origin}/ok`]]) {
+        const group = await evaluate('const group = document.querySelector(`[data-view="${arguments[0]}"]`).closest("details"); return group.open ? null : group.querySelector("summary").textContent', [view]);
+        if (group) await clickText('.issue-sidebar summary', group);
+        await evaluate('document.querySelector(`[data-view="${arguments[0]}"]`).scrollIntoView({ block: "center" })', [view]);
+        await click(`[data-view="${view}"]`);
+        await until(() => evaluate(`const rows = [...document.querySelectorAll('.data-table tbody tr:not(.virtual-spacer)')];
+          return document.querySelector('[data-view="' + arguments[0] + '"] .issue-count')?.textContent === '1'
+            && rows.length === 1 && rows[0].querySelector('td.url-column')?.getAttribute('title') === arguments[1];`, [view, url]), `${view} shows its one measured source`);
+      }
+      const allGroup = await evaluate('const group = document.querySelector(\'[data-view="all"]\').closest("details"); return group.open ? null : group.querySelector("summary").textContent');
+      if (allGroup) await clickText('.issue-sidebar summary', allGroup);
+      await evaluate('document.querySelector(\'[data-view="all"]\').scrollIntoView({ block: "center" })');
+      await click('[data-view="all"]');
+      await until(() => evaluate("return document.querySelectorAll('.data-table tbody tr:not(.virtual-spacer)').length === 4"), "all saved records remain available");
+      await click('[aria-label="Close audit views"]');
+    };
+    await verifyMarkupAudits();
     console.log(`Native crawl complete: ${before.rows.length} SQLite records; robots and 404 verified.`);
     await quit(true);
     const requestCount = requests.length;
@@ -316,6 +337,7 @@ try {
     assert.equal(after.saved.id, before.saved.id);
     assert.deepEqual(after.rows, before.rows);
     assert.equal(after.rows.length, 4, "The completed source fixture must contain all four records.");
+    await verifyMarkupAudits();
 
     await openAuditReports();
     await fill('[aria-label="Audit report title"]', "Native saved audit report");
