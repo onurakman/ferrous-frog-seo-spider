@@ -37,7 +37,7 @@ governor = "0.10.4"
 httpdate = "1.0.3"
 keyring = "4.1.1"
 md-5 = "0.11.0"
-minijinja = "2.20.0"
+minijinja = "3.0.0"
 psl = "2.1.231"
 reqwest = { version = "0.13.4", default-features = false, features = ["brotli", "charset", "cookies", "deflate", "gzip", "http2", "json", "rustls"] }
 regex = "1.12.4"
