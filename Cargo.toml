@@ -37,16 +37,16 @@ governor = "0.10.4"
 httpdate = "1.0.3"
 keyring = "4.1.1"
 md-5 = "0.11.0"
-minijinja = "2.20.0"
+minijinja = "3.0.3"
 psl = "2.1.231"
 reqwest = { version = "0.13.4", default-features = false, features = ["brotli", "charset", "cookies", "deflate", "gzip", "http2", "json", "rustls"] }
 regex = "1.12.4"
-rusqlite = { version = "0.40.1", features = ["bundled", "functions"] }
+rusqlite = { version = "0.41.0", features = ["bundled", "functions"] }
 rustls = "0.23.40"
 rustls-pki-types = "1.14.1"
 rustls-platform-verifier = "0.7.0"
-rust_xlsxwriter = "0.99.0"
-scraper = "0.27.0"
+rust_xlsxwriter = "0.101.0"
+scraper = "0.29.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.11.0"
